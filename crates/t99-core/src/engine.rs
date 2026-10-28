@@ -838,9 +838,11 @@ impl Match {
         }
         match mode {
             TargetMode::Badges => {
+                // 按徽章数（而非档位）排序：档位阈值稀疏（2/6/14/30），多数持有者挤在同档，
+                // 同档按 pid 排序会把集火退化成「打最低 pid」，级联断链。
                 let mut v = others.to_vec();
                 v.sort_by(|&a, &b| {
-                    self.badge_tier(b).cmp(&self.badge_tier(a)).then(a.cmp(&b))
+                    self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b))
                 });
                 Some(v[0])
             }
