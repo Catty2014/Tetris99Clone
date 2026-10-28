@@ -874,11 +874,11 @@ fn evaluate(
         - w.bump * bump as f64
         - w.wells * wells as f64
         - w.agg * agg as f64;
-    // 攻防收益
-    sc += w.attack * sent as f64;
-    if fr.pending() > 0 {
-        sc += w.cancel * cleared as f64; // 消行 1:1 抵消待进垃圾
-    }
+    // 攻防收益（T99 阻挡规则）：有暂缓垃圾时攻击全部转为阻挡，不发送——
+    // 真正发出去的才算进攻，阻挡量按攻击值计（大消行阻挡更多 → 鼓励拼 Tetris/TSD 挖洞）
+    let block = fr.pending().min(sent);
+    sc += w.attack * (sent - block) as f64;
+    sc += w.cancel * block as f64;
     if cleared > 0 {
         let qualifies = spin != 0 || cleared == 4;
         if fr.b2b && !qualifies {
@@ -1078,8 +1078,8 @@ fn frame_after(fr: &FrameIn, c: &Cand) -> FrameIn {
     } else {
         f.combo = -1;
     }
-    // 粗略：本块消行先抵消待进垃圾
-    let pend = fr.pending().saturating_sub(c.cleared);
+    // 粗略：本块攻击先用于阻挡暂缓垃圾
+    let pend = fr.pending().saturating_sub(c.sent.min(fr.pending()));
     f.garbage.red = 0;
     f.garbage.yellow = pend.min(fr.garbage.yellow);
     f.garbage.gray = pend.saturating_sub(fr.garbage.yellow);

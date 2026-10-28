@@ -1208,9 +1208,14 @@ impl Match {
         let tier = self.badge_tier(pid);
         let cap = self.cfg.ruleset.send_cap_rows;
         let total = ((subtotal * (100 + 25 * tier)) / 100).min(cap);
-        // 抵消 → 相位切换（压实延迟到 Clear 结束）→ 送出
-        if n > 0 {
-            self.cancel_pending(pid, n);
+        // T99 阻挡规则（wiki：有暂缓垃圾行时，攻击全部用于阻挡；只有没有暂缓垃圾时才能发送）：
+        // 攻击值（含 B2B/连击/徽章倍率）先抵扣暂缓队列，队列清空后的剩余攻击才发给别人。
+        let pending_rows: u32 = self.players[pid].pending.iter().map(|g| g.rows).sum();
+        let mut sent_rows = total;
+        if n > 0 && total > 0 && pending_rows > 0 {
+            let blocked = total.min(pending_rows);
+            self.cancel_pending(pid, blocked);
+            sent_rows = total - blocked;
         }
         if n > 0 {
             let d = self.cfg.ruleset.clear_delay(self.phase_idx);
@@ -1222,8 +1227,8 @@ impl Match {
             let are = self.cfg.ruleset.are(self.phase_idx);
             self.players[pid].phase = PlayerPhase::Are(are);
         }
-        if n > 0 && total > 0 && self.alive_count > 1 {
-            let recv = self.resolve_receivers(pid, total);
+        if n > 0 && sent_rows > 0 && self.alive_count > 1 {
+            let recv = self.resolve_receivers(pid, sent_rows);
             for (rid, rows) in recv {
                 let room = self.cfg.ruleset.pending_cap_rows
                     - self.players[rid]
@@ -1242,7 +1247,7 @@ impl Match {
                     self.players[rid].pending.push(Garb { rows, sender: pid, state });
                 }
             }
-            self.players[pid].sent += total;
+            self.players[pid].sent += sent_rows;
         }
     }
 
@@ -1798,7 +1803,8 @@ mod tests {
             let garbage = (0..W).filter(|&c| p.board[r * W + c] == CELL_GARBAGE).count();
             assert_eq!(garbage, 9);
         }
-        // 抵消：p0 消 1 行时抵扣队首
+        // T99 阻挡规则：单消（攻击值 0）不阻挡；有暂缓垃圾时攻击全部转为阻挡，不发送；
+        // 队列清空后的剩余攻击才发送
         let mut m2 = Match::new(MatchConfig { players: 2, seed: 9, ruleset: Ruleset::default() });
         {
             let p = &mut m2.players[0];
@@ -1810,19 +1816,38 @@ mod tests {
             p.active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
         }
         m2.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Yellow(stage) });
-        m2.lock_piece(0); // 消 1 行，combo=0 → 阻挡进场；抵消 1 → 剩 2
+        m2.lock_piece(0); // 消 1 行（single，攻击值 0）→ 阻挡 0，剩 3，不发送
         let rows: u32 = m2.players[0].pending.iter().map(|g| g.rows).sum();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 3, "单消攻击值为 0，不应阻挡");
+        assert_eq!(m2.players[0].sent, 0, "有暂缓垃圾时不发送");
+        // 双消（攻击值 1，留残块避免全消奖励）→ 阻挡 1，剩 2
+        let mut m3 = Match::new(MatchConfig { players: 2, seed: 9, ruleset: Ruleset::default() });
+        {
+            let p = &mut m3.players[0];
+            p.board[21 * W] = 1;
+            for c in 0..W {
+                if c < 8 {
+                    p.board[22 * W + c] = 1;
+                    p.board[23 * W + c] = 1;
+                }
+            }
+            p.active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
+        }
+        m3.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Yellow(stage) });
+        m3.lock_piece(0); // 消 2 行（double，攻击值 1）→ 阻挡 1，剩 2，不发送
+        let rows: u32 = m3.players[0].pending.iter().map(|g| g.rows).sum();
+        assert_eq!(rows, 2, "攻击值 1 应阻挡 1 行");
+        assert_eq!(m3.players[0].sent, 0, "阻挡后仍有暂缓垃圾，剩余攻击不放行");
         // 连击中断（任一次无消行锁定会把 combo 打回 -1，此处直接置位）后，红段走完即进场
         {
-            let p = &mut m2.players[0];
+            let p = &mut m3.players[0];
             p.combo = -1;
             if let Some(g) = p.pending.first_mut() {
                 g.state = GarbState::Red(1);
             }
         }
-        run_quiet(&mut m2, 3);
-        assert!(m2.players[0].pending.is_empty(), "连击结束后垃圾应进场");
+        run_quiet(&mut m3, 3);
+        assert!(m3.players[0].pending.is_empty(), "连击结束后垃圾应进场");
     }
     #[test]
     fn garbage_pushes_airborne_piece_without_death() {
