@@ -430,7 +430,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 match m {
                     ToGame::ObserverJoin { idx } => {
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "seed": seed, "players": players,
+                            "type": "hello", "match": match_no, "match_id": match_id, "seed": seed, "players": players,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });

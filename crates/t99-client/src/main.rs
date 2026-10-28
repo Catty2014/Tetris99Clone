@@ -25,9 +25,15 @@ const THUMB_HZ: f64 = 10.0;
 const TW: f32 = 44.0; // 小窗宽（含边框）
 const TH: f32 = 88.0;
 /// 侧栏网格定位：网格外缘恒收在窗口内（半宽 800 留 12px 边距），且不贴死棋盘框
+fn grid_half_for(n: usize) -> f32 {
+    n as f32 * (TW + 6.0) / 2.0
+}
+
 fn side_center_x(n: usize, half_w: f32) -> f32 {
-    let grid_half = n as f32 * (TW + 6.0) / 2.0;
-    (half_w - 12.0 - grid_half).max(148.0 + grid_half)
+    let grid_half = grid_half_for(n);
+    // 内缘贴主棋盘：右侧预览列右缘 227 + 16px。窗口放不下时向内收缩（保持 12px 外边距）。
+    let ideal = 243.0 + grid_half;
+    ideal.min((half_w - 12.0 - grid_half).max(148.0 + grid_half))
 }
 
 fn kind_color(id: Cell) -> Color {
@@ -277,11 +283,25 @@ fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
         ("相位", 180.0),
     ];
     for (s, y) in stats {
-        hud.push(text(&mut cmd, &font, s, 18.0, Color::srgb(0.8, 0.83, 0.9), Vec2::new(345.0, y)));
+        let e = text(&mut cmd, &font, s, 16.0, Color::srgb(0.8, 0.83, 0.9), Vec2::new(345.0, y));
+        cmd.entity(e).insert(bevy::sprite::Anchor::CenterRight);
+        hud.push(e);
     }
-    hud.push(text(&mut cmd, &font, "", 30.0, Color::srgb(0.95, 0.8, 0.3), Vec2::new(345.0, 340.0)));
-    hud.push(text(&mut cmd, &font, "", 24.0, Color::srgb(0.65, 0.7, 0.8), Vec2::new(345.0, 370.0)));
-    hud.push(text(&mut cmd, &font, "", 15.0, Color::srgb(0.5, 0.55, 0.62), Vec2::new(345.0, 150.0)));
+    hud.push({
+        let e = text(&mut cmd, &font, "", 30.0, Color::srgb(0.95, 0.8, 0.3), Vec2::new(345.0, 340.0));
+        cmd.entity(e).insert(bevy::sprite::Anchor::CenterRight);
+        e
+    });
+    hud.push({
+        let e = text(&mut cmd, &font, "", 24.0, Color::srgb(0.65, 0.7, 0.8), Vec2::new(345.0, 370.0));
+        cmd.entity(e).insert(bevy::sprite::Anchor::CenterRight);
+        e
+    });
+    hud.push({
+        let e = text(&mut cmd, &font, "", 13.0, Color::srgb(0.5, 0.55, 0.62), Vec2::new(345.0, 150.0));
+        cmd.entity(e).insert(bevy::sprite::Anchor::BottomRight);
+        e
+    });
     hud.push(text(
         &mut cmd,
         &font,
@@ -305,7 +325,11 @@ fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
     // 判定弹出文字（消行判定 + COMBO）
     let judge = text(&mut cmd, &font, "", 26.0, Color::srgb(0.98, 0.85, 0.35), Vec2::new(0.0, 300.0));
     let judge_sub = text(&mut cmd, &font, "", 16.0, Color::srgb(0.95, 0.6, 0.3), Vec2::new(0.0, 268.0));
-    let dbg = text(&mut cmd, &font, "", 13.0, Color::srgb(0.75, 0.78, 0.82), Vec2::new(-740.0, -415.0));
+    let dbg = {
+        let e = text(&mut cmd, &font, "", 13.0, Color::srgb(0.75, 0.78, 0.82), Vec2::new(-740.0, -415.0));
+        cmd.entity(e).insert(bevy::sprite::Anchor::BottomLeft);
+        e
+    };
     cmd.insert_resource(Views { cells, active, ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub, dbg });
     cmd.insert_resource(Thumbs::default());
     cmd.insert_resource(PrevPiece { pieces: 0, y_milli: 0 });
@@ -660,7 +684,12 @@ fn rebuild_thumbs(
         let (col, row) = (idx % n, idx / n);
         let grid_w = n as f32 * (TW + 6.0);
         let grid_h = n as f32 * (TH + 18.0);
-        let cx = if side == 0 { -side_center_x(n, half_w) } else { side_center_x(n, half_w) };
+        let cx = if side == 0 {
+            let ideal = 290.0 + grid_half_for(n);
+            -ideal.min((half_w - 12.0 - grid_half_for(n)).max(148.0 + grid_half_for(n)))
+        } else {
+            side_center_x(n, half_w)
+        };
         let x = cx - grid_w / 2.0 + col as f32 * (TW + 6.0) + TW / 2.0;
         let y = grid_h / 2.0 - row as f32 * (TH + 18.0) - TH / 2.0;
         // 背景填充 = 危险度（白/黄/橙/红）或死亡灰
@@ -725,6 +754,7 @@ fn sync(
     mut vq: Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
     mut text_q: Query<&mut Text2d>,
     mut color_q: Query<&mut TextColor>,
+    mut text_tr: Query<&mut Transform, (With<Text2d>, Without<Sprite>)>,
     windows: Query<&Window>,
 ) {
     let half_w = windows.single().map(|w| w.width() / 2.0).unwrap_or(800.0);
@@ -929,10 +959,30 @@ fn sync(
     }
     set_text(&mut text_q, views.judge, judge_txt);
     set_text(&mut text_q, views.judge_sub, combo_txt);
+    // HUD 列：贴窗口右缘（窗口自适应）；调试堆移右下角
+    {
+        let hud_x = half_w - 14.0;
+        let spots = [
+            (views.hud[0], hud_x, 300.0), // 存活/相位
+            (views.hud[1], hud_x, 270.0), // 徽章/KO/块
+            (views.hud[2], hud_x, 240.0), // 消行/送出/APM
+            (views.hud[5], hud_x, 368.0), // 名次
+            (views.hud[6], hud_x, 336.0), // 倒计时
+            // 调试堆：目标 / combo-b2b-G / 相位参数 → 右下角（BottomRight 锚定）
+            (views.hud[3], hud_x, -half_h + 40.0),
+            (views.hud[4], hud_x, -half_h + 64.0),
+            (views.hud[7], hud_x, -half_h + 86.0),
+        ];
+        for (e, x, y) in spots {
+            if let Ok(mut tr) = text_tr.get_mut(e) {
+                tr.translation = Vec3::new(x, y, 0.0);
+            }
+        }
+    }
     // 左下角调试信息：玩家 ID / 对局 ID / 延迟丢包 / 连接状态
     {
-        if let Ok((_, _, mut tr)) = vq.get_mut(views.dbg) {
-            tr.translation = Vec3::new(-half_w + 70.0, -half_h + 74.0, 0.0);
+        if let Ok(mut tr) = text_tr.get_mut(views.dbg) {
+            tr.translation = Vec3::new(-half_w + 14.0, -half_h + 14.0, 0.0);
         }
         if let Session::Net { stats, .. } = &*session {
             let st = stats.lock().unwrap();
