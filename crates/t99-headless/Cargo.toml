@@ -1,0 +1,11 @@
+[package]
+name = "t99-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+t99-core = { path = "../t99-core" }
+t99-proto = { path = "../t99-proto" }
+t99-bots = { path = "../t99-bots" }
+serde_json = "1"

@@ -1,0 +1,38 @@
+[package]
+name = "t99-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+t99-core = { path = "../t99-core" }
+t99-bots = { path = "../t99-bots" }
+t99-proto = { path = "../t99-proto" }
+
+[dependencies.bevy]
+version = "=0.16.0"
+default-features = false
+features = [
+  "bevy_winit",
+  "bevy_sprite",
+  "bevy_text",
+  "bevy_core_pipeline",
+  "default_font",
+  "webgl2",
+  "sysinfo_plugin",
+]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies.bevy]
+version = "=0.16.0"
+default-features = false
+features = ["x11", "wayland", "multi_threaded"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.100"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies.web-time]
+version = "1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+serde_json = "1"

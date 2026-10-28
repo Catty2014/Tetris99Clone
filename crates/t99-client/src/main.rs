@@ -1,0 +1,1358 @@
+//! t99 人类客户端（T99 版 UI）：内嵌引擎，Bevy 只做表现与输入。
+//!
+//! 输入（与程序/Bot 同物理，引擎侧 DAS/ARR；采样打点见 poll_input）：
+//!   A/D 移动（按住连发）  S 软降  空格 硬降  X/J 顺时针  Z/K 逆时针  C/Shift Hold
+//!   Tab 循环目标模式；方向键 = 副操作：导航对手小窗并手动锁定目标
+//!
+//! UI 对齐 T99：左右缩放小窗（框色=危险度，死亡=灰框+冻结棋盘+名次），
+//! 中央棋盘 + 左侧垃圾条 + 右侧 Next6 + 下方菱形目标指示。
+
+use bevy::prelude::*;
+use bevy::window::PresentMode;
+use std::collections::VecDeque;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+use t99_bots::BotAdapter;
+use t99_core::{Cell, Key, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
+use t99_proto::PlayerAdapter;
+
+const CELL: f32 = 26.0;
+const MINI: f32 = 4.0;
+const FRAME_US: u64 = 16_666;
+const THUMB_HZ: f64 = 10.0;
+const TW: f32 = 44.0; // 小窗宽（含边框）
+const TH: f32 = 88.0;
+/// 侧栏网格定位：网格外缘恒收在窗口内（半宽 800 留 12px 边距），且不贴死棋盘框
+fn side_center_x(n: usize, half_w: f32) -> f32 {
+    let grid_half = n as f32 * (TW + 6.0) / 2.0;
+    (half_w - 12.0 - grid_half).max(148.0 + grid_half)
+}
+
+fn kind_color(id: Cell) -> Color {
+    match id {
+        1 => Color::srgb(0.20, 0.85, 0.95),
+        2 => Color::srgb(0.95, 0.85, 0.20),
+        3 => Color::srgb(0.75, 0.35, 0.90),
+        4 => Color::srgb(0.30, 0.90, 0.40),
+        5 => Color::srgb(0.95, 0.35, 0.35),
+        6 => Color::srgb(0.35, 0.50, 0.95),
+        7 => Color::srgb(0.95, 0.60, 0.25),
+        8 => Color::srgb(0.55, 0.55, 0.58),
+        _ => Color::BLACK,
+    }
+}
+
+fn danger_color(h: usize, dead: bool) -> Color {
+    if dead {
+        return Color::srgb(0.35, 0.35, 0.38);
+    }
+    match h {
+        0..=7 => Color::srgb(0.9, 0.9, 0.9),
+        8..=11 => Color::srgb(0.72, 0.62, 0.18),
+        12..=14 => Color::srgb(0.92, 0.5, 0.12),
+        _ => Color::srgb(0.92, 0.18, 0.18),
+    }
+}
+
+fn stack_height(s: &Snapshot) -> usize {
+    for r in 0..H {
+        if s.board[r].iter().any(|&c| c != 0) {
+            return H - r;
+        }
+    }
+    0
+}
+
+/// 开局最小可容网格（2N² ≥ 存活对手数），2..=7 —— 8 人局开局为 2×2
+fn fit_grid(alive_others: usize) -> usize {
+    let mut n = 2usize;
+    while n < 7 && 2 * n * n < alive_others {
+        n += 1;
+    }
+    n
+}
+
+/// 网络指令（Bevy → net 线程）
+pub enum NetCmd {
+    Input(Vec<TimedKey>),
+    Restart,
+}
+
+/// 网络镜像：本地确定性重演权威事件流；座位以服务器 hello 为准
+#[derive(Default)]
+struct MirrorState {
+    engine: Option<Match>,
+    my_seat: usize,
+}
+
+/// 连接诊断（调试 HUD 用）：对局 ID、RTT、丢包率、连接状态
+#[derive(Resource, Default)]
+struct NetStats {
+    player_id: String,
+    match_id: u64,
+    rtt_ms: u32,
+    loss_pct: u32,
+    connected: bool,
+    /// 内部：已发 ping 数 / 收到 pong 数
+    pings: u32,
+    pongs: u32,
+}
+
+#[derive(Resource)]
+enum Session {
+    Local { engine: Match, bots: Vec<Option<BotAdapter>> },
+    Net {
+        mirror: std::sync::Arc<std::sync::Mutex<MirrorState>>,
+        tx: std::sync::mpsc::Sender<NetCmd>,
+        observer: bool,
+        status: std::sync::Arc<std::sync::Mutex<String>>,
+        stats: std::sync::Arc<std::sync::Mutex<NetStats>>,
+    },
+}
+
+impl Session {
+    fn with_engine<R>(&self, f: impl FnOnce(&Match, usize) -> R) -> Option<R> {
+        match self {
+            Session::Local { engine, .. } => Some(f(engine, 0)),
+            Session::Net { mirror, .. } => {
+                let g = mirror.lock().unwrap();
+                g.engine.as_ref().map(|e| f(e, g.my_seat))
+            }
+        }
+    }
+}
+
+#[derive(Resource, Default)]
+struct InputQueue {
+    entries: VecDeque<(Instant, Key)>,
+    /// 方向键导航游标（shown 列表索引）
+    cursor: Option<usize>,
+    target_idx: usize,
+}
+
+#[derive(Resource)]
+struct Views {
+    cells: Vec<Entity>,
+    active: Vec<Entity>,
+    ghost: Vec<Entity>,
+    hold: Vec<Entity>,
+    next: Vec<Entity>,
+    meter: Vec<Entity>,
+    hud: Vec<Entity>,
+    diamond: [Entity; 4],
+    diamond_center: Entity,
+    judge: Entity,
+    judge_sub: Entity,
+    /// 左下角调试信息（玩家 ID/对局 ID/延迟丢包/连接）
+    dbg: Entity,
+}
+
+struct ThumbView {
+    pid: usize,
+    origin: Vec2,
+    /// 背景填充（危险度/死亡灰）
+    bg: Entity,
+    /// 边缘线（瞄准关系：淡蓝/红/紫）
+    edge: Entity,
+    mask: Entity,
+    cells: Vec<Entity>,
+    active: Vec<Entity>,
+    meter: Vec<Entity>,
+    badge: Entity,
+    id: Entity,
+    rank: Entity,
+}
+
+#[derive(Resource, Default)]
+struct Thumbs {
+    n: usize,
+    views: Vec<ThumbView>,
+    all_ents: Vec<Entity>,
+    last_refresh: Option<Instant>,
+    /// 上一帧的局内帧号（倒退 = 新局，网格等级重置）
+    last_frame: u64,
+}
+
+#[derive(Resource)]
+struct PrevPiece {
+    pieces: u32,
+    y_milli: i64,
+}
+
+// ———— 布局辅助 ————
+
+fn board_pos(col: i64, row: i64) -> Vec2 {
+    Vec2::new(
+        (col as f32 - (W as f32 - 1.0) / 2.0) * CELL,
+        ((H as f32 - 1.0) / 2.0 - row as f32) * CELL,
+    )
+}
+
+fn spawn_grid(cmd: &mut Commands, origin: Vec2, size: f32, cols: usize, rows: usize, z: f32) -> Vec<Entity> {
+    let mut out = Vec::with_capacity(cols * rows);
+    for r in 0..rows {
+        for c in 0..cols {
+            let x = origin.x + (c as f32 - (cols as f32 - 1.0) / 2.0) * size;
+            let y = origin.y - (r as f32 - (rows as f32 - 1.0) / 2.0) * size;
+            out.push(
+                cmd.spawn((
+                    Sprite::from_color(Color::WHITE, Vec2::splat(size - 1.0)),
+                    Transform::from_xyz(x, y, z),
+                    Visibility::Hidden,
+                ))
+                .id(),
+            );
+        }
+    }
+    out
+}
+
+fn text(cmd: &mut Commands, font: &Handle<Font>, s: &str, size: f32, color: Color, pos: Vec2) -> Entity {
+    cmd.spawn((
+        Text2d::new(s),
+        TextFont { font: font.clone(), font_size: size, ..default() },
+        TextColor(color),
+        Transform::from_xyz(pos.x, pos.y, 3.0),
+    ))
+    .id()
+}
+
+/// 区域描边框（4 条 2px 边）
+fn frame_rect(cmd: &mut Commands, center: Vec2, w: f32, h: f32, color: Color, z: f32) {
+    let t = 2.0;
+    let segs = [
+        (Vec2::new(center.x, center.y + h / 2.0 - t / 2.0), Vec2::new(w, t)),
+        (Vec2::new(center.x, center.y - h / 2.0 + t / 2.0), Vec2::new(w, t)),
+        (Vec2::new(center.x - w / 2.0 + t / 2.0, center.y), Vec2::new(t, h)),
+        (Vec2::new(center.x + w / 2.0 - t / 2.0, center.y), Vec2::new(t, h)),
+    ];
+    for (pos, size) in segs {
+        cmd.spawn((Sprite::from_color(color, size), Transform::from_xyz(pos.x, pos.y, z)));
+    }
+}
+
+fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
+    let font: Handle<Font> = assets.load("fonts/CJK.otf");
+    cmd.spawn(Camera2d);
+    cmd.spawn((
+        Sprite::from_color(Color::srgb(0.06, 0.07, 0.10), Vec2::new(W as f32 * CELL + 8.0, H as f32 * CELL + 8.0)),
+        Transform::from_xyz(0.0, 0.0, -1.0),
+    ));
+    let cells = spawn_grid(&mut cmd, Vec2::ZERO, CELL, W, H, 0.0);
+    let active = spawn_grid(&mut cmd, Vec2::ZERO, CELL, 1, 4, 2.0);
+    let ghost = spawn_grid(&mut cmd, Vec2::ZERO, CELL, 1, 4, 1.0);
+    cmd.spawn((
+        Sprite::from_color(Color::srgb(0.08, 0.09, 0.13), Vec2::new(4.0 * 20.0 + 8.0, 2.0 * 20.0 + 8.0)),
+        Transform::from_xyz(-226.0, 240.0, -0.5),
+    ));
+    let hold = spawn_grid(&mut cmd, Vec2::new(-226.0, 240.0), 20.0, 4, 2, 0.0);
+    let next = spawn_grid(&mut cmd, Vec2::new(190.0, 119.0), 16.0, 4, 18, 0.0);
+    // 垃圾条单列堆叠：红(即将进场)在下，黄(计时)其上，灰(排队)顶层
+    let meter = spawn_grid(&mut cmd, Vec2::new(-159.0, -4.0), 20.0, 1, H, 0.0);
+
+    // 分区框与标题（界定区域 + 辅助文字）。
+    // 对齐：保存/对战盘/预览上沿取齐（+270）；垃圾下沿与对战盘下沿取齐（-270）；
+    // 攻击盘位于对战盘下方，留 16px 空隙。保存框右缘不与棋盘框（-140）重叠。
+    let fc = Color::srgb(0.30, 0.34, 0.42);
+    let lc = Color::srgb(0.45, 0.50, 0.60);
+    frame_rect(&mut cmd, Vec2::new(0.0, 0.0), W as f32 * CELL + 20.0, H as f32 * CELL + 20.0, fc, -0.7);
+    frame_rect(&mut cmd, Vec2::new(-226.0, 240.0), 96.0, 60.0, fc, -0.7);
+    frame_rect(&mut cmd, Vec2::new(190.0, 119.0), 74.0, 302.0, fc, -0.7);
+    frame_rect(&mut cmd, Vec2::new(-159.0, -4.0), 30.0, H as f32 * 20.0 + 12.0, fc, -0.7);
+    frame_rect(&mut cmd, Vec2::new(0.0, -344.0), 176.0, 116.0, fc, -0.7);
+    text(&mut cmd, &font, "对战盘", 13.0, lc, Vec2::new(-95.0, 283.0));
+    text(&mut cmd, &font, "保存", 13.0, lc, Vec2::new(-226.0, 282.0));
+    text(&mut cmd, &font, "预览", 13.0, lc, Vec2::new(190.0, 282.0));
+    text(&mut cmd, &font, "垃圾", 13.0, lc, Vec2::new(-159.0, -282.0));
+    text(&mut cmd, &font, "攻击", 13.0, lc, Vec2::new(0.0, -414.0));
+
+    let mut hud = Vec::new();
+    let stats: [(&str, f32); 5] = [
+        ("存活", 300.0),
+        ("徽章", 270.0),
+        ("消行", 240.0),
+        ("目标", 210.0),
+        ("相位", 180.0),
+    ];
+    for (s, y) in stats {
+        hud.push(text(&mut cmd, &font, s, 18.0, Color::srgb(0.8, 0.83, 0.9), Vec2::new(345.0, y)));
+    }
+    hud.push(text(&mut cmd, &font, "", 30.0, Color::srgb(0.95, 0.8, 0.3), Vec2::new(345.0, 340.0)));
+    hud.push(text(&mut cmd, &font, "", 24.0, Color::srgb(0.65, 0.7, 0.8), Vec2::new(345.0, 370.0)));
+    hud.push(text(&mut cmd, &font, "", 15.0, Color::srgb(0.5, 0.55, 0.62), Vec2::new(345.0, 150.0)));
+    hud.push(text(
+        &mut cmd,
+        &font,
+        "A/D 移动  S 软降  空格 硬降  X/Z 旋转  C Hold  Tab 模式  方向键选敌",
+        15.0,
+        Color::srgb(0.5, 0.55, 0.62),
+        Vec2::new(0.0, 428.0),
+    ));
+    // 菱形目标指示：上随机 下反攻 左击倒 右徽章（位于攻击盘中心）
+    let dd = 36.0;
+    let dm = Color::srgb(0.45, 0.5, 0.58);
+    let ds = Color::srgb(0.98, 0.8, 0.25);
+    let diamond = [
+        text(&mut cmd, &font, "随机", 16.0, dm, Vec2::new(0.0, -344.0 - dd)),
+        text(&mut cmd, &font, "反攻", 16.0, dm, Vec2::new(0.0, -344.0 + dd)),
+        text(&mut cmd, &font, "击倒", 16.0, dm, Vec2::new(-dd, -344.0)),
+        text(&mut cmd, &font, "徽章", 16.0, dm, Vec2::new(dd, -344.0)),
+    ];
+    let diamond_center = text(&mut cmd, &font, "◆", 20.0, dm, Vec2::new(0.0, -344.0));
+    let _ = ds;
+    // 判定弹出文字（消行判定 + COMBO）
+    let judge = text(&mut cmd, &font, "", 26.0, Color::srgb(0.98, 0.85, 0.35), Vec2::new(0.0, 300.0));
+    let judge_sub = text(&mut cmd, &font, "", 16.0, Color::srgb(0.95, 0.6, 0.3), Vec2::new(0.0, 268.0));
+    let dbg = text(&mut cmd, &font, "", 13.0, Color::srgb(0.75, 0.78, 0.82), Vec2::new(-740.0, -415.0));
+    cmd.insert_resource(Views { cells, active, ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub, dbg });
+    cmd.insert_resource(Thumbs::default());
+    cmd.insert_resource(PrevPiece { pieces: 0, y_milli: 0 });
+}
+
+// ———— 输入采集（Update 节奏 = 渲染循环，不锁帧时远高于 60Hz） ————
+
+fn g_seat(mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>) -> usize {
+    mirror.lock().unwrap().my_seat
+}
+
+fn push_key(q: &mut InputQueue, k: Key, now: Instant) {
+    q.entries.push_back((now, k));
+}
+
+/// 主/副操作方案：主操作移动方块，副操作导航待选玩家
+#[derive(Clone, Copy, PartialEq, Eq, Resource)]
+enum Scheme {
+    /// WASD 移动方块，方向键导航（默认）
+    Wasd,
+    /// 方向键移动方块，WASD 导航
+    Arrows,
+}
+
+impl Scheme {
+    fn move_l(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::KeyA],
+            Scheme::Arrows => [KeyCode::ArrowLeft],
+        }
+    }
+    fn move_r(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::KeyD],
+            Scheme::Arrows => [KeyCode::ArrowRight],
+        }
+    }
+    fn soft(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::KeyS],
+            Scheme::Arrows => [KeyCode::ArrowDown],
+        }
+    }
+    fn rot(&self) -> [KeyCode; 3] {
+        match self {
+            Scheme::Wasd => [KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyJ],
+            Scheme::Arrows => [KeyCode::ArrowUp, KeyCode::KeyX, KeyCode::KeyJ],
+        }
+    }
+    fn nav_l(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::ArrowLeft],
+            Scheme::Arrows => [KeyCode::KeyA],
+        }
+    }
+    fn nav_r(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::ArrowRight],
+            Scheme::Arrows => [KeyCode::KeyD],
+        }
+    }
+    fn nav_u(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::ArrowUp],
+            Scheme::Arrows => [KeyCode::KeyW],
+        }
+    }
+    fn nav_d(&self) -> [KeyCode; 1] {
+        match self {
+            Scheme::Wasd => [KeyCode::ArrowDown],
+            Scheme::Arrows => [KeyCode::KeyS],
+        }
+    }
+}
+
+fn poll_input(mut queue: ResMut<InputQueue>, keys: Res<ButtonInput<KeyCode>>, session: Res<Session>, thumbs: Res<Thumbs>, scheme: Res<Scheme>) {
+    let now = Instant::now();
+    let jp = |c: &[KeyCode]| c.iter().any(|c| keys.just_pressed(*c));
+    let jr = |c: &[KeyCode]| c.iter().any(|c| keys.just_released(*c));
+    // 主操作：移动/软降（压放式，引擎侧 DAS/ARR）
+    let (ml, mr, sf) = (scheme.move_l(), scheme.move_r(), scheme.soft());
+    if jp(&ml) {
+        push_key(&mut queue, Key::LeftDown, now);
+    }
+    if jr(&ml) {
+        push_key(&mut queue, Key::LeftUp, now);
+    }
+    if jp(&mr) {
+        push_key(&mut queue, Key::RightDown, now);
+    }
+    if jr(&mr) {
+        push_key(&mut queue, Key::RightUp, now);
+    }
+    if jp(&sf) {
+        push_key(&mut queue, Key::SoftDown, now);
+    }
+    if jr(&sf) {
+        push_key(&mut queue, Key::SoftUp, now);
+    }
+    if jp(&[KeyCode::Space]) {
+        push_key(&mut queue, Key::HardDrop, now);
+    }
+    if jp(&scheme.rot()) {
+        push_key(&mut queue, Key::RotCw, now);
+    }
+    if jp(&[KeyCode::KeyZ, KeyCode::KeyK]) {
+        push_key(&mut queue, Key::RotCcw, now);
+    }
+    if jp(&[KeyCode::KeyC, KeyCode::ShiftLeft]) {
+        push_key(&mut queue, Key::Hold, now);
+    }
+    if jp(&[KeyCode::KeyR]) {
+        if let Session::Net { tx, .. } = &*session {
+            let _ = tx.send(NetCmd::Restart);
+        }
+    }
+    if jp(&[KeyCode::Tab]) {
+        let cycle = [Key::TargetKos, Key::TargetBadges, Key::TargetAttackers, Key::TargetRandom];
+        let k = cycle[queue.target_idx % cycle.len()];
+        queue.target_idx += 1;
+        push_key(&mut queue, k, now);
+    }
+    // 副操作：导航对手（shown 列表线性导航，上下按网格行宽跳）
+    let shown = session.with_engine(|e, _| e.players.len()).unwrap_or(1) - 1;
+    if shown > 0 {
+        let mut delta = 0isize;
+        let row = thumbs.n.max(1) as isize;
+        if jp(&scheme.nav_l()) {
+            delta = -1;
+        }
+        if jp(&scheme.nav_r()) {
+            delta = 1;
+        }
+        if jp(&scheme.nav_u()) {
+            delta = -row;
+        }
+        if jp(&scheme.nav_d()) {
+            delta = row;
+        }
+        if delta != 0 {
+            let cur = queue.cursor.map(|c| c as isize).unwrap_or(0);
+            let next = (cur + delta).rem_euclid(shown as isize) as usize;
+            queue.cursor = Some(next);
+            let pid = thumbs.views.get(next).map(|t| t.pid).unwrap_or(next + 1);
+            push_key(&mut queue, Key::TargetPlayer(pid as u16), now);
+        }
+    }
+}
+
+fn drain_input(queue: &mut InputQueue) -> Vec<TimedKey> {
+    let now = Instant::now();
+    let mut out: Vec<TimedKey> = Vec::new();
+    let mut last_t: i64 = -1;
+    while let Some((ts, key)) = queue.entries.front().copied() {
+        if ts > now {
+            break;
+        }
+        queue.entries.pop_front();
+        let elapsed_us = (now - ts).as_micros() as u64;
+        let mut t_us = FRAME_US.saturating_sub(elapsed_us).min(FRAME_US - 1) as i64;
+        if t_us <= last_t {
+            t_us = last_t + 1;
+        }
+        if t_us >= FRAME_US as i64 {
+            continue; // 放不下，丢弃（下一帧重排）
+        }
+        last_t = t_us;
+        out.push(TimedKey { t_us: t_us as u32, key });
+    }
+    out
+}
+
+// ———— 逻辑节拍 ————
+
+fn tick(mut session: ResMut<Session>, mut queue: ResMut<InputQueue>) {
+    match &mut *session {
+        Session::Local { engine, bots } => {
+            if engine.over.is_some() {
+                return;
+            }
+            let n = engine.players.len();
+            let mut inputs: Vec<Vec<TimedKey>> = Vec::with_capacity(n);
+            for pid in 0..n {
+                if !engine.players[pid].alive {
+                    inputs.push(vec![]);
+                    continue;
+                }
+                if pid == 0 {
+                    inputs.push(drain_input(&mut queue));
+                } else {
+                    let mut bot = bots[pid].take();
+                    let ev = match bot.as_mut() {
+                        Some(b) => {
+                            let snap = engine.snapshot(pid);
+                            b.act(&snap)
+                        }
+                        None => vec![],
+                    };
+                    bots[pid] = bot;
+                    inputs.push(ev);
+                }
+            }
+            engine.frame(&inputs);
+        }
+        Session::Net { mirror, tx, observer, .. } => {
+            // 客户端只上报输入；对局由服务端权威推进，镜像本地重演
+            if !*observer {
+                let alive = mirror
+                    .lock()
+                    .unwrap()
+                    .engine
+                    .as_ref()
+                    .map(|e| e.players[g_seat(&mirror)].alive)
+                    .unwrap_or(false);
+                if alive {
+                    let ev = drain_input(&mut queue);
+                    if !ev.is_empty() {
+                        let _ = tx.send(NetCmd::Input(ev));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ———— 渲染同步 ————
+
+fn ghost_cells(s: &Snapshot) -> Vec<(i64, i64)> {
+    let Some(a) = s.active else { return vec![] };
+    let mut drop = i64::MAX; // 各格所需下落量的最小值 = 最先触底的格
+    for &(dx, dy) in a.kind.cells(a.rot).iter() {
+        let col = a.x as i64 + dx as i64;
+        if col < 0 || col >= W as i64 {
+            return vec![];
+        }
+        let mut top = H as i64;
+        for r in 0..H {
+            if s.board[r][col as usize] != 0 {
+                top = r as i64;
+                break;
+            }
+        }
+        let y = (a.y_milli + dy as i64 * 1000).div_euclid(1000);
+        drop = drop.min(top - 1 - dy as i64 - y);
+    }
+    if drop == i64::MAX {
+        return vec![];
+    }
+    a.kind
+        .cells(a.rot)
+        .iter()
+        .map(|&(dx, dy)| {
+            let y = (a.y_milli + dy as i64 * 1000).div_euclid(1000);
+            (y + drop, a.x as i64 + dx as i64)
+        })
+        .collect()
+}
+
+fn show_grid(
+    q: &mut Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
+    ents: &[Entity],
+    cols: usize,
+    pred: &dyn Fn(usize, usize) -> Option<Cell>,
+) {
+    for (i, &e) in ents.iter().enumerate() {
+        let r = i / cols;
+        let c = i % cols;
+        if let Ok((mut v, mut s, _)) = q.get_mut(e) {
+            match pred(r, c) {
+                Some(id) => {
+                    *v = Visibility::Visible;
+                    s.color = kind_color(id);
+                }
+                None => *v = Visibility::Hidden,
+            }
+        }
+    }
+}
+
+fn hide(q: &mut Query<(&mut Visibility, &mut Sprite, &mut Transform)>, ents: &[Entity]) {
+    for &e in ents {
+        if let Ok((mut v, _, _)) = q.get_mut(e) {
+            *v = Visibility::Hidden;
+        }
+    }
+}
+
+fn place(q: &mut Query<(&mut Visibility, &mut Sprite, &mut Transform)>, e: Entity, pos: Vec2, color: Color, alpha: f32) {
+    if let Ok((mut v, mut s, mut tr)) = q.get_mut(e) {
+        *v = Visibility::Visible;
+        s.color = color.with_alpha(alpha);
+        tr.translation.x = pos.x;
+        tr.translation.y = pos.y;
+    }
+}
+
+fn set_text(q: &mut Query<&mut Text2d>, e: Entity, s: String) {
+    if let Ok(mut t) = q.get_mut(e) {
+        *t = Text2d::new(s);
+    }
+}
+
+fn rebuild_thumbs(
+    cmd: &mut Commands,
+    font: &Handle<Font>,
+    session: &Session,
+    thumbs: &mut Thumbs,
+    half_w: f32,
+) {
+    for e in thumbs.all_ents.drain(..) {
+        cmd.entity(e).despawn();
+    }
+    thumbs.views.clear();
+    let Some((others, _my_seat)) = session.with_engine(|e, seat| {
+        ((0..e.players.len()).filter(|&p| p != seat).collect::<Vec<_>>(), seat)
+    }) else {
+        thumbs.n = 0;
+        return;
+    };
+    if others.is_empty() {
+        thumbs.n = 0;
+        return;
+    }
+    // 网格等级由 sync 决定（开局最小可容 + 淘汰降级），此处只消费
+    let n = thumbs.n.max(2);
+    let cap = 2 * n * n;
+    let mut shown: Vec<usize> = session
+        .with_engine(|e, _| others.iter().copied().filter(|&p| e.players[p].alive).collect())
+        .unwrap_or_default();
+    // 死者按名次升序补位（最近淘汰在前）：网格缩小时从尾部移除最早淘汰者
+    let dead_order: Vec<usize> = session
+        .with_engine(|e, _| {
+            let mut d: Vec<(u32, usize)> = others
+                .iter()
+                .copied()
+                .filter(|&p| !e.players[p].alive)
+                .map(|p| (e.players[p].place.unwrap_or(u32::MAX), p))
+                .collect();
+            d.sort_by_key(|&(pl, _)| pl);
+            d.into_iter().map(|(_, p)| p).collect()
+        })
+        .unwrap_or_default();
+    for p in dead_order {
+        if !shown.contains(&p) && shown.len() < cap {
+            shown.push(p);
+        }
+    }
+    shown.truncate(cap);
+    let per_side = (shown.len() + 1) / 2;
+    for (i, &pid) in shown.iter().enumerate() {
+        let (side, idx) = if i < per_side { (0usize, i) } else { (1usize, i - per_side) };
+        let (col, row) = (idx % n, idx / n);
+        let grid_w = n as f32 * (TW + 6.0);
+        let grid_h = n as f32 * (TH + 18.0);
+        let cx = if side == 0 { -side_center_x(n, half_w) } else { side_center_x(n, half_w) };
+        let x = cx - grid_w / 2.0 + col as f32 * (TW + 6.0) + TW / 2.0;
+        let y = grid_h / 2.0 - row as f32 * (TH + 18.0) - TH / 2.0;
+        // 背景填充 = 危险度（白/黄/橙/红）或死亡灰
+        let bg = cmd
+            .spawn((
+                Sprite::from_color(Color::srgb(0.2, 0.2, 0.24), Vec2::new(TW, TH)),
+                Transform::from_xyz(x, y, -0.5),
+            ))
+            .id();
+        // 边缘线 = 瞄准关系（淡蓝=被本方瞄准 红=瞄准本方 紫=互瞄），无关系时隐藏
+        let edge = cmd
+            .spawn((
+                Sprite::from_color(Color::srgb(0.45, 0.75, 1.0), Vec2::new(TW + 4.5, TH + 4.5)),
+                Transform::from_xyz(x, y, -0.55),
+                Visibility::Hidden,
+            ))
+            .id();
+        let mask = cmd
+            .spawn((
+                Sprite::from_color(Color::srgb(0.5, 0.5, 0.55), Vec2::new(TW - 4.0, TH - 4.0)),
+                Transform::from_xyz(x, y, 0.4),
+                Visibility::Hidden,
+            ))
+            .id();
+        let origin = Vec2::new(x, y);
+        let cells = spawn_grid(cmd, origin, MINI, W, H, 0.3);
+        let active = spawn_grid(cmd, origin, MINI, 1, 4, 0.35);
+        // 小窗垃圾条（单列堆叠，同主界面）
+        let meter = spawn_grid(cmd, Vec2::new(x - TW / 2.0 - 4.0, y), MINI, 1, H, 0.35);
+        // 击杀数（★）：贴框体上沿内侧显示
+        let badge = text(cmd, font, "", 12.0, Color::srgb(0.95, 0.85, 0.3), Vec2::new(x, y + TH / 2.0 - 11.0));
+        let id = text(cmd, font, &format!("{}", pid + 1), 12.0, Color::srgb(0.7, 0.75, 0.8), Vec2::new(x, y - TH / 2.0 - 9.0));
+        let rank = text(cmd, font, "", 14.0, Color::srgb(0.85, 0.85, 0.88), Vec2::new(x, y));
+        thumbs.all_ents.push(bg);
+        thumbs.all_ents.push(edge);
+        thumbs.all_ents.push(mask);
+        thumbs.all_ents.extend(cells.iter().copied());
+        thumbs.all_ents.extend(active.iter().copied());
+        thumbs.all_ents.extend(meter.iter().copied());
+        thumbs.all_ents.push(badge);
+        thumbs.all_ents.push(id);
+        thumbs.all_ents.push(rank);
+        thumbs.views.push(ThumbView { pid, origin, bg, edge, mask, cells, active, meter, badge, id, rank });
+    }
+    eprintln!(
+        "[grid] n={n} views={} per_side={per_side} side_x=±{:.0} shown0={}",
+        thumbs.views.len(),
+        side_center_x(n, half_w),
+        shown.first().copied().unwrap_or(999)
+    );
+}
+
+fn sync(
+    mut cmd: Commands,
+    session: Res<Session>,
+    views: Res<Views>,
+    font_assets: Res<AssetServer>,
+    mut thumbs: ResMut<Thumbs>,
+    mut queue: ResMut<InputQueue>,
+    mut prev: ResMut<PrevPiece>,
+    fixed: Res<Time<Fixed>>,
+    mut vq: Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
+    mut text_q: Query<&mut Text2d>,
+    mut color_q: Query<&mut TextColor>,
+    windows: Query<&Window>,
+) {
+    let half_w = windows.single().map(|w| w.width() / 2.0).unwrap_or(800.0);
+    let half_h = windows.single().map(|w| w.height() / 2.0).unwrap_or(450.0);
+    let Some(s) = session.with_engine(|e, seat| e.snapshot(seat)) else {
+        // 网络模式未就绪：显示连接状态
+        if let Session::Net { status, .. } = &*session {
+            let st = status.lock().unwrap().clone();
+            if let Some(e) = views.hud.get(5) {
+                set_text(&mut text_q, *e, st);
+            }
+        }
+        return;
+    };
+    // 反攻模式：被本方瞄准的是全部攻击者（引擎发送时均分给所有攻击者）
+    let attackers_mode = s.target_mode == TargetMode::Attackers;
+    // —— 己方棋盘 ——
+    show_grid(&mut vq, &views.cells, W, &|r, c| if s.board[r][c] != 0 { Some(s.board[r][c]) } else { None });
+    // 消行闪烁：Clear 相位中被消的行以白色脉冲覆盖
+    if !s.clearing.is_empty() {
+        let blink = (s.phase.ms_left() % 200) < 100;
+        for &row in &s.clearing {
+            if row < H {
+                for c in 0..W {
+                    if let Ok((mut v, mut sp, _)) = vq.get_mut(views.cells[row * W + c]) {
+                        *v = Visibility::Visible;
+                        sp.color = if blink {
+                            Color::srgb(1.0, 1.0, 1.0)
+                        } else {
+                            Color::srgb(0.85, 0.9, 1.0)
+                        };
+                    }
+                }
+            }
+        }
+    }
+    hide(&mut vq, &views.active);
+    hide(&mut vq, &views.ghost);
+    if let Some(a) = s.active {
+        // 外推插值：恒速重力下渲染平滑
+        let alpha = fixed.overstep_fraction();
+        let dy = if prev.pieces == s.pieces { (a.y_milli - prev.y_milli) as f32 } else { 0.0 };
+        let y_draw = a.y_milli as f32 + dy * alpha;
+        for (i, &(dx, dy)) in a.kind.cells(a.rot).iter().enumerate() {
+            let row = ((y_draw + dy as f32 * 1000.0) / 1000.0).floor() as i64;
+            let col = a.x as i64 + dx as i64;
+            if (0..H as i64).contains(&row) && (0..W as i64).contains(&col) {
+                place(&mut vq, views.active[i], board_pos(col, row), kind_color(a.kind.id()), 1.0);
+            }
+        }
+        for (i, &(row, col)) in ghost_cells(&s).iter().enumerate() {
+            if i < views.ghost.len() && (0..H as i64).contains(&row) && (0..W as i64).contains(&col) {
+                place(&mut vq, views.ghost[i], board_pos(col, row), kind_color(a.kind.id()), 0.25);
+            }
+        }
+    }
+    prev.pieces = s.pieces;
+    prev.y_milli = s.active.map(|a| a.y_milli).unwrap_or(0);
+    // Hold / Next / 垃圾条
+    show_grid(&mut vq, &views.hold, 4, &|r, c| match s.hold {
+        Some(k) => k.cells(0).iter().find(|&&(dx, dy)| dx as usize == c && dy as usize == r).map(|_| k.id()),
+        None => None,
+    });
+    show_grid(&mut vq, &views.next, 4, &|r, c| {
+        let idx = r / 3;
+        let rr = r % 3;
+        if rr == 2 {
+            return None;
+        }
+        match s.next.get(idx) {
+            Some(&k) => k.cells(0).iter().find(|&&(dx, dy)| dx as usize == c && dy as usize == rr).map(|_| k.id()),
+            None => None,
+        }
+    });
+    // 垃圾条单列：红在下（即将进场，T99 红闪：以黄转红的相同间隔闪烁）、黄其上（计时中）、灰顶层（排队）
+    let red_on = session
+        .with_engine(|e, _| {
+            let stage_ms = e.cfg.ruleset.garbage_stage(e.phase_idx) / TMS;
+            let cycle = (2 * stage_ms).max(1);
+            (s.n as i64 * 16666 / 1000) % cycle < stage_ms
+        })
+        .unwrap_or(true);
+    show_grid(&mut vq, &views.meter, 1, &|r, _| {
+        let idx = (H - 1 - r) as u32;
+        if idx < s.garbage_red {
+            if red_on {
+                Some(5)
+            } else {
+                None
+            }
+        } else if idx < s.garbage_red + s.garbage_yellow {
+            Some(2)
+        } else if idx < s.garbage_red + s.garbage_yellow + s.garbage_gray {
+            Some(8)
+        } else {
+            None
+        }
+    });
+    // —— HUD ——
+    set_text(&mut text_q, views.hud[0], format!("存活 {}/{} 相位{}", s.alive.len(), session.with_engine(|e, _| e.players.len()).unwrap_or(0), session.with_engine(|e, _| e.phase_idx + 1).unwrap_or(1)));
+    set_text(&mut text_q, views.hud[1], format!("徽章{} KO{} 块{}", s.badges, s.ko, s.pieces));
+    set_text(
+        &mut text_q,
+        views.hud[2],
+        format!("消行{} 送出{} APM{:.0}", s.lines, s.sent, if s.n > 0 { s.sent as f64 * 3600.0 / s.n as f64 } else { 0.0 }),
+    );
+    let tgt = match s.target_mode {
+        TargetMode::Manual(t) => format!("手动→{}", t + 1),
+        m => m.name().to_string(),
+    };
+    let tgt_to = if attackers_mode {
+        if s.targeted_by.is_empty() {
+            "随机".to_string()
+        } else {
+            format!("全部×{}", s.targeted_by.len())
+        }
+    } else {
+        s.target.map(|t| t + 1).map(|x| x.to_string()).unwrap_or("-".into())
+    };
+    set_text(
+        &mut text_q,
+        views.hud[3],
+        format!("目标 {} → {} 被瞄{}", tgt, tgt_to, s.targeted_by.len()),
+    );
+    set_text(
+        &mut text_q,
+        views.hud[4],
+        format!(
+            "combo{} b2b{} {:.2}G {}",
+            s.combo,
+            s.b2b,
+            s.gravity_milli as f64 / 60000.0,
+            match s.phase {
+                PlayerPhase::Play => "".into(),
+                PlayerPhase::Clear(_) => format!("消行{}ms", s.phase.ms_left()),
+                PlayerPhase::Are(_) => format!("ARE{}ms", s.phase.ms_left()),
+            }
+        ),
+    );
+    let place_str = if !s.alive_self {
+        format!("第 {} 名", s.place.unwrap_or(0))
+    } else if session.with_engine(|e, _| e.over.is_some()).unwrap_or(false) {
+        "第一名！".to_string()
+    } else {
+        String::new()
+    };
+    set_text(&mut text_q, views.hud[5], place_str);
+    // 对局倒计时（0 杀加速时显示倍率并变红）
+    let cd = if s.burn_x10 > 10 {
+        format!("{}:{:02} ×{:.1}", s.match_secs_left / 60, s.match_secs_left % 60, s.burn_x10 as f32 / 10.0)
+    } else {
+        format!("{}:{:02}", s.match_secs_left / 60, s.match_secs_left % 60)
+    };
+    set_text(&mut text_q, views.hud[6], cd);
+    let mut color_q_state = color_q;
+    if let Ok(mut tc) = color_q_state.get_mut(views.hud[6]) {
+        tc.0 = if s.burn_x10 > 10 { Color::srgb(0.95, 0.35, 0.35) } else { Color::srgb(0.65, 0.7, 0.8) };
+    }
+    // 当前模式参数（相位规格 + 垃圾延迟）
+    let params = session
+        .with_engine(|e, _| {
+            let rules = &e.cfg.ruleset;
+            let ph = &rules.phases[e.phase_idx];
+            format!(
+                "P{} G{:.2}→{:.2} ARE{} 消{} 垃{}",
+                e.phase_idx + 1,
+                ph.gravity_base as f64 / 60000.0,
+                rules.gravity_hold(e.phase_idx) as f64 / 60000.0,
+                ph.are / TMS,
+                ph.clear_delay / TMS,
+                rules.garbage_stage(e.phase_idx) / TMS
+            )
+        })
+        .unwrap_or_default();
+    set_text(&mut text_q, views.hud[7], params);
+    // 判定弹出：最近消行 1s 内显示，COMBO 在下方；新判定直接替换。
+    // 普通消 1（无旋转/全消/B2B 且无连击）不弹。
+    let mut judge_txt = String::new();
+    let mut combo_txt = String::new();
+    if let Some(lc) = &s.last_clear {
+        if s.n.saturating_sub(lc.frame) < 60 {
+            let plain_single = lc.spin == 0 && lc.lines == 1 && !lc.all_clear && !lc.b2b && s.combo < 1;
+            if !plain_single {
+                let name = match (lc.spin, lc.lines) {
+                    (2, 1) => "T-Spin Single".to_string(),
+                    (2, 2) => "T-Spin Double".to_string(),
+                    (2, 3) => "T-Spin Triple".to_string(),
+                    (2, _) => "T-Spin".to_string(),
+                    (1, 1) => "T-Spin Mini Single".to_string(),
+                    (1, 2) => "T-Spin Mini Double".to_string(),
+                    (1, _) => "T-Spin Mini".to_string(),
+                    (_, 4) => "Tetris".to_string(),
+                    (_, k) => format!("消{k}"),
+                };
+                let name = if lc.all_clear { "Clear".to_string() } else { name };
+                judge_txt = if lc.b2b { format!("B2B {name}") } else { name };
+                if s.combo >= 1 {
+                    combo_txt = format!("{} COMBO", s.combo);
+                }
+            }
+        }
+    }
+    set_text(&mut text_q, views.judge, judge_txt);
+    set_text(&mut text_q, views.judge_sub, combo_txt);
+    // 左下角调试信息：玩家 ID / 对局 ID / 延迟丢包 / 连接状态
+    {
+        if let Ok((_, _, mut tr)) = vq.get_mut(views.dbg) {
+            tr.translation = Vec3::new(-half_w + 70.0, -half_h + 74.0, 0.0);
+        }
+        if let Session::Net { stats, .. } = &*session {
+            let st = stats.lock().unwrap();
+            let conn = if st.connected { "Connected" } else { "Disconnected" };
+            let dbg_txt = format!(
+                "PlayerID: {}\nMatchID: {}\nLat/Loss: {}ms/{}%\nServer: {}",
+                if st.player_id.is_empty() { "(observer)" } else { &st.player_id },
+                if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) },
+                st.rtt_ms,
+                st.loss_pct,
+                conn
+            );
+            set_text(&mut text_q, views.dbg, dbg_txt);
+        }
+    }
+    // 菱形高亮：当前模式金色，其余灰
+    let sel = match s.target_mode {
+        TargetMode::Random => 0,
+        TargetMode::Attackers => 1,
+        TargetMode::Kos => 2,
+        TargetMode::Badges => 3,
+        TargetMode::Manual(_) => 4,
+    };
+    let hot = Color::srgb(0.98, 0.8, 0.25);
+    let dim = Color::srgb(0.45, 0.5, 0.58);
+    for (i, &e) in views.diamond.iter().enumerate() {
+        let want = if sel == i { hot } else { dim };
+        if let Ok(mut tc) = color_q_state.get_mut(e) {
+            tc.0 = want;
+        }
+    }
+    if let Ok(mut tc) = color_q_state.get_mut(views.diamond_center) {
+        tc.0 = if sel == 4 { hot } else { dim };
+    }
+    // —— 小窗层（节流） ——
+    let font: Handle<Font> = font_assets.load("fonts/CJK.otf");
+    let alive_others = session
+        .with_engine(|e, seat| (0..e.players.len()).filter(|&p| p != seat && e.players[p].alive).count())
+        .unwrap_or(0);
+    // 新局（帧号倒退）→ 网格重置为开局最小可容（8 人局 = 2×2）
+    if s.n < thumbs.last_frame {
+        thumbs.n = 0;
+    }
+    thumbs.last_frame = s.n;
+    let mut want_n = if thumbs.n == 0 { fit_grid(alive_others.max(1)) } else { thumbs.n };
+    // 淘汰降级：跌出 K-2 级容量 2(K-2)² → 降一级（恒 ≥ 2×2）
+    while want_n > 2 && alive_others < 2 * (want_n - 2) * (want_n - 2) {
+        want_n -= 1;
+    }
+    if want_n != thumbs.n {
+        thumbs.n = want_n;
+        rebuild_thumbs(&mut cmd, &font, &session, &mut thumbs, half_w);
+        thumbs.last_refresh = None;
+    }
+    let due = match thumbs.last_refresh {
+        None => true,
+        Some(t) => t.elapsed().as_secs_f64() >= 1.0 / THUMB_HZ,
+    };
+    if due {
+        thumbs.last_refresh = Some(Instant::now());
+        let cursor_pid = queue.cursor.and_then(|c| thumbs.views.get(c)).map(|tv| tv.pid);
+        for tv in thumbs.views.iter() {
+            let Some(snap) = session.with_engine(|e, _| e.snapshot(tv.pid)) else { continue };
+            let dead = !snap.alive_self;
+            let h = stack_height(&snap);
+    let is_target = if attackers_mode {
+        s.targeted_by.contains(&tv.pid)
+    } else {
+        s.target == Some(tv.pid)
+    };
+    let is_targeted = s.targeted_by.contains(&tv.pid);            // 背景填充 = 危险度/死亡灰；边缘线 = 瞄准关系（淡蓝/红/紫）
+            if let Ok((_, mut sp, _)) = vq.get_mut(tv.bg) {
+                sp.color = danger_color(h, dead);
+            }
+            if let Ok((mut v, mut sp, _)) = vq.get_mut(tv.edge) {
+                if dead {
+                    *v = Visibility::Hidden;
+                } else if is_target && is_targeted {
+                    *v = Visibility::Visible;
+                    sp.color = Color::srgb(0.75, 0.35, 1.0);
+                } else if is_target {
+                    *v = Visibility::Visible;
+                    sp.color = Color::srgb(0.45, 0.75, 1.0);
+                } else if is_targeted {
+                    *v = Visibility::Visible;
+                    sp.color = Color::srgb(1.0, 0.32, 0.32);
+                } else {
+                    *v = Visibility::Hidden;
+                }
+            }
+            // 棋盘（死亡冻结：快照即死亡瞬间状态）
+            show_grid(&mut vq, &tv.cells, W, &|r, c| if snap.board[r][c] != 0 { Some(snap.board[r][c]) } else { None });
+            // 活动块 + 垃圾条（单列堆叠）
+            hide(&mut vq, &tv.active);
+            hide(&mut vq, &tv.meter);
+            if let Some(a) = snap.active {
+                for (i, &(dx, dy)) in a.kind.cells(a.rot).iter().enumerate() {
+                    let Some(&e) = tv.active.get(i) else { continue };
+                    let row = a.y_milli.div_euclid(1000) + dy as i64;
+                    let col = a.x as i64 + dx as i64;
+                    if (0..H as i64).contains(&row) && (0..W as i64).contains(&col) {
+                        let px = tv.origin.x + (col as f32 - (W as f32 - 1.0) / 2.0) * MINI;
+                        let py = tv.origin.y - (row as f32 - (H as f32 - 1.0) / 2.0) * MINI;
+                        place(&mut vq, e, Vec2::new(px, py), kind_color(a.kind.id()), 1.0);
+                    }
+                }
+            }
+            if !dead {
+                show_grid(&mut vq, &tv.meter, 1, &|r, _| {
+                    let idx = (H - 1 - r) as u32;
+                    if idx < snap.garbage_red {
+                        if red_on {
+                            Some(5)
+                        } else {
+                            None
+                        }
+                    } else if idx < snap.garbage_red + snap.garbage_yellow {
+                        Some(2)
+                    } else if idx < snap.garbage_red + snap.garbage_yellow + snap.garbage_gray {
+                        Some(8)
+                    } else {
+                        None
+                    }
+                });
+            }
+            // 灰蒙版 + 名次
+            if let Ok((mut v, mut sp, _)) = vq.get_mut(tv.mask) {
+                *v = if dead { Visibility::Visible } else { Visibility::Hidden };
+                sp.color = Color::srgba(0.45, 0.45, 0.5, 0.65);
+            }
+            // 击杀数：>3 用「数字+★」避免一排星星溢出小窗
+            set_text(
+                &mut text_q,
+                tv.badge,
+                if snap.badges == 0 {
+                    "".into()
+                } else if snap.badges > 3 {
+                    format!("{}★", snap.badges)
+                } else {
+                    "★".repeat(snap.badges as usize)
+                },
+            );
+            set_text(&mut text_q, tv.rank, if dead { format!("#{}", snap.place.unwrap_or(0)) } else { "".into() });
+            // 副操作光标：ID 标签高亮
+            if let Ok(mut tc) = color_q_state.get_mut(tv.id) {
+                tc.0 = if cursor_pid == Some(tv.pid) {
+                    Color::srgb(1.0, 0.9, 0.4)
+                } else {
+                    Color::srgb(0.7, 0.75, 0.8)
+                };
+            }
+        }
+    }
+}
+
+/// 网络线程：连接服务器，维护本地镜像（事件流重演），转发输入/重启
+#[cfg(not(target_arch = "wasm32"))]
+fn net_thread(
+    url: String,
+    id: String,
+    key: String,
+    observer: bool,
+    spectate: usize,
+    mirror: std::sync::Arc<std::sync::Mutex<MirrorState>>,
+    status: std::sync::Arc<std::sync::Mutex<String>>,
+    rx: std::sync::mpsc::Receiver<NetCmd>,
+    stats: std::sync::Arc<std::sync::Mutex<NetStats>>,
+) {
+    use tungstenite::{client::IntoClientRequest, handshake::client::Response, Message, WebSocket};
+    let role = if observer { "observer" } else { "player" };
+    let full = format!("{url}/ws?id={id}&key={key}&role={role}&spectate={spectate}");
+    let req = match full.into_client_request() {
+        Ok(r) => r,
+        Err(e) => {
+            *status.lock().unwrap() = format!("URL 无效: {e}");
+            return;
+        }
+    };
+    let (mut ws, _resp): (WebSocket<_>, Response) = match tungstenite::connect(req) {
+        Ok(x) => x,
+        Err(e) => {
+            *status.lock().unwrap() = format!("连接失败: {e}");
+            return;
+        }
+    };
+    *status.lock().unwrap() = "已连接，等待对局…".into();
+    stats.lock().unwrap().connected = true;
+    {
+        let mut st = stats.lock().unwrap();
+        st.player_id = id.clone();
+    }
+    if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_ref() {
+        let _ = tcp.set_read_timeout(Some(std::time::Duration::from_millis(40)));
+    }
+    let handle_msg = |t: &str, mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>, status: &std::sync::Arc<std::sync::Mutex<String>>, expected: &mut Option<u64>| -> bool {
+        let v: serde_json::Value = match serde_json::from_str(&t) { Ok(v) => v, Err(_) => return true };
+        match v["type"].as_str().unwrap_or("") {
+            "hello" => {
+                *expected = None;
+                {
+                    let mut st = stats.lock().unwrap();
+                    st.match_id = v["match_id"].as_u64().unwrap_or(0);
+                    st.connected = true;
+                }
+                let players = v["players"].as_u64().unwrap_or(2) as usize;
+                let seed = v["seed"].as_u64().unwrap_or(0);
+                let seat = v["seat"].as_i64().unwrap_or(-1);
+                // 规则参数随 hello 下发，镜像与权威引擎必然一致
+                let mut ruleset = Ruleset::default();
+                let tl = v["time_limit_secs"].as_u64().unwrap_or(0);
+                if tl > 0 {
+                    ruleset.match_ticks = (tl as i64) * 1000 * TMS;
+                }
+                ruleset.stall_accel = v["stall_accel"].as_bool().unwrap_or(true);
+                let mut g = mirror.lock().unwrap();
+                g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
+                g.my_seat = if seat >= 0 { seat as usize } else { spectate };
+                drop(g);
+                *status.lock().unwrap() = format!("对局 #{} 进行中", v["match"].as_u64().unwrap_or(0));
+            }
+            "tick" => {
+                // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
+                let tn = v["n"].as_u64();
+                if let (Some(tn), Some(exp)) = (tn, *expected) {
+                    if tn != exp {
+                        eprintln!("[mirror] 失步: 收到 tick n={tn} 期望 {exp}（本地镜像将重建）");
+                        *status.lock().unwrap() = "镜像失步，重连补史…".into();
+                        return false;
+                    }
+                }
+                let mut g = mirror.lock().unwrap();
+                if let Some(e) = g.engine.as_mut() {
+                    let n = e.players.len();
+                    let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; n];
+                    if let Some(arr) = v["in"].as_array() {
+                        for pair in arr {
+                            let pid = pair[0].as_u64().unwrap_or(0) as usize;
+                            if pid >= n { continue; }
+                            if let Some(evs) = pair[1].as_array() {
+                                inputs[pid] = evs.iter().filter_map(|e| {
+                                    let t = e.get(0)?.as_u64()? as u32;
+                                    let k = e.get(1)?.as_str()?;
+                                    let key = if k == "target_player" {
+                                        Key::TargetPlayer(e.get(2)?.as_u64()? as u16)
+                                    } else {
+                                        Key::from_name(k)?
+                                    };
+                                    Some(TimedKey { t_us: t, key })
+                                }).collect();
+                            }
+                        }
+                    }
+                    e.frame(&inputs);
+                }
+                *expected = Some(tn.unwrap_or(0) + 1);
+            }
+            "result" => {
+                let reason = v["reason"].as_str().unwrap_or("?");
+                let mut st = format!("对局结束[{reason}]：");
+                if let Some(arr) = v["places"].as_array() {
+                    st.push_str(&arr.iter().map(|p| format!("#{}→{}", p[0], p[1])).collect::<Vec<_>>().join(" "));
+                }
+                st.push_str("（按 R 重开）");
+                *status.lock().unwrap() = st;
+            }
+            "pong" => {
+                let t = v["t"].as_u64().unwrap_or(0);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let mut st = stats.lock().unwrap();
+                if now >= t && t > 0 {
+                    st.rtt_ms = (now - t) as u32;
+                }
+                st.pongs += 1;
+                st.loss_pct = if st.pings == 0 { 0 } else { (st.pings - st.pongs) * 100 / st.pings };
+                st.connected = true;
+            }
+            "error" => {
+                *status.lock().unwrap() = format!("服务器错误: {}", v["code"].as_str().unwrap_or("?"));
+            }
+            _ => {}
+        }
+        true
+    };
+    let mut expected: Option<u64> = None;
+    let mut last_ping = Instant::now();
+    'conn: loop {
+        if last_ping.elapsed().as_millis() >= 1000 {
+            last_ping = Instant::now();
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            stats.lock().unwrap().pings += 1;
+            let _ = ws.send(Message::Text(serde_json::json!({"type": "ping", "t": t}).to_string().into()));
+        }
+        match ws.read() {
+            Ok(Message::Text(t)) => {
+                if !handle_msg(&t.to_string(), &mirror, &status, &mut expected) {
+                    break 'conn; // 失步 → 触发重连
+                }
+            }
+            Ok(Message::Ping(d)) => { let _ = ws.send(Message::Pong(d)); }
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(tungstenite::Error::Io(ref e)) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                *status.lock().unwrap() = format!("连接断开: {e}");
+                stats.lock().unwrap().connected = false;
+                break 'conn;
+            }
+        }
+        while let Ok(cmd) = rx.try_recv() {
+            let msg = match cmd {
+                NetCmd::Input(evs) => serde_json::json!({
+                    "type": "input",
+                    "events": evs.iter().map(|t| match t.key {
+                        Key::TargetPlayer(v) => serde_json::json!([t.t_us, t.key.name(), v]),
+                        _ => serde_json::json!([t.t_us, t.key.name()]),
+                    }).collect::<Vec<_>>()
+                }),
+                NetCmd::Restart => serde_json::json!({"type": "restart"}),
+            };
+            if ws.send(Message::Text(msg.to_string().into())).is_err() {
+                *status.lock().unwrap() = "发送失败，连接断开".into();
+                break 'conn;
+            }
+        }
+    }
+    // —— 失步/断线后：观战端重连补史自愈；玩家端无法中途入场，放弃并保持最终画面 ——
+    if observer {
+        *status.lock().unwrap() = "重连中…".into();
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        net_thread(url, id, key, observer, spectate, mirror, status, rx, Default::default());
+    } else {
+        *status.lock().unwrap() = "已断开（保持最终画面）".into();
+    }
+}
+
+fn main() {
+    let mut seed = 42u64;
+    let mut n_bots = 3usize;
+    let mut tier = "advanced".to_string();
+    let mut scheme = Scheme::Wasd;
+    let mut server: Option<String> = None;
+    let mut my_id = "player1".to_string();
+    let mut my_key = "k".to_string();
+    let mut observer = false;
+    let mut spectate = 0usize;
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seed" => { seed = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(seed); i += 1; }
+            "--bots" => { n_bots = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(n_bots); i += 1; }
+            "--tier" => { tier = args.get(i + 1).cloned().unwrap_or(tier); i += 1; }
+            "--controls" => {
+                if args.get(i + 1).map(|s| s.as_str()) == Some("arrows") { scheme = Scheme::Arrows; }
+                i += 1;
+            }
+            "--server" => { server = args.get(i + 1).cloned(); i += 1; }
+            "--id" => { my_id = args.get(i + 1).cloned().unwrap_or(my_id); i += 1; }
+            "--key" => { my_key = args.get(i + 1).cloned().unwrap_or(my_key); i += 1; }
+            "--observer" => { observer = true; }
+            "--spectate" => { spectate = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(spectate); i += 1; }
+            _ => {}
+        }
+        i += 1;
+    }
+    let session = if let Some(url) = server {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mirror: std::sync::Arc<std::sync::Mutex<MirrorState>> = Default::default();
+            let status: std::sync::Arc<std::sync::Mutex<String>> = std::sync::Arc::new(std::sync::Mutex::new("连接中…".into()));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (m2, st2, url2, id2, key2) = (mirror.clone(), status.clone(), url.clone(), my_id.clone(), my_key.clone());
+            let stats: std::sync::Arc<std::sync::Mutex<NetStats>> = Default::default();
+            let stats2 = stats.clone();
+            std::thread::spawn(move || net_thread(url2, id2, key2, observer, spectate, m2, st2, rx, stats2));
+            Session::Net { mirror, tx, observer, status, stats }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (my_id, my_key, observer, spectate);
+            eprintln!("wasm 构建暂不支持 --server（本地模式）");
+            let n_bots = n_bots.clamp(1, 98);
+            let mut bots: Vec<Option<BotAdapter>> = vec![None];
+            for _ in 0..n_bots { bots.push(Some(BotAdapter::new(&tier))); }
+            Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: Ruleset::default() }), bots }
+        }
+    } else {
+        let n_bots = n_bots.clamp(1, 98);
+        let mut bots: Vec<Option<BotAdapter>> = vec![None];
+        for _ in 0..n_bots {
+            bots.push(Some(BotAdapter::new(&tier)));
+        }
+        Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: Ruleset::default() }), bots }
+    };
+    let mut window = Window {
+        title: "t99 · Arena Tetris".into(),
+        resolution: (1600.0, 900.0).into(),
+        ..default()
+    };
+    if !cfg!(target_arch = "wasm32") {
+        // 不锁帧：输入采集节奏即渲染循环（ADR-019）。wasm 上 rAF 节奏即显示刷新率。
+        window.present_mode = PresentMode::Immediate;
+    }
+    App::new()
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(window),
+            ..default()
+        }))
+        .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .insert_resource(session)
+        .insert_resource(InputQueue::default())
+        .insert_resource(scheme)
+        .add_systems(Startup, setup)
+        .add_systems(Update, (poll_input, sync).chain())
+        .add_systems(FixedUpdate, tick)
+        .run();
+}

@@ -1,0 +1,23 @@
+[package]
+name = "t99-bot-m"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Master / GrandMaster：与参赛模型程序完全同通道的外部程序（stdin/stdout 单行 JSON）。
+# 有意不依赖 t99-core / t99-proto——只依赖 serde，保证参赛线协议自洽完备。
+# 整个目录在 Arena 公开包中剔除（隐藏档，参赛方仅知晓其存在）。
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+[[bin]]
+name = "t99-bot-master"
+path = "src/bin/master.rs"
+
+[[bin]]
+name = "t99-bot-gm"
+path = "src/bin/gm.rs"
