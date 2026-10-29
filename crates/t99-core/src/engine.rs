@@ -203,6 +203,8 @@ pub struct Player {
     initial_hold: bool,
     rot_last_pressed: Option<u8>,
     rot_last_released: Option<u8>,
+    /// 当前 I*S 窗口内发生过释放；用于“以后松开的为准”
+    rot_released_in_window: bool,
     /// 本帧已发生锁定；后续 piece-action 不再执行
     locked_this_frame: bool,
     das: Das,
@@ -358,6 +360,7 @@ impl Match {
                 initial_hold: false,
                 rot_last_pressed: None,
                 rot_last_released: None,
+                rot_released_in_window: false,
                 locked_this_frame: false,
                 das: Das { left: false, right: false, dir: None, das: 0, arr: 0 },
                 lock_timer: 0,
@@ -467,7 +470,11 @@ impl Match {
         let (edge_rot, edge_hold, held_hold, held_rot) = {
             let p = &self.players[pid];
             let held_rot = if p.held_cw && p.held_ccw {
+                // 两边都还按住：以后按下的为准
                 p.rot_last_pressed.or(p.initial_rot)
+            } else if p.rot_released_in_window {
+                // 有一边已经松开：以后松开的为准
+                p.rot_last_released
             } else if p.held_cw {
                 Some(1)
             } else if p.held_ccw {
@@ -482,7 +489,8 @@ impl Match {
             && self.initial_triggered(edge_hold, held_hold);
         let want_rot = self.cfg.ruleset.irs
             && self.initial_triggered(edge_rot.is_some(), held_rot.is_some());
-        let rot = edge_rot.or(held_rot);
+        // held/释放规则优先于窗口内最后一次按下。
+        let rot = held_rot.or(edge_rot);
 
         // IHS 先：交换后递归 spawn，from_hold=true 只再应用 IRS。
         if want_hold {
@@ -497,6 +505,7 @@ impl Match {
         }
         self.players[pid].initial_rot = None;
         self.players[pid].initial_hold = false;
+        self.players[pid].rot_released_in_window = false;
     }
 
     /// 帧推进：sanitize 后按事件时刻精确积分。
@@ -784,6 +793,7 @@ impl Match {
                     Key::RotCwUp => {
                         p.held_cw = false;
                         p.rot_last_released = Some(1);
+                        p.rot_released_in_window = true;
                         return;
                     }
                     Key::RotCcwDown => {
@@ -795,6 +805,7 @@ impl Match {
                     Key::RotCcwUp => {
                         p.held_ccw = false;
                         p.rot_last_released = Some(3);
+                        p.rot_released_in_window = true;
                         return;
                     }
                     Key::Hold => {
@@ -1843,6 +1854,24 @@ mod tests {
         m.players[0].held_cw = true;
         m.spawn(0, Some(Kind::T), false);
         assert_eq!(m.players[0].active.unwrap().rot, 1);
+    }
+
+    #[test]
+    fn initial_rotation_direction_rules() {
+        let mut m = solo();
+        m.players[0].active = None;
+        m.apply_key(0, Key::RotCwDown);
+        m.apply_key(0, Key::RotCcwDown);
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().rot, 3); // 两边按住：后按下者
+
+        let mut m = solo();
+        m.players[0].active = None;
+        m.apply_key(0, Key::RotCwDown);
+        m.apply_key(0, Key::RotCcwDown);
+        m.apply_key(0, Key::RotCwUp);
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().rot, 1); // 已松开：后松开者
     }
 
     #[test]
