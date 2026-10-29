@@ -198,11 +198,35 @@ t99-hc              session + Policy，不编译 mirror
 | `keyframe` | S→C | 每 5s 或按需；完整对局状态 |
 | `digest` | S→C | 5/30Hz 对手盘面，仅 digest 模式 |
 | `resync` | C→S | 请求 keyframe + 后续 tick |
-| `result` | S→C | 广播 places；逐席 place/ko/lines/sent/pieces |
+| `result` | S→C | ranking：player_id/seat/rank/badges；逐席 ko/lines/sent/pieces |
 | `error` | S→C | auth / id_invalid / match_running / no_seat |
 | `ping/pong` | C↔S | JSON `t`；RTT/丢包/HUD |
 
 WS 控制帧 `Ping` 当前不再自动回 pong；要么由写线程统一处理，要么在协议层禁用并只保留 JSON ping。
+
+### 5.6 身份、结算与排名
+
+- `seat` 是 0..N-1 的整数席位；`player_id` 是字符串身份，两者分开。
+- PlayerID 在连接时查重，重复直接拒绝；席位从空闲席位随机分配，每局重新洗牌，不设 roster 顺序。
+- 结算向 stdout 输出一行 JSON，日志继续走 stderr：
+
+```json
+{"type":"match_result","match_id":123,"seed":123456,"reason":"time_limit",
+ "ranking":[
+  {"player_id":"A","seat":7,"rank":1,"badges":12,"alive":true},
+  {"player_id":"B","seat":31,"rank":1,"badges":12,"alive":true},
+  {"player_id":"C","seat":2,"rank":3,"badges":9,"alive":true},
+  {"player_id":"F","seat":88,"rank":4,"badges":4,"alive":false}
+ ]}
+```
+
+排名规则：
+
+1. `last_alive`：胜者 `rank = 1`；其余按淘汰序从后往前排，最后被淘汰者 `rank = 2`。
+2. 流局/时间到：幸存者按徽章降序；同徽章同名次；采用 competition 排名，即 `1,1,3,3,5`。
+3. 流局中的已淘汰者排在所有幸存者之后，按淘汰序从后往前排；起始名次为 `幸存者人数 + 1`。
+4. `badges` 对已淘汰者取被击倒时的值，对幸存者取终局值。
+5. 同一帧多人淘汰需要额外定义；建议同帧同名次，并让 competition 的下一位跳过该组。
 
 ## 6. Server 帧循环
 
