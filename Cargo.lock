@@ -3701,6 +3701,7 @@ name = "t99-config"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "t99-core",
  "toml",
 ]
 

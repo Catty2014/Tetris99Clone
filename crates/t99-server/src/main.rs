@@ -35,6 +35,8 @@ struct Args {
     max_frames: u64,
     /// 对局预算秒（0 = 按人数自动：4p 5min → 99p 15min）
     time_limit_secs: u64,
+    /// 只读规则集；CLI 的 time-limit/stall-accel 仍可覆盖
+    ruleset: Ruleset,
     /// 0 杀加速燃烧（展览机制；正式 Arena 关闭）
     stall_accel: bool,
     /// lobby 模式：席位由网络玩家（外部程序/提交程序/人类）接入，人数到齐自动开局；开局后加入无效。
@@ -90,6 +92,22 @@ fn parse_args() -> Args {
         seed = random_seed();
         eprintln!("[seed] {seed}");
     }
+    let rc = t99_config::load_ruleset(Some(std::path::Path::new(&cfg.ruleset_file)))
+        .unwrap_or_else(|e| {
+            eprintln!("[ruleset] {e}");
+            std::process::exit(2);
+        });
+    if rc.ruleset.id != RULESET_ID {
+        eprintln!(
+            "[ruleset] id 不匹配: file={} compiled={}；修改规则集后必须同步重编 RULESET_ID",
+            rc.ruleset.id, RULESET_ID
+        );
+        std::process::exit(2);
+    }
+    let ruleset = rc.to_ruleset().unwrap_or_else(|e| {
+        eprintln!("[ruleset] {e}");
+        std::process::exit(2);
+    });
     Args {
         address: get("--address").unwrap_or(cfg.server.address),
         port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(cfg.server.port),
@@ -100,6 +118,7 @@ fn parse_args() -> Args {
         seed,
         max_frames: get("--max-frames").and_then(|s| s.parse().ok()).unwrap_or(54_000),
         time_limit_secs: get("--time-limit-secs").and_then(|s| s.parse().ok()).unwrap_or(0),
+        ruleset,
         stall_accel: get("--stall-accel")
             .map(|s| s != "0" && s != "false")
             .unwrap_or(cfg.server.stalemate_accel),
@@ -339,8 +358,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             }
         }
 
-        let mut ruleset = Ruleset::default();
-        ruleset.match_ticks = if args.time_limit_secs > 0 { (args.time_limit_secs as Ticks) * 1000 * TMS } else { 0 };
+        let mut ruleset = args.ruleset.clone();
+        if args.time_limit_secs > 0 {
+            ruleset.match_ticks = (args.time_limit_secs as Ticks) * 1000 * TMS;
+        }
         ruleset.stall_accel = args.stall_accel;
         let mut engine = Match::new(MatchConfig { players, seed, ruleset });
         // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。

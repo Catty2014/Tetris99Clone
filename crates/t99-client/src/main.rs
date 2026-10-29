@@ -1724,6 +1724,7 @@ fn net_thread(
     key: String,
     observer: bool,
     spectate: usize,
+    base_ruleset: Ruleset,
     mirror: std::sync::Arc<std::sync::Mutex<MirrorState>>,
     status: std::sync::Arc<std::sync::Mutex<String>>,
     rx: std::sync::mpsc::Receiver<NetCmd>,
@@ -1774,7 +1775,7 @@ fn net_thread(
                 let seed = v["seed"].as_u64().unwrap_or(0);
                 let seat = v["seat"].as_i64().unwrap_or(-1);
                 // 规则参数随 hello 下发，镜像与权威引擎必然一致
-                let mut ruleset = Ruleset::default();
+                let mut ruleset = base_ruleset.clone();
                 let tl = v["time_limit_secs"].as_u64().unwrap_or(0);
                 if tl > 0 {
                     ruleset.match_ticks = (tl as i64) * 1000 * TMS;
@@ -1963,7 +1964,18 @@ fn net_thread(
     if observer {
         *status.lock().unwrap() = "重连中…".into();
         std::thread::sleep(std::time::Duration::from_millis(400));
-        net_thread(url, id, key, observer, spectate, mirror, status, rx, Default::default());
+        net_thread(
+            url,
+            id,
+            key,
+            observer,
+            spectate,
+            base_ruleset.clone(),
+            mirror,
+            status,
+            rx,
+            Default::default(),
+        );
     } else {
         *status.lock().unwrap() = "已断开（保持最终画面）".into();
     }
@@ -2027,6 +2039,23 @@ fn main() {
             cfg.display.framerate
         );
     }
+    let rc = t99_config::load_ruleset(Some(std::path::Path::new(&cfg.ruleset_file)))
+        .unwrap_or_else(|e| {
+            eprintln!("[ruleset] {e}");
+            std::process::exit(2);
+        });
+    if rc.ruleset.id != t99_core::RULESET_ID {
+        eprintln!(
+            "[ruleset] id 不匹配: file={} compiled={}；修改规则集后必须同步重编 RULESET_ID",
+            rc.ruleset.id,
+            t99_core::RULESET_ID
+        );
+        std::process::exit(2);
+    }
+    let base_ruleset = rc.to_ruleset().unwrap_or_else(|e| {
+        eprintln!("[ruleset] {e}");
+        std::process::exit(2);
+    });
     let timing = InputTiming {
         das_ticks: cfg.control.das_ticks,
         arr_ticks: cfg.control.arr_ticks,
@@ -2055,7 +2084,10 @@ fn main() {
             let (m2, st2, url2, id2, key2) = (mirror.clone(), status.clone(), url.clone(), my_id.clone(), my_key.clone());
             let stats: std::sync::Arc<std::sync::Mutex<NetStats>> = Default::default();
             let stats2 = stats.clone();
-            std::thread::spawn(move || net_thread(url2, id2, key2, observer, spectate, m2, st2, rx, stats2));
+            let ruleset2 = base_ruleset.clone();
+            std::thread::spawn(move || {
+                net_thread(url2, id2, key2, observer, spectate, ruleset2, m2, st2, rx, stats2)
+            });
             Session::Net { mirror, tx, observer, status, stats }
         }
         #[cfg(target_arch = "wasm32")]
@@ -2065,7 +2097,7 @@ fn main() {
             let n_bots = n_bots.clamp(1, 98);
             let mut bots: Vec<Option<BotAdapter>> = vec![None];
             for _ in 0..n_bots { bots.push(Some(BotAdapter::new(&tier))); }
-            Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: Ruleset::default() }), bots }
+            Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: base_ruleset.clone() }), bots }
         }
     } else {
         let n_bots = n_bots.clamp(1, 98);
@@ -2073,7 +2105,7 @@ fn main() {
         for _ in 0..n_bots {
             bots.push(Some(BotAdapter::new(&tier)));
         }
-        Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: Ruleset::default() }), bots }
+        Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: base_ruleset.clone() }), bots }
     };
     let mut window = Window {
         title: "t99 · Arena Tetris".into(),
