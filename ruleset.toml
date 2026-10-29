@@ -27,8 +27,7 @@ ihs = true                  # 同上
 allow_rot180 = false
 death = "block"
 
-das_ticks = 10              # 166.7ms
-arr_ticks = 2               # 33.3ms
+# DAS/ARR are headed-client input timing (client.toml), not ruleset.
 soft_milli_per_sec = 60000
 
 lock_delay = "move"         # 移动重置

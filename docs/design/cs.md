@@ -79,6 +79,8 @@ t99-hc              session + Policy，不编译 mirror
 - 一个逻辑帧窗口内的多次采样编码成多个 `t_us` 事件；每逻辑帧最多一个 `input` 批次。
 - 例：采样 240Hz、逻辑 60Hz，一帧 4 个事件，`t_us` 分布在 0–16666。
 - 采样写入带时间戳的 ring；逻辑帧边界只做“取走并封装”，不阻塞采样。
+- DAS/ARR 属于有头客户端的输入时序：客户端把按住状态折算成离散的 `left_down` / `right_down` 事件；HeadlessClient 直接发每格一个离散事件，不关心 DAS/ARR。
+- 引擎不再根据按住状态自动重复横向移动；`left_up` / `right_up` 只是释放标记。
 - Client 的本地回显只能是 UI 预测，不能回灌 `Match`。
 
 ### 3.3 显示
@@ -92,6 +94,7 @@ t99-hc              session + Policy，不编译 mirror
 
 - 由 `state` 到达驱动，60Hz。
 - 内部可以更高频规划，但提交仍按 `n_intent` 批量。
+- 只产生离散语义事件：要左移几格就发几个 `left_down`，不实现 DAS/ARR。
 - 不跑渲染循环，不编译 mirror。
 
 ## 4. 对手速率
@@ -190,6 +193,9 @@ t99-hc              session + Policy，不编译 mirror
 - 过期或越界整批丢弃并计 miss。
 - `profile=program` 每帧必须发，允许空 `events`；`profile=human` 可以不发，视为空输入。
 - `target_player` 额外带 `v`。
+- `left_down` / `right_down` 是离散的一格移动，不是“按住”信号；同一帧可以按 `t_us` 顺序出现多次，上限仍为 16 个事件。`left_up` / `right_up` 只是释放标记。
+- DAS/ARR 不进入 `input`：有头客户端把按住状态折算成离散 down 事件；HeadlessClient 每格发一个事件。
+- WebSocket 上对象形式 `{t_us,k,v}` 与数组形式 `[t_us,k,v?]` 等价；`tick` 使用数组形式。
 
 ### 5.5 其他消息
 

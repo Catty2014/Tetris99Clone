@@ -16,6 +16,11 @@ spectate = 0
 # player_id / key are injected by the runtime manifest, CLI, or environment.
 
 [control]
+# Headed-client input timing. Headless clients emit discrete events and ignore these.
+# ARR is the repeat interval after DAS; 0 means instant repeat.
+das_ms = 167
+arr_ms = 33
+
 # Key names:
 #   letters: uppercase letter itself ("A", "Z")
 #   digits:  "0".."9"
