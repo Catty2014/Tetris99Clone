@@ -220,6 +220,14 @@ pub struct Player {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    /// 因对方待进上限或无人可送而丢弃的行
+    pub dropped: u32,
+    /// 自己消行时抵消掉的待进垃圾行
+    pub canceled: u32,
+    /// 真正进入自己场地的垃圾行
+    pub inserted: u32,
+    /// 历史最大待进行数（含红黄灰）
+    pub peak_pending: u32,
     pub pieces: u32,
     pub target_mode: TargetMode,
     pub last_target: Option<usize>,
@@ -316,6 +324,10 @@ pub struct TableRow {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    pub dropped: u32,
+    pub canceled: u32,
+    pub inserted: u32,
+    pub peak_pending: u32,
     pub pieces: u32,
     pub reason: Option<String>,
 }
@@ -375,6 +387,10 @@ impl Match {
                 badges: 0,
                 lines: 0,
                 sent: 0,
+                dropped: 0,
+                canceled: 0,
+                inserted: 0,
+                peak_pending: 0,
                 pieces: 0,
                 target_mode: TargetMode::Kos,
                 last_target: None,
@@ -1112,6 +1128,7 @@ impl Match {
         let g = self.players[pid].pending.remove(0);
         let n = g.rows as usize;
         let last_sender = g.sender;
+        self.players[pid].inserted += g.rows;
         let p_same = self.cfg.ruleset.p_same_hole_pct;
         {
             let p = &mut self.players[pid];
@@ -1155,15 +1172,19 @@ impl Match {
         }
     }
 
-    fn cancel_pending(&mut self, pid: usize, mut n: u32) {
+    fn cancel_pending(&mut self, pid: usize, mut n: u32) -> u32 {
+        let mut canceled = 0;
         while n > 0 && !self.players[pid].pending.is_empty() {
             let take = n.min(self.players[pid].pending[0].rows);
             self.players[pid].pending[0].rows -= take;
             n -= take;
+            canceled += take;
             if self.players[pid].pending[0].rows == 0 {
                 self.players[pid].pending.remove(0);
             }
         }
+        self.players[pid].canceled += canceled;
+        canceled
     }
 
     /// 消行延迟结束：压实待消行、落盘就绪垃圾、进入 ARE。
@@ -1365,15 +1386,12 @@ impl Match {
             let are = self.cfg.ruleset.are(self.phase_idx);
             self.players[pid].phase = PlayerPhase::Are(are);
         }
-        if n > 0 && sent_rows > 0 && self.alive_count > 1 {
+        if n > 0 && sent_rows > 0 {
             let recv = self.resolve_receivers(pid, sent_rows);
+            let mut delivered = 0u32;
             for (rid, rows) in recv {
-                let room = self.cfg.ruleset.pending_cap_rows
-                    - self.players[rid]
-                        .pending
-                        .iter()
-                        .map(|g| g.rows)
-                        .sum::<u32>();
+                let have: u32 = self.players[rid].pending.iter().map(|g| g.rows).sum();
+                let room = self.cfg.ruleset.pending_cap_rows.saturating_sub(have);
                 let rows = rows.min(room);
                 if rows > 0 {
                     // 队列为空立即开始计时（黄），否则灰排队
@@ -1382,10 +1400,15 @@ impl Match {
                     } else {
                         GarbState::Gray
                     };
-                    self.players[rid].pending.push(Garb { rows, sender: pid, state });
+                    let p = &mut self.players[rid];
+                    p.pending.push(Garb { rows, sender: pid, state });
+                    let now: u32 = p.pending.iter().map(|g| g.rows).sum();
+                    p.peak_pending = p.peak_pending.max(now);
+                    delivered += rows;
                 }
             }
-            self.players[pid].sent += sent_rows;
+            self.players[pid].sent += delivered;
+            self.players[pid].dropped += sent_rows - delivered;
         }
     }
 
@@ -1506,6 +1529,10 @@ impl Match {
                 badges: p.badges,
                 lines: p.lines,
                 sent: p.sent,
+                dropped: p.dropped,
+                canceled: p.canceled,
+                inserted: p.inserted,
+                peak_pending: p.peak_pending,
                 pieces: p.pieces,
                 reason: p.death_reason.as_ref().map(|r| match r {
                     DeathReason::TopOut => "top_out".to_string(),
