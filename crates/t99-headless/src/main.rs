@@ -134,7 +134,7 @@ fn cmd_run(args: &[String]) {
 
     // 握手
     for pid in 0..seats.len() {
-        let hello = hello_for(pid, players, ruleset.preview);
+        let hello = hello_for(pid, &format!("seat{pid}"), players, ruleset.preview);
         if seats[pid].adapter.setup(&hello).is_err() {
             seats[pid].killed = true;
             engine.kill(pid, "setup_failed");
@@ -238,7 +238,11 @@ fn cmd_run(args: &[String]) {
         let msg = ResultMsg {
             kind: "result",
             n,
+            seat: pid,
+            player_id: format!("seat{pid}"),
             place: place_map[pid],
+            rank: row.rank,
+            badges: row.badges,
             players,
             ko: row.ko,
             lines: row.lines,

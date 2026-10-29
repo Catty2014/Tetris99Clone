@@ -19,7 +19,7 @@ pub const MILLI: i64 = 1000;
 
 /// 服务器 hello.protocol
 pub const PROTOCOL_MIN: u32 = 5;
-pub const PROTOCOL_MAX: u32 = 7;
+pub const PROTOCOL_MAX: u32 = 8;
 
 // ———— 线协议（参赛方视角）———
 
@@ -36,9 +36,9 @@ pub struct FrameIn {
     #[serde(rename = "type")]
     pub kind: String,
     pub n: u64,
-    /// 本帧归属玩家 pid（v7 起用于围猎决策排除自己）
-    #[serde(default)]
-    pub player_id: usize,
+    /// 本帧归属席位（v8 起与 player_id 字符串分开）
+    #[serde(default, alias = "player_id")]
+    pub seat: usize,
     #[serde(default)]
     pub board: Vec<String>,
     pub active: Option<ActiveIn>,
@@ -1300,7 +1300,7 @@ impl Brain {
             .badges_all
             .iter()
             .enumerate()
-            .filter(|&(i, _)| i != fr.player_id)
+            .filter(|&(i, _)| i != fr.seat)
             .max_by_key(|&(_, &b)| b);
         // GM（「可以不活，其余参赛者必须死」）：围猎永远优先于反攻；
         // Master：仅当真正受威胁（待进垃圾 ≥3 行）才反攻，否则坚持围猎/进攻。

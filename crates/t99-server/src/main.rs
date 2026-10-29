@@ -262,6 +262,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 let hello = serde_json::json!({
                     "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
+                    "player_id": c.id.clone(),
                     "role": if c.seat.is_some() { "player" } else { "observer" },
                     "time_limit_secs": args.time_limit_secs,
                     "stall_accel": args.stall_accel,
@@ -274,6 +275,20 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         ruleset.match_ticks = if args.time_limit_secs > 0 { (args.time_limit_secs as Ticks) * 1000 * TMS } else { 0 };
         ruleset.stall_accel = args.stall_accel;
         let mut engine = Match::new(MatchConfig { players, seed, ruleset });
+        // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。
+        let seat_ids: Vec<String> = {
+            let h = hall.lock().unwrap();
+            (0..players)
+                .map(|pid| {
+                    h.clients
+                        .iter()
+                        .flatten()
+                        .find(|c| c.seat == Some(pid))
+                        .map(|c| c.id.clone())
+                        .unwrap_or_else(|| format!("bot-{pid}"))
+                })
+                .collect()
+        };
         // 席位适配器：前 human_seats 席 = 网络玩家（lobby），其余 = 内建 bot / 外部子进程
         let mut net_iter = net_bots.into_iter();
         let mut bots: Vec<Option<Box<dyn PlayerAdapter>>> = (0..players)
@@ -295,27 +310,12 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         // 外部程序握手：ready 超时/拒绝 → 直接判负（与正式 Arena 语义一致）
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
-                if let Err(e) = b.setup(&hello_for(pid, players, 6)) {
+                if let Err(e) = b.setup(&hello_for(pid, &seat_ids[pid], players, 6)) {
                     eprintln!("[seat {pid}] {} setup 失败: {e:?}", b.name());
                     engine.kill(pid, "setup_failed");
                 }
             }
         }
-
-        // 结算输出用：seat -> PlayerID；bot 席位生成稳定占位 ID。
-        let seat_ids: Vec<String> = {
-            let h = hall.lock().unwrap();
-            (0..players)
-                .map(|pid| {
-                    h.clients
-                        .iter()
-                        .flatten()
-                        .find(|c| c.seat == Some(pid))
-                        .map(|c| c.id.clone())
-                        .unwrap_or_else(|| format!("bot-{pid}"))
-                })
-                .collect()
-        };
 
         let mut next_inputs: HashMap<usize, Vec<TimedKey>> = HashMap::new();
         // 当前局的全部 tick（供中途加入的观战端回放）
@@ -483,10 +483,15 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
                 let p = &engine.players[pid];
+                let row = ranking.iter().find(|r| r.pid == pid);
                 let msg = ResultMsg {
                     kind: "result",
                     n: engine.frame_n,
+                    seat: pid,
+                    player_id: seat_ids[pid].clone(),
                     place: p.place,
+                    rank: row.map(|r| r.rank).unwrap_or(0),
+                    badges: p.badges,
                     players,
                     ko: p.ko,
                     lines: p.lines,
@@ -717,7 +722,7 @@ fn main() {
             }
             if let Some(s) = seat {
                 let _ = ws.send(Message::Text(
-                    serde_json::json!({"type":"seat","seat":s,"spectate":spectate}).to_string().into(),
+                    serde_json::json!({"type":"seat","seat":s,"player_id":id.clone(),"spectate":spectate}).to_string().into(),
                 ));
             } else {
                 let _ = ws.send(Message::Text(

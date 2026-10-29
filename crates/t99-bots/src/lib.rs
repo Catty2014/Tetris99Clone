@@ -699,7 +699,7 @@ impl PlayerAdapter for BotAdapter {
         format!("bot:{}", self.label)
     }
     fn setup(&mut self, hello: &Hello) -> Result<(), AdapterError> {
-        self.bot.ready(hello.player_id, hello.players, hello.preview);
+        self.bot.ready(hello.seat, hello.players, hello.preview);
         let _ = AdapterError::Timeout;
         Ok(())
     }

@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use t99_core::{Key, Snapshot, TimedKey};
 
-pub const PROTOCOL: u32 = 7;
+pub const PROTOCOL: u32 = 8;
 pub const FRAME_DEADLINE: Duration = Duration::from_millis(16);
 pub const READY_DEADLINE: Duration = Duration::from_millis(2000);
 pub const MAX_CONSECUTIVE_MISS: u32 = 600;
@@ -31,7 +31,10 @@ pub struct Hello {
     pub protocol: u32,
     pub ruleset: &'static str,
     pub frame_hz: u32,
-    pub player_id: usize,
+    /// 引擎内部席位编号
+    pub seat: usize,
+    /// 外部身份；与 seat 分开
+    pub player_id: String,
     pub players: usize,
     pub board: BoardSpec,
     pub preview: usize,
@@ -44,13 +47,14 @@ pub struct BoardSpec {
     pub h: usize,
 }
 
-pub fn hello_for(pid: usize, players: usize, preview: usize) -> Hello {
+pub fn hello_for(pid: usize, player_id: &str, players: usize, preview: usize) -> Hello {
     Hello {
         kind: "hello",
         protocol: PROTOCOL,
         ruleset: t99_core::RULESET_ID,
         frame_hz: 60,
-        player_id: pid,
+        seat: pid,
+        player_id: player_id.to_string(),
         players,
         board: BoardSpec { w: t99_core::W, h: t99_core::H },
         preview,
@@ -67,7 +71,8 @@ pub struct FrameMsg {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub n: u64,
-    pub player_id: usize,
+    /// 引擎内部席位编号；外部身份在 hello.player_id
+    pub seat: usize,
     pub board: Vec<String>,
     pub active: Option<ActiveMsg>,
     /// 玩家相位：play / clear / are
@@ -167,7 +172,7 @@ impl FrameMsg {
         FrameMsg {
             kind: "frame",
             n: s.n,
-            player_id: pid,
+            seat: pid,
             board: board_rows(s),
             active: s.active.map(|a| ActiveMsg { t: a.kind.ch(), r: a.rot, x: a.x, y_m: a.y_milli }),
             phase: PhaseMsg { kind: s.phase.tag(), ms_left: s.phase.ms_left() },
@@ -277,7 +282,11 @@ pub struct ResultMsg {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub n: u64,
+    pub seat: usize,
+    pub player_id: String,
     pub place: Option<u32>,
+    pub rank: u32,
+    pub badges: u32,
     pub players: usize,
     pub ko: u32,
     pub lines: u32,
@@ -866,11 +875,12 @@ mod tests {
 
     #[test]
     fn hello_json_shape() {
-        let h = hello_for(3, 4, 6);
+        let h = hello_for(3, "human-1234", 4, 6);
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.contains(r#""type":"hello""#));
-        assert!(s.contains(r#""player_id":3"#));
-        assert!(s.contains(r#""protocol":7"#));
+        assert!(s.contains(r#""seat":3"#));
+        assert!(s.contains(r#""player_id":"human-1234""#));
+        assert!(s.contains(r#""protocol":8"#));
         assert!(s.contains(r#""ruleset":"9f3c1a7e""#));
     }
 }

@@ -135,8 +135,8 @@ t99-hc              session + Policy，不编译 mirror
 服务器在鉴权、席位分配完成后先发 `hello`：
 
 ```json
-{"type":"hello","protocol":7,"ruleset":"9f3c1a7e","match_id":123,"seed":20261029,
- "players":99,"seat":7,"role":"player","profile":"program",
+{"type":"hello","protocol":8,"ruleset":"9f3c1a7e","player_id":"human-1a2b3c4d",
+ "match_id":123,"seed":20261029,"players":99,"seat":7,"role":"player","profile":"program",
  "logic_hz":60,"lead_frames":2,"tick_hz":60,
  "summary_hz":5,"opp_view_hz":30,
  "time_limit_secs":300,"stall_accel":false}
@@ -148,7 +148,7 @@ t99-hc              session + Policy，不编译 mirror
 - 接受时回：
 
 ```json
-{"type":"ready","protocol":7,"ruleset":"9f3c1a7e"}
+{"type":"ready","protocol":8,"ruleset":"9f3c1a7e"}
 ```
 
 - 服务器再次校验；不匹配同样关闭连接。`ready` 超时 2s 视为拒绝。
@@ -161,10 +161,10 @@ t99-hc              session + Policy，不编译 mirror
 ### 5.2 HeadlessClient 订阅
 
 ```json
-{"type":"state","n":1234,"player_id":7, "...": "Snapshot 字段"}
+{"type":"state","n":1234,"seat":7, "...": "Snapshot 字段"}
 ```
 
-`player_id` 必须是真实席位，不能硬编码 0。
+`seat` 是引擎内部席位；字符串身份在 hello 的 `player_id` 里。`seat` 不能硬编码 0。
 
 ```json
 {"type":"summary","n":1234,
@@ -349,7 +349,7 @@ loop:
 | `t99-proto::NetPlayerAdapter` | `t99-session` 的 WS transport + server `ClientSession` |
 | `t99-proto::SubprocessAdapter` | `t99-session` 的 stdio transport |
 | `NetPlayerAdapter::act` 串行 | 帧循环 drain `input(n_intent)` |
-| `FrameMsg::from_snapshot(snap, 0)` | `state`，`player_id = pid` |
+| `FrameMsg::from_snapshot(snap, 0)` | `state`，`seat = pid`；`player_id` 字符串在 hello/result |
 | `t99-client` FixedUpdate drain+send | SessionCore + 独立 InputQueue + 渲染插值 |
 | `t99-bot-m run_ws` / `t99-ws-bot` | `t99-hc` + `Policy` |
 | `history: Vec<String>` 全量 | `keyframe` 每 5s + 最近 tick |
@@ -363,6 +363,7 @@ loop:
 - **P1a 已完成**（`5fdf3e9`）：`PlayerAdapter` 增加 `begin_frame`/`try_input`/`end_frame`，服务器先全量发帧，再用共享 deadline 收集；99 席全网络 300 帧实测 59.07 TPS、65.8% 单核、0 setup 失败。
 - **M1 已完成**：`input` 事件兼容对象/数组；引擎移除 DAS/ARR，`left_down`/`right_down` 每次移动一格；有头客户端按 `das_ms`/`arr_ms` 生成离散序列；HeadlessClient 不关心 DAS/ARR。
 - **M2a 已完成**（`6dbe075`）：hello/ready 带 `protocol` + 短 `ruleset`，客户端不匹配立即拒绝；席位随机分配；PlayerID 查重；`--ids` 改为可选 allowlist，不再决定座次。
+- **M2b 已完成**：protocol 升 8；wire 上 `seat` 为整数、`player_id` 为字符串；`Hello`/`FrameMsg`/`ResultMsg` 同步拆分；`t99-bot-m` 用 `seat` 做围猎排除。
 - **M3 已完成**：`Player` 记录 `death_frame`；`final_ranking()` 实现正常局淘汰序、流局幸存者徽章 competition、同帧淘汰同名次；服务器向 stdout 输出 `match_result` JSON（player_id/seat/rank/badges/alive/ko/lines/sent/pieces）。
 - **P1b 待做**：`input(n_intent)` 事件流与 `lead_frames`，去掉私有 `frame` 请求/应答；WAN 下当前 16ms deadline 仍会丢帧。
 - **P2 待做**：`t99-session` 抽取、`t99-headless connect`、`Policy`。

@@ -83,7 +83,7 @@ fn main() {
             .collect();
         for (pid, b) in adapters.iter_mut().enumerate() {
             if let Some(b) = b {
-                if let Err(e) = b.setup(&hello_for(pid, players, 6)) {
+                if let Err(e) = b.setup(&hello_for(pid, &format!("seat{pid}"), players, 6)) {
                     eprintln!("[seat {pid}] {} setup 失败: {e:?}", b.name());
                     m.kill(pid, "setup_failed");
                 }
@@ -177,7 +177,11 @@ fn main() {
                 let msg = ResultMsg {
                     kind: "result",
                     n: m.frame_n,
+                    seat: pid,
+                    player_id: format!("seat{pid}"),
                     place: p.place,
+                    rank: p.place.unwrap_or(0),
+                    badges: p.badges,
                     players,
                     ko: p.ko,
                     lines: p.lines,
