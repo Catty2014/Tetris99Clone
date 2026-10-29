@@ -93,7 +93,7 @@ impl Default for ControlSection {
             left: "A".into(),
             right: "D".into(),
             rotate: vec!["W".into(), "X".into()],
-            rotate_c: vec!["<L-C>".into(), "Z".into()],
+            rotate_c: vec!["Z".into(), "<L-C>".into()],
             softdrop: "S".into(),
             harddrop: "<SP>".into(),
             hold: vec!["C".into(), "<L-S>".into()],
@@ -417,6 +417,7 @@ impl Default for RulesetConfig {
 #[serde(default)]
 pub struct RulesetSection {
     pub id: String,
+    pub tick_hz: u32,
     pub board_width: usize,
     pub board_height: usize,
     pub hidden_rows: usize,
@@ -448,6 +449,7 @@ impl Default for RulesetSection {
     fn default() -> Self {
         Self {
             id: "9f3c1a7e".into(),
+            tick_hz: 60,
             board_width: 10,
             board_height: 20,
             hidden_rows: 4,
@@ -587,7 +589,14 @@ impl RulesetConfig {
             "either" => t99_core::InitialTrigger::Either,
             other => return Err(ConfigError::Rules(format!("initial_trigger={other:?}"))),
         };
-        let tick = |n: u32| n as t99_core::Ticks * t99_core::FRAME_TICKS;
+        if r.tick_hz == 0 || t99_core::TPS % r.tick_hz as t99_core::Ticks != 0 {
+            return Err(ConfigError::Rules(format!(
+                "tick_hz={} 必须整除引擎时基 {}（60/120/...）",
+                r.tick_hz,
+                t99_core::TPS
+            )));
+        }
+        let tick = |n: u32| n as t99_core::Ticks * (t99_core::TPS / r.tick_hz as t99_core::Ticks);
         let phases: Vec<t99_core::PhaseSpec> = r
             .stage
             .iter()
@@ -606,6 +615,7 @@ impl RulesetConfig {
         }
         Ok(t99_core::Ruleset {
             preview: r.preview,
+            tick_hz: r.tick_hz,
             irs: r.irs,
             ihs: r.ihs,
             initial_trigger: trigger,
@@ -722,6 +732,22 @@ seed = 0
 
         let mut c = RulesetConfig::default();
         c.ruleset.stage[0].are_ticks = 0;
+        assert!(c.to_ruleset().is_err());
+    }
+
+    #[test]
+    fn ruleset_tick_hz_scales_tick_durations() {
+        let mut c = RulesetConfig::default();
+        c.ruleset.tick_hz = 120;
+        let r = c.to_ruleset().unwrap();
+        assert_eq!(r.tick_hz, 120);
+        assert_eq!(r.frame_ticks(), t99_core::TPS / 120);
+        assert_eq!(r.lock_ticks, 30 * (t99_core::TPS / 120));
+        assert_eq!(r.phases[0].are, 6 * (t99_core::TPS / 120));
+        // match_seconds 是绝对时间
+        assert_eq!(r.match_ticks, 900 * 1000 * t99_core::TMS);
+
+        c.ruleset.tick_hz = 0;
         assert!(c.to_ruleset().is_err());
     }
 

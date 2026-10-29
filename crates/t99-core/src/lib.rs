@@ -389,6 +389,8 @@ pub struct PhaseSpec {
 #[derive(Clone, Debug)]
 pub struct Ruleset {
     pub preview: usize,
+    /// 逻辑 tick 速率；规则时长仍是绝对时间，120Hz 只改变每帧步长
+    pub tick_hz: u32,
     pub irs: bool,
     pub ihs: bool,
     pub initial_trigger: InitialTrigger,
@@ -431,6 +433,7 @@ impl Default for Ruleset {
     fn default() -> Self {
         Ruleset {
             preview: 6,
+            tick_hz: 60,
             irs: true,
             ihs: true,
             initial_trigger: InitialTrigger::Either,
@@ -494,6 +497,10 @@ impl Default for Ruleset {
 }
 
 impl Ruleset {
+    pub fn frame_ticks(&self) -> Ticks {
+        TPS / self.tick_hz.max(1) as Ticks
+    }
+
     pub fn phase_of(&self, alive: usize, start: usize) -> usize {
         let ratio = ((alive.max(1) * 1000) / start.max(1)) as u32;
         for (i, p) in self.phases.iter().enumerate() {

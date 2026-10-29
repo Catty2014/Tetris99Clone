@@ -608,7 +608,7 @@ fn session_tick_hz(session: &Session) -> u32 {
                 h
             }
         }
-        _ => DEFAULT_TICK_HZ,
+        Session::Local { engine, .. } => engine.cfg.ruleset.tick_hz.max(1),
     }
 }
 
@@ -1776,6 +1776,12 @@ fn net_thread(
                 let seat = v["seat"].as_i64().unwrap_or(-1);
                 // 规则参数随 hello 下发，镜像与权威引擎必然一致
                 let mut ruleset = base_ruleset.clone();
+                let tick_hz = v["tick_hz"]
+                    .as_u64()
+                    .or_else(|| v["frame_hz"].as_u64())
+                    .unwrap_or(DEFAULT_TICK_HZ as u64) as u32;
+                // tick 速率以服务器 hello 为准，镜像引擎的帧长必须跟着服务器
+                ruleset.tick_hz = tick_hz.max(1);
                 let tl = v["time_limit_secs"].as_u64().unwrap_or(0);
                 if tl > 0 {
                     ruleset.match_ticks = (tl as i64) * 1000 * TMS;
@@ -1784,10 +1790,7 @@ fn net_thread(
                 let mut g = mirror.lock().unwrap();
                 g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
                 g.my_seat = if seat >= 0 { seat as usize } else { spectate };
-                g.tick_hz = v["tick_hz"]
-                    .as_u64()
-                    .or_else(|| v["frame_hz"].as_u64())
-                    .unwrap_or(DEFAULT_TICK_HZ as u64) as u32;
+                g.tick_hz = tick_hz;
                 g.pending_frame_n = 0;
                 g.last_input_n = 0;
                 drop(g);

@@ -516,6 +516,7 @@ impl Match {
         for p in &mut self.players {
             p.locked_this_frame = false;
         }
+        let frame_ticks = self.cfg.ruleset.frame_ticks();
         let n = self.players.len();
         let mut per: Vec<Vec<TimedKey>> = (0..n)
             .map(|i| inputs.get(i).and_then(|v| sanitize_events(v)).unwrap_or_default())
@@ -544,14 +545,14 @@ impl Match {
                 }
             }
             if !stop {
-                self.advance(pid, FRAME_TICKS - cursor);
+                self.advance(pid, frame_ticks - cursor);
             }
             if self.over.is_some() {
                 break;
             }
         }
         self.frame_n += 1;
-        self.phase_ticks += FRAME_TICKS;
+        self.phase_ticks += frame_ticks;
         // 对局倒计时：最后一次击杀 T 秒后（T>60）以 T/60 倍速燃烧（0 杀加速，展览用）；
         // 归零即按排序键终局（rule.md 8 排序键 / 9 时间上限）
         if self.over.is_none() {
@@ -575,14 +576,15 @@ impl Match {
 
     /// 本帧倒计时燃烧量：正常一帧；0 杀超过 60s 后线性升至 T/60 倍
     fn burn_ticks(&self) -> Ticks {
+        let frame_ticks = self.cfg.ruleset.frame_ticks();
         if !self.cfg.ruleset.stall_accel {
-            return FRAME_TICKS;
+            return frame_ticks;
         }
         let gap = self.frame_n.saturating_sub(self.last_death_frame.unwrap_or(0));
         if gap <= 60 * 60 {
-            return FRAME_TICKS;
+            return frame_ticks;
         }
-        (FRAME_TICKS as u128 * gap as u128 / 3600) as Ticks
+        (frame_ticks as u128 * gap as u128 / 3600) as Ticks
     }
 
     fn advance(&mut self, pid: usize, mut dt: Ticks) {
@@ -1651,7 +1653,7 @@ impl Match {
             alive_self: p.alive,
             place: p.place,
             match_secs_left: ((self.match_ticks_left + 1000 * TMS - 1) / (1000 * TMS)) as u32,
-            burn_x10: ((self.burn_ticks() as u128 * 10 / FRAME_TICKS as u128) as u16).max(1),
+            burn_x10: ((self.burn_ticks() as u128 * 10 / self.cfg.ruleset.frame_ticks().max(1) as u128) as u16).max(1),
             pid: pid_field,
             badges_all: self.players.iter().map(|p| p.badges).collect(),
             targeted_by: (0..self.players.len())
@@ -1943,13 +1945,14 @@ mod tests {
         let before = m.match_ticks_left;
         m.frame(&[vec![], vec![], vec![]]);
         // frame() 先自增 frame_n 再燃烧 → gap = 4201
-        assert_eq!(m.match_ticks_left, before - (FRAME_TICKS * 4201) / 3600);
+        let frame_ticks = m.cfg.ruleset.frame_ticks();
+        assert_eq!(m.match_ticks_left, before - (frame_ticks * 4201) / 3600);
         // 击杀复位 1×
         m.kill(1, "test");
         assert_eq!(m.last_death_frame, Some(m.frame_n));
         let before = m.match_ticks_left;
         m.frame(&[vec![], vec![], vec![]]);
-        assert_eq!(m.match_ticks_left, before - FRAME_TICKS);
+        assert_eq!(m.match_ticks_left, before - frame_ticks);
         // 锚点留在帧 0（gap 已远超 60s，燃烧 >1× 且持续加速）→ 预算烧完即 time_limit 终局
         m.last_death_frame = Some(0);
         let mut guard = 0;
@@ -2022,8 +2025,29 @@ mod tests {
         // 无消行 → 直接 ARE，期间无活动块
         assert!(m.players[0].active.is_none());
         assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
-        let are_frames = m.cfg.ruleset.are(0) / FRAME_TICKS + 2;
+        let are_frames = m.cfg.ruleset.are(0) / m.cfg.ruleset.frame_ticks() + 2;
         run_quiet(&mut m, are_frames as u64);
+        assert!(m.players[0].active.is_some());
+        assert_eq!(m.players[0].phase, PlayerPhase::Play);
+    }
+
+    #[test]
+    fn doubled_tick_rate_halves_frame_ticks_without_changing_absolute_timing() {
+        let mut r = Ruleset::default();
+        r.tick_hz = 120;
+        assert_eq!(r.frame_ticks(), TPS / 120);
+        // 规则时长是绝对时间，不随 tick_hz 变化
+        assert_eq!(r.are(0), 100 * TMS);
+        assert_eq!(r.lock_ticks, 500 * TMS);
+
+        let mut m = Match::new(MatchConfig { players: 1, seed: 3, ruleset: r });
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
+        m.lock_piece(0);
+        assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
+        // 120Hz 下 ARE 100ms = 12 帧
+        run_quiet(&mut m, 11);
+        assert!(m.players[0].active.is_none());
+        run_quiet(&mut m, 2);
         assert!(m.players[0].active.is_some());
         assert_eq!(m.players[0].phase, PlayerPhase::Play);
     }

@@ -19,8 +19,7 @@ use t99_bots::BotAdapter;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, RULESET_ID};
 use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
 
-/// 逻辑帧墙钟周期：16.6667ms。引擎时基本身是 FRAME_TICKS，这里只负责节流。
-const FRAME_NS: u64 = 1_000_000_000 / 60;
+/// 逻辑帧墙钟周期由 ruleset.tick_hz 决定；引擎时基本身是 frame_ticks，这里只负责节流。
 /// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
 const MSG_CLOSE: &str = "\u{0}close";
 
@@ -253,6 +252,8 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
     'match_one: loop {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(match_no | 1);
         let players = args.players;
+        let tick_hz = args.ruleset.tick_hz.max(1) as u64;
+        let frame_ns = 1_000_000_000 / tick_hz;
         // 对局 ID（雪花式：毫秒时间戳 << 12 | 局号）
         let match_id = (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -305,7 +306,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     match m {
                         ToGame::ObserverJoin { idx } => {
                             let hello = serde_json::json!({
-                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": 60,
+                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
                                 "seat": -1, "role": "observer",
                                 "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                             });
@@ -347,7 +348,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
                 let hello = serde_json::json!({
-                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": 60,
+                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
                     "player_id": c.id.clone(),
                     "role": if c.seat.is_some() { "player" } else { "observer" },
@@ -415,13 +416,13 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let mut frame_idx: u64 = 0;
         while in_match {
             let deadline = sched_origin
-                + Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / 60);
+                + Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / tick_hz);
             let now = Instant::now();
             if now < deadline {
                 std::thread::sleep(deadline - now);
-            } else if now.duration_since(deadline) > Duration::from_nanos(2 * FRAME_NS) {
+            } else if now.duration_since(deadline) > Duration::from_nanos(2 * frame_ns) {
                 // 落后超过 2 帧：重置调度原点，避免追帧风暴；引擎仍只推进一帧
-                sched_origin = now - Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / 60);
+                sched_origin = now - Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / tick_hz);
             }
             // 消息并入下一帧
             while let Ok(m) = rx.try_recv() {
@@ -443,7 +444,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     ToGame::ObserverJoin { idx } => {
                         // 单线程回放：先 hello + 全部历史 tick，再激活直播，时序必然正确
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": 60,
+                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
@@ -613,7 +614,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 match m {
                     ToGame::ObserverJoin { idx } => {
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": 60,
+                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
