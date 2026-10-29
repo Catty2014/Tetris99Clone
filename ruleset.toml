@@ -9,7 +9,7 @@
 #   gravity_* = 毫格/秒
 
 [ruleset]
-id = "9f3c1a7e"             # 短 UUID；由 canonical ruleset 派生，正式比赛保持稳定
+id = "9f3c1a7e"             # 占位；正式值由 canonical ruleset 派生，DAS/ARR 移到 client 后需重新派生
 
 board_width = 10
 board_height = 20
