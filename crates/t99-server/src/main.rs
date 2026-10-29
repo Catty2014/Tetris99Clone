@@ -7,7 +7,6 @@
 //! - 对局结束后所有人类席位请求 restart 或 8s 超时即开新局（新种子）。
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -25,6 +24,10 @@ const RESTART_TIMEOUT: Duration = Duration::from_secs(8);
 const LOBBY_TIMEOUT: Duration = Duration::from_secs(10);
 /// 结算展示期：结果广播后至少保留此时长再开下一局
 const RESULT_HOLD: Duration = Duration::from_secs(5);
+/// 写线程的写超时：对端不读时不至于永久卡在 send 上
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
+const MSG_CLOSE: &str = "\u{0}close";
 
 struct Args {
     port: u16,
@@ -123,6 +126,23 @@ fn event_json(t: &TimedKey) -> serde_json::Value {
         Key::TargetPlayer(v) => serde_json::json!([t.t_us, t.key.name(), v]),
         _ => serde_json::json!([t.t_us, t.key.name()]),
     }
+}
+
+/// 每连接的写线程：阻塞在 writer_rx 上逐条写出（含 hello/tick/result/pong）。
+/// 退出条件：通道关闭（大厅登记与 NetPlayerAdapter 都 drop 了 tx）、收到 MSG_CLOSE、
+/// 或写失败（对端消失/写超时）。
+fn writer_loop(mut ws: tungstenite::WebSocket<std::net::TcpStream>, rx: mpsc::Receiver<String>) {
+    while let Ok(msg) = rx.recv() {
+        if msg == MSG_CLOSE {
+            break;
+        }
+        if ws.send(Message::Text(msg.into())).is_err() {
+            break;
+        }
+    }
+    // 尽力关闭：对端已不读时 close/flush 可能失败，写超时兜底
+    let _ = ws.close(None);
+    let _ = ws.flush();
 }
 
 fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, human_seats: usize, running: Arc<AtomicBool>) {
@@ -574,6 +594,8 @@ fn main() {
             let mut inbound_tx: Option<mpsc::Sender<String>> = None;
             // 注册 + 席位分配必须原子（否则并发连接会分到同一席位）
             let (tx, writer_rx) = mpsc::channel::<String>();
+            // 读线程自用的发送端（Pong 回显 + 断开时的收尾信号都走写线程）
+            let tx_reader = tx.clone();
             let want_restart = Arc::new(AtomicBool::new(false));
             let (idx, seat) = {
                 let mut h = hall.lock().unwrap();
@@ -625,8 +647,31 @@ fn main() {
                     serde_json::json!({"type":"seat","seat":-1,"spectate":spectate}).to_string().into(),
                 ));
             }
-            // 读写轮询：读超时即写泵粒度——玩家席位 60Hz 帧下发要求 ≤2ms 排空
-            ws.get_ref().set_read_timeout(Some(Duration::from_millis(2))).ok();
+            // 读/写分线程：读线程阻塞在 ws.read()（无读超时），写线程独占克隆 socket 的
+            // WebSocket 并阻塞在通道 recv 上。旧实现靠 2ms 读超时轮询顺带排空写队列，
+            // 99 连接 ≈ 5 万次/秒唤醒，纯空转吃 CPU，却换不来吞吐（TPS 瓶颈是
+            // NetPlayerAdapter::act 的串行等待，不是这里）。
+            let writer_ws = match ws.get_ref().try_clone() {
+                Ok(s) => {
+                    // 对端不读时 send 不无限阻塞（写超时兜底写线程收尾）
+                    s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+                    tungstenite::WebSocket::from_raw_socket(
+                        s,
+                        tungstenite::protocol::Role::Server,
+                        None,
+                    )
+                }
+                Err(e) => {
+                    eprintln!("[conn] {id} 写线程建流失败: {e}");
+                    if let Some(slot) = hall.lock().unwrap().clients.get_mut(idx) {
+                        *slot = None;
+                    }
+                    let _ = to_game.send(ToGame::Left { idx });
+                    return;
+                }
+            };
+            std::thread::spawn(move || writer_loop(writer_ws, writer_rx));
+            // 读线程：只读上行，下行（帧/pong）一律投给写线程，避免两条线程写同一 socket
             loop {
                 match ws.read() {
                     Ok(Message::Text(t)) => {
@@ -637,21 +682,19 @@ fn main() {
                         // lobby 玩家：上行全部原样交给 NetPlayerAdapter（ready/input/result）
                         if let Some(itx) = &inbound_tx {
                             let _ = itx.send(t.to_string());
-                            if let Ok(_) = serde_json::from_str::<serde_json::Value>(&t) {
-                                // ping 仍就地回显（低延迟测量）
-                                if v["type"] == "ping" {
-                                    let _ = ws.send(Message::Text(
-                                        serde_json::json!({"type": "pong", "t": v["t"]}).to_string().into(),
-                                    ));
-                                }
+                            // ping 仍回显（低延迟测量），但走写线程
+                            if v["type"] == "ping" {
+                                let _ = tx_reader.send(
+                                    serde_json::json!({"type": "pong", "t": v["t"]}).to_string(),
+                                );
                             }
                             continue;
                         }
                         match v["type"].as_str().unwrap_or("") {
                             "ping" => {
-                                let _ = ws.send(Message::Text(
-                                    serde_json::json!({"type": "pong", "t": v["t"]}).to_string().into(),
-                                ));
+                                let _ = tx_reader.send(
+                                    serde_json::json!({"type": "pong", "t": v["t"]}).to_string(),
+                                );
                             }
                             "input" => {
                                 if let Some(s) = seat {
@@ -689,15 +732,14 @@ fn main() {
                     }
                     Ok(Message::Close(_)) => break,
                     Ok(_) => {}
-                    Err(tungstenite::Error::Io(ref e)) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
                     Err(_) => break,
                 }
-                while let Ok(msg) = writer_rx.try_recv() {
-                    if ws.send(Message::Text(msg.into())).is_err() {
-                        break;
-                    }
-                }
             }
+            // 断开：先摘除大厅登记（drop 广播 tx）再通知写线程收尾，避免线程滞留
+            if let Some(slot) = hall.lock().unwrap().clients.get_mut(idx) {
+                *slot = None;
+            }
+            let _ = tx_reader.send(MSG_CLOSE.to_string());
             let _ = to_game.send(ToGame::Left { idx });
             eprintln!("[disc] {id}");
         });
