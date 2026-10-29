@@ -369,7 +369,35 @@ loop:
 
 P1a 的 CPU 上升是因为真正跑满了 60 TPS，且每帧多了一次 99 席轮询；CPU/帧约 11ms，仍低于 16.7ms 预算。
 
-## 12. 非目标
+## 12. 配置分层
+
+配置格式固定为 TOML。官方 Rust 程序/库按以下顺序取值：
+
+```text
+CLI > 环境变量 > 配置文件 > 内建默认值
+```
+
+1. 命令行：`--server-url`、`--key`、`--player-id`、`--config` 等。
+2. 环境变量：`T99_SERVER_URL`、`T99_SERVER_KEY`、`T99_PLAYER_ID`；嵌套键用双下划线，例如 `T99_DISPLAY__VSYNC`。
+3. 配置文件：`--config` / `T99_CONFIG` 指定，缺省 `./config.toml`。
+
+合并按字段进行，不整表替换；数组整体替换，不追加。未知字段在配置文件中告警，在 CLI 中视为错误。`--config` 本身只能来自 CLI 或环境变量，不能由配置文件指定。
+
+静态配置与运行时清单分开：
+
+- `config.toml`：服务器、控制、显示等长期设置，不写每局密钥。
+- 运行时清单：由 Grader 为每个参赛进程生成，包含 `server.url`、`key`、`player_id`、期望的 `protocol`/`ruleset` 等；以 0600 权限写入临时文件，并同时以 CLI 和环境变量传入，三份内容一致。
+
+参赛程序（含 bot）在运行时总会同时收到三种来源，内容一致，可以任选其一读取。自己实现 wire protocol 的程序只需要 `server.url`、`key`、`player_id` 这一小组；`[control]`、`[display]` 主要服务官方 Client。协议与规则集的最终权威仍是服务器 `hello`，运行时清单里的 `protocol`/`ruleset` 只用于提前自检。
+
+官方库建议提供：
+
+```rust
+let cfg = t99_config::Config::load()?;      // CLI > env > file > default
+let rt = cfg.runtime();                     // url / key / player_id / expected versions
+```
+
+## 13. 非目标
 
 - 不向 99 个玩家广播对手棋盘快照。
 - 不把服务器权威模拟降到 30/5Hz。
