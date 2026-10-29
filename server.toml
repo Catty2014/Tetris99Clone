@@ -1,0 +1,34 @@
+# t99 Arena server configuration
+#
+# Precedence: CLI > environment (T99_*) > this file > built-in defaults.
+# Per-match url / key / player_id / expected versions are injected by the
+# Grader at runtime; they are not stored here.
+#
+# Default path: ./server.toml (override with --config / T99_CONFIG)
+# Ruleset: ./ruleset.toml (read-only, shared with the client)
+
+role = "server"
+ruleset_file = "ruleset.toml"
+
+[server]
+address = "127.0.0.1"      # use 0.0.0.0 or a specific NIC address for remote play
+port = 6666
+loglevel = "INFO"          # ERROR / WARN / INFO / DEBUG / TRACE
+debug = false
+stalemate_accel = false    # competitive: false; true only for exhibition
+lobby_timeout_secs = 10
+restart_timeout_secs = 8
+write_timeout_secs = 5
+
+[auth]
+check_player_id = true
+case_sensitive = true
+# One glob per line, matched against the whole ID; no metacharacters = exact.
+id_files = ["auth/players.txt"]
+
+[match]
+players = 99
+lobby = true
+# 0 = random per match, printed to stdout; a non-zero value is used as-is.
+seed = 0
+# No roster: seats are randomized every match; PlayerID is the unique identity.

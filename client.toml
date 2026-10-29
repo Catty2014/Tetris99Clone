@@ -1,0 +1,37 @@
+# t99 Arena client configuration
+#
+# Precedence: CLI > environment (T99_*) > this file > built-in defaults.
+# player_id / key / server url may be injected by the Grader at runtime.
+#
+# Default path: ./client.toml (override with --config / T99_CONFIG)
+# Ruleset: ./ruleset.toml (read-only, must match the compiled-in RULESET_ID)
+
+role = "client"
+ruleset_file = "ruleset.toml"
+
+[client]
+server = "ws://127.0.0.1:6666"
+observer = false
+spectate = 0
+# player_id / key are injected by the runtime manifest, CLI, or environment.
+
+[control]
+left = "A"
+right = "D"
+rotate = ["W", "X"]
+rotateC = ["Z", "<LC>"]
+softdrop = "S"
+harddrop = "<SP>"
+hold = ["C", "<LS>"]
+attack = "<TAB>"
+manual = "arrow"            # arrow / wasd; only affects manual target selection
+attack_fallback = "random"  # ko / random / badge / attacker
+
+[display]
+vsync = true
+framerate = 240             # only a cap when vsync = false
+opponent_framerate = 60     # opponent board display sampling rate
+ghost = true
+shadow_locked = true
+result_hold_secs = 0        # 0 = keep until dismissed / next match
+# Input sampling rate follows the display rate; there is no sample_rate knob.

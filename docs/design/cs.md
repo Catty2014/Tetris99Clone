@@ -379,13 +379,15 @@ CLI > 环境变量 > 配置文件 > 内建默认值
 
 1. 命令行：`--server-url`、`--key`、`--player-id`、`--config` 等。
 2. 环境变量：`T99_SERVER_URL`、`T99_SERVER_KEY`、`T99_PLAYER_ID`；嵌套键用双下划线，例如 `T99_DISPLAY__VSYNC`。
-3. 配置文件：`--config` / `T99_CONFIG` 指定，缺省 `./config.toml`。
+3. 配置文件：server 缺省 `./server.toml`，client 缺省 `./client.toml`；`--config` / `T99_CONFIG` 覆盖。规则集单独用 `--ruleset` / `T99_RULESET`，缺省 `./ruleset.toml`。
 
 合并按字段进行，不整表替换；数组整体替换，不追加。未知字段在配置文件中告警，在 CLI 中视为错误。`--config` 本身只能来自 CLI 或环境变量，不能由配置文件指定。
 
 静态配置与运行时清单分开：
 
-- `config.toml`：服务器、控制、显示等长期设置；每局 key 由运行时清单提供，不写进长期配置。
+- `server.toml`：`[server]`、`[auth]`、`[match]`，只由服务器读取。
+- `client.toml`：`[client]`、`[control]`、`[display]`，只由官方 Client 读取。
+- `ruleset.toml`：只读规则集与阶段表，server/client/HeadlessClient 共用；不能由运行时配置覆盖。
 - 运行时清单：由 Grader 为每个参赛进程生成，包含 `server.url`、`key`、`player_id`、期望的 `protocol`/`ruleset` 等；写入临时文件，并同时以 CLI 和环境变量传入，三份内容一致。
 - `key` 是所有参赛者共享的房间口令，不是秘密，也不是身份凭证；文件权限、argv 和日志暴露不作为安全边界。身份由 `player_id` 和 allowlist 负责；若需要防止冒用，另加签名或 per-player token。
 
