@@ -7,7 +7,7 @@
 ## 0. 目标
 
 1. **一条信道，三种订阅。** Client 与 HeadlessClient 使用同一个 WebSocket 端点、同一套握手和消息格式，`profile` 决定服务器发什么。
-2. **权威与表现解耦。** 服务器逻辑固定 60Hz；输入采样、显示、对手视图各自独立，不互相推进。
+2. **权威与表现解耦。** 服务器逻辑固定 60Hz；输入采样随显示帧率、显示、对手视图各自独立于逻辑，不互相推进。
 3. **程序席位不承担对手计算。** HeadlessClient 只拿自己的 `state` 和 5Hz 的 `summary`，不重演其他 98 席。
 4. **Client 承担完整观战。** 本地重演 99 席，对手显示默认 30Hz、可调 5–60Hz。
 5. **去掉逐席串行等待。** 服务器按帧收集所有席位的输入，最坏等待为一个共享 deadline，而不是 `sum(RTT)`。
@@ -60,7 +60,7 @@ t99-hc              session + Policy，不编译 mirror
 | 域 | 值 | 驱动 | 约束 |
 |---|---:|---|---|
 | logic | 60Hz，16667µs | Server | 唯一权威；`frame_n` 是全局时钟 |
-| input sampling | 120/240Hz 或事件驱动 | Client/HC | 采样时打 `t_us`，不按渲染帧打点 |
+| input sampling | = 显示帧率 | Client | 随 vsync / framerate；采样时打 `t_us`，不按逻辑帧打点 |
 | render | vsync / 不限帧 | Client | 只读逻辑状态并插值，不推进 `Match` |
 | opponent view | 30Hz 默认，5–60 可调 | Client | 从 mirror 采样；digest 模式下为订阅参数 |
 | summary | 5Hz | Server → HC | 堆叠、KO、徽章、目标信息 |
@@ -75,7 +75,7 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 3.2 输入
 
-- 输入采样率可以高于逻辑帧率，但不产生更多消息。
+- 输入采样率等于显示帧率（`vsync` 或 `framerate` 决定），不单独配置 `sample_rate`；显示高于 60 时可以高于逻辑帧率，但不产生更多消息。
 - 一个逻辑帧窗口内的多次采样编码成多个 `t_us` 事件；每逻辑帧最多一个 `input` 批次。
 - 例：采样 240Hz、逻辑 60Hz，一帧 4 个事件，`t_us` 分布在 0–16666。
 - 采样写入带时间戳的 ring；逻辑帧边界只做“取走并封装”，不阻塞采样。
@@ -83,9 +83,10 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 3.3 显示
 
+- `vsync = true` 时以显示器刷新率为准，`framerate` 不生效；`vsync = false` 时 `framerate` 是上限。
 - 渲染不调用 `engine.frame`，只读最近两个逻辑状态做插值。
 - 自己的盘面 60Hz；对手缩略图默认 30Hz，featured 视图可 60Hz。
-- 输入采样不依赖渲染帧率；渲染卡顿不改变输入批次。
+- 输入采样随显示帧率，但不推进逻辑；渲染卡顿只会降低采样密度，不改变已采样事件的 `t_us` 时序。
 
 ### 3.4 HeadlessClient
 
@@ -103,9 +104,9 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 4.2 依据
 
-当前 ruleset 的相位参数：
+当前 ruleset 的阶段参数：
 
-| 相位 | clear_delay | ARE | 消行后锁定间隔 | 无消行锁定间隔 | 垃圾进场 |
+| 阶段 | clear_delay | ARE | 消行后锁定间隔 | 无消行锁定间隔 | 垃圾进场 |
 |---|---:|---:|---:|---:|---:|
 | P1 | 300ms | 100ms | 400ms / 2.5Hz | 100ms / 10Hz | 1200ms |
 | P2 | 250ms | 100ms | 350ms / 2.9Hz | 100ms / 10Hz | 900ms |
@@ -233,7 +234,7 @@ loop:
 
 - `Mirror` 线程按 tick 顺序推进 `Match`；不连续即 `resync`。
 - 渲染读取最近两个状态插值；对手视图按 `opp_view_hz` 采样。
-- 输入采样独立于 `FixedUpdate`；采样率可以是 120/240Hz 或事件驱动。
+- 输入采样随显示帧率（无独立 `sample_rate`），与逻辑 `FixedUpdate` 解耦。
 - HUD 读 session stats，不反推协议状态。
 
 ### 7.3 HeadlessClient
@@ -269,7 +270,7 @@ loop:
 ### P3 Client
 
 - native client 改为 session + mirror + UI。
-- 输入采样独立；渲染插值；对手视图 30/60 可调。
+- 输入采样随显示帧率、与逻辑解耦；渲染插值；对手视图 30/60 可调。
 - observer 走 keyframe + tick。
 
 ### P4 wasm 与候选契约
