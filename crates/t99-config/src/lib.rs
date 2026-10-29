@@ -65,6 +65,17 @@ pub struct ControlSection {
     pub das_ticks: u32,
     pub arr_ticks: u32,
     pub dual_charge: bool,
+    pub left: String,
+    pub right: String,
+    pub rotate: Vec<String>,
+    #[serde(rename = "rotateC")]
+    pub rotate_c: Vec<String>,
+    pub softdrop: String,
+    pub harddrop: String,
+    pub hold: Vec<String>,
+    pub attack: String,
+    pub manual: String,
+    pub attack_fallback: String,
 }
 
 impl Default for ControlSection {
@@ -73,6 +84,16 @@ impl Default for ControlSection {
             das_ticks: 10,
             arr_ticks: 2,
             dual_charge: false,
+            left: "A".into(),
+            right: "D".into(),
+            rotate: vec!["W".into(), "X".into()],
+            rotate_c: vec!["Z".into(), "<L-C>".into()],
+            softdrop: "S".into(),
+            harddrop: "<SP>".into(),
+            hold: vec!["C".into(), "<L-S>".into()],
+            attack: "<TAB>".into(),
+            manual: "arrow".into(),
+            attack_fallback: "random".into(),
         }
     }
 }

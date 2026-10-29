@@ -442,64 +442,160 @@ fn push_key(q: &mut InputQueue, k: Key, now: Instant) {
     q.entries.push_back((now, k));
 }
 
-/// 主/副操作方案：主操作移动方块，副操作导航待选玩家
-#[derive(Clone, Copy, PartialEq, Eq, Resource)]
-enum Scheme {
-    /// WASD 移动方块，方向键导航（默认）
-    Wasd,
-    /// 方向键移动方块，WASD 导航
-    Arrows,
+#[derive(Resource, Clone)]
+struct Keymap {
+    left: Vec<KeyCode>,
+    right: Vec<KeyCode>,
+    soft: Vec<KeyCode>,
+    hard: Vec<KeyCode>,
+    rot_cw: Vec<KeyCode>,
+    rot_ccw: Vec<KeyCode>,
+    hold: Vec<KeyCode>,
+    attack: Vec<KeyCode>,
+    nav_l: Vec<KeyCode>,
+    nav_r: Vec<KeyCode>,
+    nav_u: Vec<KeyCode>,
+    nav_d: Vec<KeyCode>,
 }
 
-impl Scheme {
-    fn move_l(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::KeyA],
-            Scheme::Arrows => [KeyCode::ArrowLeft],
-        }
+impl Keymap {
+    fn from_control(c: &t99_config::ControlSection) -> Result<Self, String> {
+        let nav = match c.manual.as_str() {
+            "arrow" => (
+                vec![KeyCode::ArrowLeft],
+                vec![KeyCode::ArrowRight],
+                vec![KeyCode::ArrowUp],
+                vec![KeyCode::ArrowDown],
+            ),
+            "wasd" => (
+                vec![KeyCode::KeyA],
+                vec![KeyCode::KeyD],
+                vec![KeyCode::KeyW],
+                vec![KeyCode::KeyS],
+            ),
+            other => return Err(format!("manual={other:?}，只支持 arrow / wasd")),
+        };
+        Ok(Self {
+            left: parse_keys(&[c.left.clone()])?,
+            right: parse_keys(&[c.right.clone()])?,
+            soft: parse_keys(&[c.softdrop.clone()])?,
+            hard: parse_keys(&[c.harddrop.clone()])?,
+            rot_cw: parse_keys(&c.rotate)?,
+            rot_ccw: parse_keys(&c.rotate_c)?,
+            hold: parse_keys(&c.hold)?,
+            attack: parse_keys(&[c.attack.clone()])?,
+            nav_l: nav.0,
+            nav_r: nav.1,
+            nav_u: nav.2,
+            nav_d: nav.3,
+        })
     }
-    fn move_r(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::KeyD],
-            Scheme::Arrows => [KeyCode::ArrowRight],
+
+    fn preset(name: &str) -> Result<Self, String> {
+        let mut c = t99_config::ControlSection::default();
+        if name == "arrows" {
+            c.left = "<LEFT>".into();
+            c.right = "<RIGHT>".into();
+            c.softdrop = "<DOWN>".into();
+            c.rotate = vec!["<UP>".into(), "X".into()];
+            c.manual = "wasd".into();
+        } else if name != "wasd" {
+            return Err(format!("未知 controls preset: {name}"));
         }
+        Self::from_control(&c)
     }
-    fn soft(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::KeyS],
-            Scheme::Arrows => [KeyCode::ArrowDown],
+}
+
+fn parse_keys(raw: &[String]) -> Result<Vec<KeyCode>, String> {
+    if raw.is_empty() {
+        return Err("空键位列表".into());
+    }
+    raw.iter()
+        .map(|s| parse_key(s).ok_or_else(|| format!("未知键位: {s:?}")))
+        .collect()
+}
+
+fn parse_key(s: &str) -> Option<KeyCode> {
+    let k = match s {
+        "<TAB>" => KeyCode::Tab,
+        "<SP>" => KeyCode::Space,
+        "<CR>" => KeyCode::Enter,
+        "<BS>" => KeyCode::Backspace,
+        "<DEL>" => KeyCode::Delete,
+        "<INS>" => KeyCode::Insert,
+        "<PGUP>" => KeyCode::PageUp,
+        "<PGDN>" => KeyCode::PageDown,
+        "<HOME>" => KeyCode::Home,
+        "<END>" => KeyCode::End,
+        "<UP>" => KeyCode::ArrowUp,
+        "<DOWN>" => KeyCode::ArrowDown,
+        "<LEFT>" => KeyCode::ArrowLeft,
+        "<RIGHT>" => KeyCode::ArrowRight,
+        "<L-S>" => KeyCode::ShiftLeft,
+        "<R-S>" => KeyCode::ShiftRight,
+        "<L-C>" => KeyCode::ControlLeft,
+        "<R-C>" => KeyCode::ControlRight,
+        "<L-A>" => KeyCode::AltLeft,
+        "<R-A>" => KeyCode::AltRight,
+        _ => {
+            let mut it = s.chars();
+            let c = it.next()?;
+            if it.next().is_some() {
+                return None;
+            }
+            match c {
+                'A' => KeyCode::KeyA,
+                'B' => KeyCode::KeyB,
+                'C' => KeyCode::KeyC,
+                'D' => KeyCode::KeyD,
+                'E' => KeyCode::KeyE,
+                'F' => KeyCode::KeyF,
+                'G' => KeyCode::KeyG,
+                'H' => KeyCode::KeyH,
+                'I' => KeyCode::KeyI,
+                'J' => KeyCode::KeyJ,
+                'K' => KeyCode::KeyK,
+                'L' => KeyCode::KeyL,
+                'M' => KeyCode::KeyM,
+                'N' => KeyCode::KeyN,
+                'O' => KeyCode::KeyO,
+                'P' => KeyCode::KeyP,
+                'Q' => KeyCode::KeyQ,
+                'R' => KeyCode::KeyR,
+                'S' => KeyCode::KeyS,
+                'T' => KeyCode::KeyT,
+                'U' => KeyCode::KeyU,
+                'V' => KeyCode::KeyV,
+                'W' => KeyCode::KeyW,
+                'X' => KeyCode::KeyX,
+                'Y' => KeyCode::KeyY,
+                'Z' => KeyCode::KeyZ,
+                '0' => KeyCode::Digit0,
+                '1' => KeyCode::Digit1,
+                '2' => KeyCode::Digit2,
+                '3' => KeyCode::Digit3,
+                '4' => KeyCode::Digit4,
+                '5' => KeyCode::Digit5,
+                '6' => KeyCode::Digit6,
+                '7' => KeyCode::Digit7,
+                '8' => KeyCode::Digit8,
+                '9' => KeyCode::Digit9,
+                ',' => KeyCode::Comma,
+                '.' => KeyCode::Period,
+                '/' => KeyCode::Slash,
+                ';' => KeyCode::Semicolon,
+                '\'' => KeyCode::Quote,
+                '[' => KeyCode::BracketLeft,
+                ']' => KeyCode::BracketRight,
+                '\\' => KeyCode::Backslash,
+                '-' => KeyCode::Minus,
+                '=' => KeyCode::Equal,
+                '`' => KeyCode::Backquote,
+                _ => return None,
+            }
         }
-    }
-    fn rot(&self) -> [KeyCode; 3] {
-        match self {
-            Scheme::Wasd => [KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyJ],
-            Scheme::Arrows => [KeyCode::ArrowUp, KeyCode::KeyX, KeyCode::KeyJ],
-        }
-    }
-    fn nav_l(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::ArrowLeft],
-            Scheme::Arrows => [KeyCode::KeyA],
-        }
-    }
-    fn nav_r(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::ArrowRight],
-            Scheme::Arrows => [KeyCode::KeyD],
-        }
-    }
-    fn nav_u(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::ArrowUp],
-            Scheme::Arrows => [KeyCode::KeyW],
-        }
-    }
-    fn nav_d(&self) -> [KeyCode; 1] {
-        match self {
-            Scheme::Wasd => [KeyCode::ArrowDown],
-            Scheme::Arrows => [KeyCode::KeyS],
-        }
-    }
+    };
+    Some(k)
 }
 
 fn session_tick_hz(session: &Session) -> u32 {
@@ -535,7 +631,7 @@ fn poll_input(
     keys: Res<ButtonInput<KeyCode>>,
     session: Res<Session>,
     thumbs: Res<Thumbs>,
-    scheme: Res<Scheme>,
+    keymap: Res<Keymap>,
 ) {
     let now = Instant::now();
     let jp = |c: &[KeyCode]| c.iter().any(|c| keys.just_pressed(*c));
@@ -549,7 +645,11 @@ fn poll_input(
         push_key(&mut queue, key, now);
     }
     // 主操作：移动/软降。横向 DAS/ARR 在这里展开，引擎只收离散事件。
-    let (ml, mr, sf) = (scheme.move_l(), scheme.move_r(), scheme.soft());
+    let (ml, mr, sf) = (
+        keymap.left.as_slice(),
+        keymap.right.as_slice(),
+        keymap.soft.as_slice(),
+    );
     if jp(&ml) {
         push_key(&mut queue, Key::LeftDown, now);
         repeat.left.held = true;
@@ -604,25 +704,25 @@ fn poll_input(
     if jr(&sf) {
         push_key(&mut queue, Key::SoftUp, now);
     }
-    if jp(&[KeyCode::Space]) {
+    if jp(&keymap.hard) {
         push_key(&mut queue, Key::HardDrop, now);
     }
-    if jp(&scheme.rot()) {
+    if jp(&keymap.rot_cw) {
         push_key(&mut queue, Key::RotCwDown, now);
     }
-    if jr(&scheme.rot()) {
+    if jr(&keymap.rot_cw) {
         push_key(&mut queue, Key::RotCwUp, now);
     }
-    if jp(&[KeyCode::KeyZ, KeyCode::KeyK]) {
+    if jp(&keymap.rot_ccw) {
         push_key(&mut queue, Key::RotCcwDown, now);
     }
-    if jr(&[KeyCode::KeyZ, KeyCode::KeyK]) {
+    if jr(&keymap.rot_ccw) {
         push_key(&mut queue, Key::RotCcwUp, now);
     }
-    if jp(&[KeyCode::KeyC, KeyCode::ShiftLeft]) {
+    if jp(&keymap.hold) {
         push_key(&mut queue, Key::HoldDown, now);
     }
-    if jr(&[KeyCode::KeyC, KeyCode::ShiftLeft]) {
+    if jr(&keymap.hold) {
         push_key(&mut queue, Key::HoldUp, now);
     }
     if jp(&[KeyCode::KeyR]) {
@@ -630,7 +730,7 @@ fn poll_input(
             let _ = tx.send(NetCmd::Restart);
         }
     }
-    if jp(&[KeyCode::Tab]) {
+    if jp(&keymap.attack) {
         let cycle = [Key::TargetKos, Key::TargetBadges, Key::TargetAttackers, Key::TargetRandom];
         let k = cycle[queue.target_idx % cycle.len()];
         queue.target_idx += 1;
@@ -641,16 +741,16 @@ fn poll_input(
     if shown > 0 {
         let mut delta = 0isize;
         let row = thumbs.n.max(1) as isize;
-        if jp(&scheme.nav_l()) {
+        if jp(&keymap.nav_l) {
             delta = -1;
         }
-        if jp(&scheme.nav_r()) {
+        if jp(&keymap.nav_r) {
             delta = 1;
         }
-        if jp(&scheme.nav_u()) {
+        if jp(&keymap.nav_u) {
             delta = -row;
         }
-        if jp(&scheme.nav_d()) {
+        if jp(&keymap.nav_d) {
             delta = row;
         }
         if delta != 0 {
@@ -777,6 +877,21 @@ mod repeat_tests {
         s.right.next = Some(t0);
         let ev = repeat_keys(&mut s, t0 + arr + Duration::from_millis(1), das, arr);
         assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
+    }
+
+    #[test]
+    fn keymap_parses_default_control_section() {
+        let c = t99_config::ControlSection::default();
+        let m = Keymap::from_control(&c).unwrap();
+        assert_eq!(m.left, vec![KeyCode::KeyA]);
+        assert_eq!(m.right, vec![KeyCode::KeyD]);
+        assert_eq!(m.hard, vec![KeyCode::Space]);
+        assert_eq!(m.rot_ccw, vec![KeyCode::KeyZ, KeyCode::ControlLeft]);
+        assert_eq!(m.hold, vec![KeyCode::KeyC, KeyCode::ShiftLeft]);
+        assert_eq!(m.nav_l, vec![KeyCode::ArrowLeft]);
+        assert_eq!(parse_key("<SP>"), Some(KeyCode::Space));
+        assert_eq!(parse_key("<TAB>"), Some(KeyCode::Tab));
+        assert_eq!(parse_key("a"), None);
     }
 
     #[test]
@@ -1858,7 +1973,7 @@ fn main() {
     let mut seed = 42u64;
     let mut n_bots = 3usize;
     let mut tier = "advanced".to_string();
-    let mut scheme = Scheme::Wasd;
+    let mut controls_override: Option<String> = None;
     let mut server: Option<String> = None;
     let mut my_id = "player1".to_string();
     let mut my_key = "k".to_string();
@@ -1876,7 +1991,7 @@ fn main() {
             "--bots" => { n_bots = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(n_bots); i += 1; }
             "--tier" => { tier = args.get(i + 1).cloned().unwrap_or(tier); i += 1; }
             "--controls" => {
-                if args.get(i + 1).map(|s| s.as_str()) == Some("arrows") { scheme = Scheme::Arrows; }
+                controls_override = args.get(i + 1).cloned();
                 i += 1;
             }
             "--server" => { server = args.get(i + 1).cloned(); i += 1; }
@@ -1923,6 +2038,14 @@ fn main() {
         opponent_framerate: cfg.display.opponent_framerate,
         result_hold_secs: cfg.display.result_hold_secs,
     };
+    let keymap = match controls_override.as_deref() {
+        Some(name) => Keymap::preset(name),
+        None => Keymap::from_control(&cfg.control),
+    }
+    .unwrap_or_else(|e| {
+        eprintln!("[config] {e}");
+        std::process::exit(2);
+    });
     let session = if let Some(url) = server {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1976,7 +2099,7 @@ fn main() {
         .insert_resource(RepeatState::default())
         .insert_resource(timing)
         .insert_resource(display)
-        .insert_resource(scheme)
+        .insert_resource(keymap)
         .add_systems(Startup, setup)
         .add_systems(Update, (sync_tick_rate, poll_input, sync).chain())
         .add_systems(FixedUpdate, tick)
