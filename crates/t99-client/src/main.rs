@@ -17,7 +17,8 @@ use web_time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 use t99_bots::BotAdapter;
-use t99_core::{Cell, Key, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
+use t99_core::engine::ActiveView;
+use t99_core::{Cell, Key, Kind, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
 use t99_proto::PlayerAdapter;
 
 const CELL: f32 = 26.0;
@@ -655,6 +656,28 @@ mod repeat_tests {
         let ev = repeat_keys(&mut s, t0 + Duration::from_millis(ARR_MS + 1));
         assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
     }
+
+    #[test]
+    fn ghost_lands_on_floor() {
+        let board = [[0; W]; H];
+        let a = ActiveView { kind: Kind::T, rot: 0, x: 3, y_milli: 0 };
+        let cells = ghost_cells_for(&board, a);
+        assert!(cells.contains(&(18, 4)), "T top cell: {cells:?}");
+        assert!(cells.contains(&(19, 3)), "T bottom left: {cells:?}");
+        assert!(cells.contains(&(19, 4)), "T bottom middle: {cells:?}");
+        assert!(cells.contains(&(19, 5)), "T bottom right: {cells:?}");
+    }
+
+    #[test]
+    fn ghost_rests_one_row_above_stack() {
+        let mut board = [[0; W]; H];
+        board[10][4] = 1;
+        let a = ActiveView { kind: Kind::T, rot: 0, x: 3, y_milli: 0 };
+        let cells = ghost_cells_for(&board, a);
+        assert!(cells.contains(&(8, 4)), "T top cell: {cells:?}");
+        assert!(cells.contains(&(9, 4)), "T bottom middle: {cells:?}");
+        assert!(!cells.contains(&(10, 4)), "must not overlap stack: {cells:?}");
+    }
 }
 
 fn drain_input(queue: &mut InputQueue) -> Vec<TimedKey> {
@@ -738,7 +761,13 @@ fn tick(mut session: ResMut<Session>, mut queue: ResMut<InputQueue>) {
 // ———— 渲染同步 ————
 
 fn ghost_cells(s: &Snapshot) -> Vec<(i64, i64)> {
-    let Some(a) = s.active else { return vec![] };
+    match s.active {
+        Some(a) => ghost_cells_for(&s.board, a),
+        None => vec![],
+    }
+}
+
+fn ghost_cells_for(board: &[[Cell; W]; H], a: ActiveView) -> Vec<(i64, i64)> {
     let mut drop = i64::MAX; // 各格所需下落量的最小值 = 最先触底的格
     for &(dx, dy) in a.kind.cells(a.rot).iter() {
         let col = a.x as i64 + dx as i64;
@@ -747,13 +776,14 @@ fn ghost_cells(s: &Snapshot) -> Vec<(i64, i64)> {
         }
         let mut top = H as i64;
         for r in 0..H {
-            if s.board[r][col as usize] != 0 {
+            if board[r][col as usize] != 0 {
                 top = r as i64;
                 break;
             }
         }
+        // y 已经包含该格的 dy；这里只能减一次，否则 ghost 会整体上移一格。
         let y = (a.y_milli + dy as i64 * 1000).div_euclid(1000);
-        drop = drop.min(top - 1 - dy as i64 - y);
+        drop = drop.min(top - 1 - y);
     }
     if drop == i64::MAX {
         return vec![];
