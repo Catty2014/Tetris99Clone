@@ -213,6 +213,8 @@ pub struct Player {
     pub alive: bool,
     pub death_reason: Option<DeathReason>,
     pub place: Option<u32>,
+    /// 死亡发生的逻辑帧；同帧淘汰共享名次
+    pub death_frame: Option<u64>,
     last_garbage_from: Option<usize>,
     pub last_clear: Option<ClearView>,
 }
@@ -280,6 +282,9 @@ pub struct MatchResult {
 pub struct TableRow {
     pub pid: usize,
     pub place: Option<u32>,
+    /// 最终名次；同徽章/同帧淘汰采用 competition 排名
+    pub rank: u32,
+    pub death_frame: Option<u64>,
     pub alive: bool,
     pub ko: u32,
     pub badges: u32,
@@ -341,6 +346,7 @@ impl Match {
                 alive: true,
                 death_reason: None,
                 place: None,
+                death_frame: None,
                 last_garbage_from: None,
                 last_clear: None,
             });
@@ -1235,6 +1241,7 @@ impl Match {
             p.active = None;
             p.death_reason = Some(reason);
             p.place = Some(self.alive_count as u32);
+            p.death_frame = Some(self.frame_n);
             p.pending.clear();
         }
         self.alive_count -= 1;
@@ -1308,6 +1315,8 @@ impl Match {
             .map(|p| TableRow {
                 pid: p.id,
                 place: p.place,
+                rank: 0,
+                death_frame: p.death_frame,
                 alive: p.alive,
                 ko: p.ko,
                 badges: p.badges,
@@ -1320,6 +1329,77 @@ impl Match {
                 }),
             })
             .collect()
+    }
+
+    /// 结算名次：正常局按淘汰序；流局幸存者按徽章，已淘汰者按淘汰序；
+    /// 同徽章 / 同 death_frame 共享名次，下一组跳过该组人数。
+    pub fn final_ranking(&self) -> Vec<TableRow> {
+        let mut rows = self.final_table();
+        let time_limit = self
+            .over
+            .as_ref()
+            .map(|o| o.reason == "time_limit")
+            .unwrap_or(false);
+
+        let mut survivors: Vec<usize> = (0..self.players.len())
+            .filter(|&p| self.players[p].alive)
+            .collect();
+        if time_limit {
+            survivors.sort_by(|&a, &b| {
+                self.players[b]
+                    .badges
+                    .cmp(&self.players[a].badges)
+                    .then(a.cmp(&b))
+            });
+        } else {
+            survivors.sort_unstable();
+        }
+
+        let mut rank = 1u32;
+        let mut i = 0;
+        while i < survivors.len() {
+            let j = if time_limit {
+                let badges = self.players[survivors[i]].badges;
+                let mut j = i + 1;
+                while j < survivors.len() && self.players[survivors[j]].badges == badges {
+                    j += 1;
+                }
+                j
+            } else {
+                i + 1
+            };
+            for &pid in &survivors[i..j] {
+                rows[pid].rank = rank;
+            }
+            rank += (j - i) as u32;
+            i = j;
+        }
+
+        let mut dead: Vec<usize> = (0..self.players.len())
+            .filter(|&p| !self.players[p].alive)
+            .collect();
+        dead.sort_by(|&a, &b| {
+            self.players[b]
+                .death_frame
+                .cmp(&self.players[a].death_frame)
+                .then(a.cmp(&b))
+        });
+        let mut i = 0;
+        while i < dead.len() {
+            let frame = self.players[dead[i]].death_frame;
+            let mut j = i + 1;
+            while j < dead.len() && self.players[dead[j]].death_frame == frame {
+                j += 1;
+            }
+            for &pid in &dead[i..j] {
+                rows[pid].rank = rank;
+            }
+            rank += (j - i) as u32;
+            i = j;
+        }
+
+        rows.sort_by(|a, b| a.rank.cmp(&b.rank).then(a.pid.cmp(&b.pid)));
+        rows
     }
 
     pub fn alive_count(&self) -> usize {
@@ -1536,6 +1616,41 @@ mod tests {
             TimedKey { t_us: 0, key: Key::LeftDown },
             TimedKey { t_us: 1000, key: Key::LeftUp }
         ]).is_some());
+    }
+
+    #[test]
+    fn ranking_normal_and_same_frame_ties() {
+        let cfg = MatchConfig { players: 4, seed: 1, ruleset: Ruleset::default() };
+        let mut m = Match::new(cfg);
+        m.frame_n = 10;
+        m.kill_player(3, DeathReason::TopOut);
+        m.kill_player(2, DeathReason::TopOut);
+        m.frame_n = 20;
+        m.kill_player(1, DeathReason::TopOut);
+        let r = m.final_ranking();
+        assert_eq!((r[0].pid, r[0].rank), (0, 1));
+        assert_eq!((r[1].pid, r[1].rank), (1, 2));
+        assert_eq!(r[2].rank, 3);
+        assert_eq!(r[3].rank, 3);
+        assert_eq!((r[2].pid, r[3].pid), (2, 3));
+    }
+
+    #[test]
+    fn ranking_draw_uses_badges_then_elimination_order() {
+        let cfg = MatchConfig { players: 4, seed: 1, ruleset: Ruleset::default() };
+        let mut m = Match::new(cfg);
+        m.frame_n = 10;
+        m.kill_player(3, DeathReason::TopOut);
+        m.players[0].badges = 5;
+        m.players[1].badges = 5;
+        m.players[2].badges = 2;
+        m.players[3].badges = 9;
+        m.over = Some(MatchResult { reason: "time_limit", frame: 100, places: vec![] });
+        let r = m.final_ranking();
+        assert_eq!((r[0].pid, r[0].rank), (0, 1));
+        assert_eq!((r[1].pid, r[1].rank), (1, 1));
+        assert_eq!((r[2].pid, r[2].rank), (2, 3));
+        assert_eq!((r[3].pid, r[3].rank), (3, 4));
     }
 
     #[test]

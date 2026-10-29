@@ -362,6 +362,8 @@ loop:
 - **P0 已完成**（`f946c34`）：服务器墙钟改为绝对 deadline，300 帧实测 4.9835s、平均 16.6672ms；`FrameMsg` 使用真实 `snap.pid`；人类 lobby 客户端回 `ready` 并按私有 `frame.n` 回 `input`。
 - **P1a 已完成**（`5fdf3e9`）：`PlayerAdapter` 增加 `begin_frame`/`try_input`/`end_frame`，服务器先全量发帧，再用共享 deadline 收集；99 席全网络 300 帧实测 59.07 TPS、65.8% 单核、0 setup 失败。
 - **M1 已完成**：`input` 事件兼容对象/数组；引擎移除 DAS/ARR，`left_down`/`right_down` 每次移动一格；有头客户端按 `das_ms`/`arr_ms` 生成离散序列；HeadlessClient 不关心 DAS/ARR。
+- **M2a 已完成**（`6dbe075`）：hello/ready 带 `protocol` + 短 `ruleset`，客户端不匹配立即拒绝；席位随机分配；PlayerID 查重；`--ids` 改为可选 allowlist，不再决定座次。
+- **M3 已完成**：`Player` 记录 `death_frame`；`final_ranking()` 实现正常局淘汰序、流局幸存者徽章 competition、同帧淘汰同名次；服务器向 stdout 输出 `match_result` JSON（player_id/seat/rank/badges/alive/ko/lines/sent/pieces）。
 - **P1b 待做**：`input(n_intent)` 事件流与 `lead_frames`，去掉私有 `frame` 请求/应答；WAN 下当前 16ms deadline 仍会丢帧。
 - **P2 待做**：`t99-session` 抽取、`t99-headless connect`、`Policy`。
 - **P3/P4 待做**：Client mirror/输入采样解耦、wasm/digest、候选 SDK。

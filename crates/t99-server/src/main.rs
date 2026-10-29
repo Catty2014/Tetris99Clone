@@ -23,8 +23,6 @@ use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, Su
 const FRAME_NS: u64 = 1_000_000_000 / 60;
 const RESTART_TIMEOUT: Duration = Duration::from_secs(8);
 const LOBBY_TIMEOUT: Duration = Duration::from_secs(10);
-/// 结算展示期：结果广播后至少保留此时长再开下一局
-const RESULT_HOLD: Duration = Duration::from_secs(5);
 /// 写线程的写超时：对端不读时不至于永久卡在 send 上
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
@@ -304,6 +302,21 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             }
         }
 
+        // 结算输出用：seat -> PlayerID；bot 席位生成稳定占位 ID。
+        let seat_ids: Vec<String> = {
+            let h = hall.lock().unwrap();
+            (0..players)
+                .map(|pid| {
+                    h.clients
+                        .iter()
+                        .flatten()
+                        .find(|c| c.seat == Some(pid))
+                        .map(|c| c.id.clone())
+                        .unwrap_or_else(|| format!("bot-{pid}"))
+                })
+                .collect()
+        };
+
         let mut next_inputs: HashMap<usize, Vec<TimedKey>> = HashMap::new();
         // 当前局的全部 tick（供中途加入的观战端回放）
         let mut history: Vec<String> = Vec::new();
@@ -435,25 +448,37 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             .as_ref()
             .map(|o| o.reason.to_string())
             .unwrap_or_else(|| "time_limit".into());
-        let mut place_map = vec![None; players];
-        for row in engine.final_table() {
-            place_map[row.pid] = row.place;
-        }
-        if engine.over.is_none() {
-            // 流局：幸存者仅按徽章数排名
-            let mut surv: Vec<usize> = (0..players).filter(|&p| engine.players[p].alive).collect();
-            surv.sort_by(|&a, &b| engine.players[b].badges.cmp(&engine.players[a].badges).then(a.cmp(&b)));
-            for (i, &pid) in surv.iter().enumerate() {
-                if place_map[pid].is_none() {
-                    place_map[pid] = Some(i as u32 + 1);
-                }
-            }
-        }
+        let ranking = engine.final_ranking();
         let result = serde_json::json!({
             "type": "result", "frame": engine.frame_n, "reason": reason, "hash": engine.hash_state(),
-            "places": (0..players).filter_map(|p| place_map[p].map(|pl| serde_json::json!([p, pl]))).collect::<Vec<_>>(),
+            "places": ranking.iter().map(|r| serde_json::json!([r.pid, r.rank])).collect::<Vec<_>>(),
         });
         hall.lock().unwrap().broadcast(&result.to_string());
+
+        // 服务器结算：stdout 一行 JSON，机器可读；stderr 保留人类日志。
+        let out = serde_json::json!({
+            "type": "match_result",
+            "match_id": match_id,
+            "seed": seed,
+            "reason": reason,
+            "protocol": PROTOCOL,
+            "ruleset": RULESET_ID,
+            "ranking": ranking.iter().map(|r| serde_json::json!({
+                "player_id": seat_ids[r.pid],
+                "seat": r.pid,
+                "rank": r.rank,
+                "badges": r.badges,
+                "alive": r.alive,
+                "ko": r.ko,
+                "lines": r.lines,
+                "sent": r.sent,
+                "pieces": r.pieces,
+                "eliminated_at_frame": r.death_frame,
+            })).collect::<Vec<_>>(),
+        });
+        println!("{out}");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
         // 结算下发 + 外部子进程收尾（等待退出，超时击杀）
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
@@ -487,8 +512,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 .join(" ")
         );
 
-        // 结算展示期后驻留：不再开新局；观战端晚到仍可补史看到最终局面
-        std::thread::sleep(RESULT_HOLD);
+        // 单局驻留：不再开新局；观战端晚到仍可补史看到最终局面。
         eprintln!("[server] 单局结束，服务器驻留现场（保持连接与补史；Ctrl-C 退出）");
         loop {
             while let Ok(m) = rx.try_recv() {
