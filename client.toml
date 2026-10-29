@@ -16,13 +16,23 @@ spectate = 0
 # player_id / key are injected by the runtime manifest, CLI, or environment.
 
 [control]
+# Key names:
+#   letters: uppercase letter itself ("A", "Z")
+#   digits:  "0".."9"
+#   symbols: the character produced (",", ";", "/", ...)
+#   special: <TAB> <SP> <CR> <BS> <DEL> <INS> <PGUP> <PGDN> <HOME> <END>
+#            <UP> <DOWN> <LEFT> <RIGHT>
+#            <L-S> <L-C> <R-A> ... (standalone modifier keys, not chords)
+#   numeric: an integer key id may replace a string, e.g. rotate = [87, 88]
+# ESC is always reserved for the menu and cannot be bound to gameplay.
+# Shift+ chords, lowercase letters, case-switching forms, and Fn are not supported.
 left = "A"
 right = "D"
 rotate = ["W", "X"]
-rotateC = ["Z", "<LC>"]
+rotateC = ["Z", "<L-C>"]
 softdrop = "S"
 harddrop = "<SP>"
-hold = ["C", "<LS>"]
+hold = ["C", "<L-S>"]
 attack = "<TAB>"
 manual = "arrow"            # arrow / wasd; only affects manual target selection
 attack_fallback = "random"  # ko / random / badge / attacker
