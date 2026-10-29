@@ -37,8 +37,8 @@ struct Args {
     time_limit_secs: u64,
     /// 0 杀加速燃烧（展览机制；正式 Arena 关闭）
     stall_accel: bool,
-    /// lobby 模式：无内建/子进程席位，全部席位由网络玩家（外部程序/提交程序/人类）接入，
-    /// 人数到齐自动开局；开局后加入无效
+    /// lobby 模式：席位由网络玩家（外部程序/提交程序/人类）接入，人数到齐自动开局；开局后加入无效。
+    /// 与 --bots 同用时为混合局：0..human_seats 席网络玩家，其余席位进程内/子进程 bot
     lobby: bool,
     /// lobby 名册（逗号分隔，长度=席位数）；缺省自动生成 p<i>-<hash>
     ids: Option<String>,
@@ -56,8 +56,11 @@ fn parse_args() -> Args {
         None
     };
     let players: usize = get("--players").and_then(|s| s.parse().ok()).unwrap_or(4);
+    let lobby = args.iter().any(|a| a == "--lobby");
+    // 缺省 bot 阵容只用于非 lobby 局；lobby 不给 --bots 时即纯网络局（全部席位网络玩家），
+    // 显式给 --bots 时保留，形成混合局（前 human_seats 席网络，其余进程内/子进程 bot）
     let bots: Vec<String> = get("--bots")
-        .unwrap_or_else(|| "advanced,advanced".into())
+        .unwrap_or_else(|| if lobby { String::new() } else { "advanced,advanced".into() })
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -72,19 +75,8 @@ fn parse_args() -> Args {
         max_frames: get("--max-frames").and_then(|s| s.parse().ok()).unwrap_or(54_000),
         time_limit_secs: get("--time-limit-secs").and_then(|s| s.parse().ok()).unwrap_or(0),
         stall_accel: get("--stall-accel").map(|s| s != "0" && s != "false").unwrap_or(true),
-        lobby: args.iter().any(|a| a == "--lobby"),
+        lobby,
         ids: get("--ids"),
-    }
-    .with_lobby_cleanup()
-}
-
-impl Args {
-    /// lobby 模式：全部席位走网络玩家，内建/子进程 bot 清零（否则会挤占 human_seats）
-    fn with_lobby_cleanup(mut self) -> Self {
-        if self.lobby {
-            self.bots.clear();
-        }
-        self
     }
 }
 
@@ -178,14 +170,14 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        // lobby 模式：等待全部席位由网络玩家坐满（开局后加入无效）
+        // lobby 模式：等待 human_seats 个网络席位坐满（开局后加入无效）；其余席位由 bot 填充
         let mut net_bots: Vec<Option<NetPlayerAdapter>> = vec![];
         if args.lobby {
             loop {
                 {
                     let h = hall.lock().unwrap();
                     let seated = h.clients.iter().flatten().filter(|c| c.seat.is_some()).count();
-                    if seated >= players {
+                    if seated >= human_seats {
                         break;
                     }
                 }
@@ -216,10 +208,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 std::thread::sleep(Duration::from_millis(100));
             }
             running.store(true, Ordering::SeqCst);
-            // 按席位构建网络玩家适配器
+            // 按席位构建网络玩家适配器（仅前 human_seats 席）
             net_bots = {
                 let mut h = hall.lock().unwrap();
-                (0..players)
+                (0..human_seats)
                     .map(|pid| {
                         let client = h.clients.iter_mut().flatten().find(|c| c.seat == Some(pid));
                         client.map(|c| {
@@ -250,25 +242,24 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         ruleset.match_ticks = if args.time_limit_secs > 0 { (args.time_limit_secs as Ticks) * 1000 * TMS } else { 0 };
         ruleset.stall_accel = args.stall_accel;
         let mut engine = Match::new(MatchConfig { players, seed, ruleset });
-        // 席位适配器：内建 bot / 外部子进程（--bots 模式）或网络玩家（lobby 模式）
-        let mut bots: Vec<Option<Box<dyn PlayerAdapter>>> = if args.lobby {
-            net_bots.into_iter().map(|b| b.map(|b| Box::new(b) as Box<dyn PlayerAdapter>)).collect()
-        } else {
-            (0..players)
-                .map(|pid| {
-                    if pid >= human_seats {
-                        args.bots.get(pid - human_seats).map(|spec| -> Box<dyn PlayerAdapter> {
-                            match parse_seat(spec) {
-                                SeatProgram::BuiltIn(tier) => Box::new(BotAdapter::new(&tier)),
-                                SeatProgram::Ext { label, path } => Box::new(SubprocessAdapter::new(format!("ext:{label}"), vec![path])),
-                            }
-                        })
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        };
+        // 席位适配器：前 human_seats 席 = 网络玩家（lobby），其余 = 内建 bot / 外部子进程
+        let mut net_iter = net_bots.into_iter();
+        let mut bots: Vec<Option<Box<dyn PlayerAdapter>>> = (0..players)
+            .map(|pid| {
+                if args.lobby && pid < human_seats {
+                    net_iter.next().flatten().map(|b| Box::new(b) as Box<dyn PlayerAdapter>)
+                } else if pid >= human_seats {
+                    args.bots.get(pid - human_seats).map(|spec| -> Box<dyn PlayerAdapter> {
+                        match parse_seat(spec) {
+                            SeatProgram::BuiltIn(tier) => Box::new(BotAdapter::new(&tier)),
+                            SeatProgram::Ext { label, path } => Box::new(SubprocessAdapter::new(format!("ext:{label}"), vec![path])),
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
         // 外部程序握手：ready 超时/拒绝 → 直接判负（与正式 Arena 语义一致）
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
@@ -478,7 +469,7 @@ fn main() {
         if args.lobby {
             match &args.ids {
                 Some(list) => list.split(',').map(|x| x.trim().to_string()).collect(),
-                None => (0..args.players)
+                None => (0..human_seats)
                     .map(|i| {
                         let h = &format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64 + (i as u64) * 0x9E37);
                         format!("p{i}-{}", &h[..6.min(h.len())])
@@ -490,11 +481,18 @@ fn main() {
         },
     ));
     if args.lobby {
-        let r = roster.lock().unwrap();
-        let ids: Vec<&String> = r.iter().collect();
-        eprintln!("[roster] key={} 席位数 {} 合法 ID：", args.key, ids.len());
-        for id in ids {
-            eprintln!("  {id}");
+        {
+            let r = roster.lock().unwrap();
+            let ids: Vec<&String> = r.iter().collect();
+            eprintln!("[roster] key={} 席位数 {} 合法 ID：", args.key, ids.len());
+            for id in ids {
+                eprintln!("  {id}");
+            }
+        }
+        // 名册长度必须等于网络席位数，否则永远等不齐（少）或有人领不到位（多）
+        let n_ids = roster.lock().unwrap().len();
+        if n_ids != human_seats {
+            eprintln!("[roster] 警告：名册 {} 个 ID ≠ 网络席位 {}（human_seats），lobby 将无法开局", n_ids, human_seats);
         }
     }
     let hall: Arc<Mutex<Hall>> = Arc::new(Mutex::new(Hall::default()));

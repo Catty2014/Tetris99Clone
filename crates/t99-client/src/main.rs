@@ -8,6 +8,7 @@
 //! 中央棋盘 + 左侧垃圾条 + 右侧 Next6 + 下方菱形目标指示。
 
 use bevy::prelude::*;
+use bevy::text::{TextLayoutInfo, TextSpan};
 use bevy::window::PresentMode;
 use std::collections::VecDeque;
 #[cfg(target_arch = "wasm32")]
@@ -94,7 +95,7 @@ struct MirrorState {
 }
 
 /// 连接诊断（调试 HUD 用）：对局 ID、RTT、丢包率、连接状态
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone)]
 struct NetStats {
     player_id: String,
     match_id: u64,
@@ -156,8 +157,14 @@ struct Views {
     diamond_center: Entity,
     judge: Entity,
     judge_sub: Entity,
-    /// 左下角调试信息（玩家 ID/对局 ID/延迟丢包/连接）
-    dbg: Entity,
+    /// 调试 HUD：左上一行（玩家/对局码），左下一行（连接状态行）。bg = 深色背衬条（文字底）
+    dbg_top: Entity,
+    dbg_top_bg: Entity,
+    dbg_bot: Entity,
+    /// 左下行拆两段：状态（Connected 绿 / Disconnected 红）+ 其余（固定哑色）
+    dbg_bot_status: Entity,
+    dbg_bot_rest: Entity,
+    dbg_bot_bg: Entity,
 }
 
 struct ThumbView {
@@ -330,12 +337,55 @@ fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
     // 判定弹出文字（消行判定 + COMBO）
     let judge = text(&mut cmd, &font, "", 26.0, Color::srgb(0.98, 0.85, 0.35), Vec2::new(0.0, 300.0));
     let judge_sub = text(&mut cmd, &font, "", 16.0, Color::srgb(0.95, 0.6, 0.3), Vec2::new(0.0, 268.0));
-    let dbg = {
-        let e = text(&mut cmd, &font, "", 13.0, Color::srgb(0.75, 0.78, 0.82), Vec2::new(-740.0, -415.0));
-        cmd.entity(e).insert(bevy::sprite::Anchor::BottomLeft);
-        e
+    // 调试 HUD：左上一行（玩家/对局码）+ 左下一行（连接状态），深色半透明背衬条压条
+    // 文本 z=51、背衬 z=50，压在 99p 小窗网格（z≤3）之上；不折行，紧贴窗口边角
+    let strip_bg = |cmd: &mut Commands| {
+        cmd.spawn((
+            Sprite::from_color(Color::srgba(0.03, 0.04, 0.06, 0.70), Vec2::new(240.0, 20.0)),
+            Transform::from_xyz(0.0, 0.0, 50.0),
+        ))
+        .id()
     };
-    cmd.insert_resource(Views { cells, active, ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub, dbg });
+    let dbg_top_bg = strip_bg(&mut cmd);
+    let dbg_bot_bg = strip_bg(&mut cmd);
+    let dbg_top = cmd
+        .spawn((
+            Text2d::new(""),
+            TextFont { font: font.clone(), font_size: 15.0, ..default() },
+            TextColor(Color::srgb(0.75, 0.78, 0.82)),
+            Transform::from_xyz(0.0, 0.0, 51.0),
+            bevy::sprite::Anchor::TopLeft,
+        ))
+        .id();
+    // 左下行 = 根（空）+ 两个 span：状态（变色）与其余（哑色），同一行内自动连续排布
+    let dbg_bot = cmd
+        .spawn((
+            Text2d::new(""),
+            TextFont { font: font.clone(), font_size: 15.0, ..default() },
+            TextColor(Color::srgb(0.75, 0.78, 0.82)),
+            Transform::from_xyz(0.0, 0.0, 51.0),
+            bevy::sprite::Anchor::BottomLeft,
+        ))
+        .id();
+    let dbg_bot_status = cmd
+        .spawn((
+            TextSpan::new(""),
+            TextFont { font: font.clone(), font_size: 15.0, ..default() },
+            TextColor(Color::srgb(0.30, 0.90, 0.45)),
+        ))
+        .id();
+    let dbg_bot_rest = cmd
+        .spawn((
+            TextSpan::new(""),
+            TextFont { font: font.clone(), font_size: 15.0, ..default() },
+            TextColor(Color::srgb(0.75, 0.78, 0.82)),
+        ))
+        .id();
+    cmd.entity(dbg_bot).add_children(&[dbg_bot_status, dbg_bot_rest]);
+    cmd.insert_resource(Views {
+        cells, active, ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub,
+        dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_bot_rest, dbg_bot_bg,
+    });
     cmd.insert_resource(Thumbs::default());
     cmd.insert_resource(PrevPiece { pieces: 0, y_milli: 0 });
 }
@@ -637,6 +687,85 @@ fn set_text(q: &mut Query<&mut Text2d>, e: Entity, s: String) {
     }
 }
 
+fn set_span(q: &mut Query<&mut TextSpan>, e: Entity, s: String) {
+    if let Ok(mut sp) = q.get_mut(e) {
+        *sp = TextSpan::new(s);
+    }
+}
+
+/// 调试 HUD 文本：左上一行「玩家 ID | 对局码」，左下一行「状态(Build值) + 延迟/丢包/TPS/FPS」。
+/// 状态单独着色（Connected 绿 / Disconnected 红 / 本地 Local 哑色），其余恒为哑色。
+fn set_debug_hud_text(
+    session: &Session,
+    fps: f32,
+    text_q: &mut Query<&mut Text2d>,
+    span_q: &mut Query<&mut TextSpan>,
+    color_q: &mut Query<&mut TextColor>,
+    views: &Views,
+) {
+    let stat = match &*session {
+        Session::Net { stats, .. } => Some(stats.lock().unwrap().clone()),
+        Session::Local { .. } => None,
+    };
+    let (top_txt, status, status_col, rest_txt) = match stat {
+        Some(st) => {
+            let pid = if st.player_id.is_empty() { "(observer)".to_string() } else { st.player_id };
+            let mid = if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) };
+            let top_txt = format!("PlayerID {pid} | MatchID {mid}");
+            let status = if st.connected { "Connected" } else { "Disconnected" };
+            let status_col = if st.connected { Color::srgb(0.30, 0.90, 0.45) } else { Color::srgb(0.95, 0.35, 0.35) };
+            let rest_txt = if st.connected {
+                format!(" | Lat {}ms | Loss {}% | TPS {:.2} | FPS {:.0}", st.rtt_ms, st.loss_pct, st.server_tps, fps)
+            } else {
+                format!(" | Lat - | Loss - | TPS - | FPS {:.0}", fps)
+            };
+            (top_txt, status.to_string(), status_col, rest_txt)
+        }
+        None => (
+            "PlayerID local | MatchID -".to_string(),
+            "Local".to_string(),
+            Color::srgb(0.55, 0.60, 0.70),
+            format!(" | FPS {:.0}", fps),
+        ),
+    };
+    set_text(text_q, views.dbg_top, top_txt);
+    set_text(text_q, views.dbg_bot, String::new());
+    set_span(span_q, views.dbg_bot_status, status);
+    set_span(span_q, views.dbg_bot_rest, rest_txt);
+    if let Ok(mut tc) = color_q.get_mut(views.dbg_bot_status) {
+        tc.0 = status_col;
+    }
+}
+
+/// 调试 HUD 逐帧摆位：文本锚定窗口左上/左下角（一行式，不折行不撑主棋盘），
+/// 背衬条按文本测量宽度自适应压在文字底下（z=50，文本 z=51，压在 99p 小窗网格 z≤3 之上）。
+fn place_debug_hud(
+    views: &Views,
+    vq: &mut Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
+    text_tr: &mut Query<&mut Transform, (With<Text2d>, Without<Sprite>)>,
+    layout: &Query<&TextLayoutInfo, With<Text2d>>,
+    half_w: f32,
+    half_h: f32,
+) {
+    let mx = 14.0;
+    for (te, be, top) in [(views.dbg_top, views.dbg_top_bg, true), (views.dbg_bot, views.dbg_bot_bg, false)] {
+        // 未测量（首帧/字体未加载）时给保守默认宽
+        let size = layout.get(te).map(|i| i.size).unwrap_or(Vec2::new(240.0, 18.0));
+        let y = if top { half_h - 10.0 } else { -half_h + 10.0 };
+        // TopLeft/BottomLeft 锚：文本框自锚点向下/向上展开，背衬条取框体竖直中点
+        let cy = if top { y - size.y / 2.0 } else { y + size.y / 2.0 };
+        if let Ok(mut tr) = text_tr.get_mut(te) {
+            tr.translation = Vec3::new(-half_w + mx, y, 51.0);
+        }
+        if let Ok((_, mut sp, mut tr)) = vq.get_mut(be) {
+            let w = (size.x + 18.0).max(190.0);
+            let h = (size.y + 5.0).max(20.0);
+            sp.custom_size = Some(Vec2::new(w, h));
+            tr.translation = Vec3::new(-half_w + mx - 9.0 + w / 2.0, cy, 50.0);
+        }
+    }
+}
+
 fn rebuild_thumbs(
     cmd: &mut Commands,
     font: &Handle<Font>,
@@ -760,8 +889,10 @@ fn sync(
     mut fps_smooth: Local<f32>,
     mut vq: Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
     mut text_q: Query<&mut Text2d>,
+    mut span_q: Query<&mut TextSpan>,
     mut color_q: Query<&mut TextColor>,
-    mut text_tr: Query<&mut Transform, (With<Text2d>, Without<Sprite>)>,
+    // 文本变换 + 逐字符测量宽信息：合并为一组参数（Bevy 系统参数元组上限 16）
+    mut dbg_tr: (Query<&mut Transform, (With<Text2d>, Without<Sprite>)>, Query<&TextLayoutInfo, With<Text2d>>),
     windows: Query<&Window>,
 ) {
     let half_w = windows.single().map(|w| w.width() / 2.0).unwrap_or(800.0);
@@ -780,6 +911,9 @@ fn sync(
                 set_text(&mut text_q, *e, st);
             }
         }
+        // 调试 HUD 在等待/断线期同样可见（Disconnected + 横杠占位）
+        set_debug_hud_text(&session, *fps_smooth, &mut text_q, &mut span_q, &mut color_q, &views);
+        place_debug_hud(&views, &mut vq, &mut dbg_tr.0, &dbg_tr.1, half_w, half_h);
         return;
     };
     // 反攻模式：被本方瞄准的是全部攻击者（引擎发送时均分给所有攻击者）
@@ -987,32 +1121,15 @@ fn sync(
             (views.hud[7], hud_x, -half_h + 86.0),
         ];
         for (e, x, y) in spots {
-            if let Ok(mut tr) = text_tr.get_mut(e) {
+            if let Ok(mut tr) = dbg_tr.0.get_mut(e) {
                 tr.translation = Vec3::new(x, y, 0.0);
             }
         }
     }
-    // 左下角调试信息：玩家 ID / 对局 ID / 延迟丢包 / 连接状态
-    {
-        if let Ok(mut tr) = text_tr.get_mut(views.dbg) {
-            tr.translation = Vec3::new(-half_w + 14.0, -half_h + 14.0, 0.0);
-        }
-        if let Session::Net { stats, .. } = &*session {
-            let st = stats.lock().unwrap();
-            let conn = if st.connected { "Connected" } else { "Disconnected" };
-            let dbg_txt = format!(
-                "PlayerID: {}\nMatchID: {}\nLat/Loss: {}ms/{}%\nServer: {}\nServer TPS: {:.1}\nClient FPS: {:.0}",
-                if st.player_id.is_empty() { "(observer)" } else { &st.player_id },
-                if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) },
-                st.rtt_ms,
-                st.loss_pct,
-                conn,
-                st.server_tps,
-                *fps_smooth
-            );
-            set_text(&mut text_q, views.dbg, dbg_txt);
-        }
-    }
+    // 调试 HUD：左上一行「玩家 ID | 对局码」，左下一行「连接状态 + 延迟/丢包/TPS/FPS」，
+    // z=50/51 压在小窗网格之上，背衬条保证其在 99p 7×7 网格盖上仍可读
+    set_debug_hud_text(&session, *fps_smooth, &mut text_q, &mut span_q, &mut color_q_state, &views);
+    place_debug_hud(&views, &mut vq, &mut dbg_tr.0, &dbg_tr.1, half_w, half_h);
     // 菱形高亮：当前模式金色，其余灰
     let sel = match s.target_mode {
         TargetMode::Random => 0,
