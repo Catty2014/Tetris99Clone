@@ -101,6 +101,11 @@ struct NetStats {
     rtt_ms: u32,
     loss_pct: u32,
     connected: bool,
+    /// 服务器 tick 速率（EMA，tick/s）
+    server_tps: f32,
+    /// 内部：上一 tick 的序号与到达时刻
+    last_tick_n: u64,
+    last_tick_at: Option<Instant>,
     /// 内部：已发 ping 数 / 收到 pong 数
     pings: u32,
     pongs: u32,
@@ -751,6 +756,8 @@ fn sync(
     mut queue: ResMut<InputQueue>,
     mut prev: ResMut<PrevPiece>,
     fixed: Res<Time<Fixed>>,
+    time: Res<Time>,
+    mut fps_smooth: Local<f32>,
     mut vq: Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
     mut text_q: Query<&mut Text2d>,
     mut color_q: Query<&mut TextColor>,
@@ -759,6 +766,12 @@ fn sync(
 ) {
     let half_w = windows.single().map(|w| w.width() / 2.0).unwrap_or(800.0);
     let half_h = windows.single().map(|w| w.height() / 2.0).unwrap_or(450.0);
+    let inst_fps = 1.0 / time.delta_secs().max(1e-6);
+    *fps_smooth = if *fps_smooth <= 0.0 {
+        inst_fps
+    } else {
+        *fps_smooth * 0.9 + inst_fps * 0.1
+    };
     let Some(s) = session.with_engine(|e, seat| e.snapshot(seat)) else {
         // 网络模式未就绪：显示连接状态
         if let Session::Net { status, .. } = &*session {
@@ -988,12 +1001,14 @@ fn sync(
             let st = stats.lock().unwrap();
             let conn = if st.connected { "Connected" } else { "Disconnected" };
             let dbg_txt = format!(
-                "PlayerID: {}\nMatchID: {}\nLat/Loss: {}ms/{}%\nServer: {}",
+                "PlayerID: {}\nMatchID: {}\nLat/Loss: {}ms/{}%\nServer: {}\nServer TPS: {:.1}\nClient FPS: {:.0}",
                 if st.player_id.is_empty() { "(observer)" } else { &st.player_id },
                 if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) },
                 st.rtt_ms,
                 st.loss_pct,
-                conn
+                conn,
+                st.server_tps,
+                *fps_smooth
             );
             set_text(&mut text_q, views.dbg, dbg_txt);
         }
@@ -1186,6 +1201,9 @@ fn net_thread(
                     let mut st = stats.lock().unwrap();
                     st.match_id = v["match_id"].as_u64().unwrap_or(0);
                     st.connected = true;
+                    st.server_tps = 0.0;
+                    st.last_tick_n = 0;
+                    st.last_tick_at = None;
                 }
                 // 引擎语义版本校验：客户端二进制落后/超前于服务器 → 镜像必然分叉
                 let srv_rev = v["engine_rev"].as_u64().unwrap_or(0) as u32;
@@ -1214,8 +1232,28 @@ fn net_thread(
                 *status.lock().unwrap() = format!("对局 #{} 进行中", v["match"].as_u64().unwrap_or(0));
             }
             "tick" => {
-                // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
+                // 服务器 tick 速率：按 tick 序号差 / 到达时间差做 EMA
                 let tn = v["n"].as_u64();
+                if let Some(tn) = tn {
+                    let now = Instant::now();
+                    let mut st = stats.lock().unwrap();
+                    if st.last_tick_n > 0 && tn > st.last_tick_n {
+                        if let Some(prev) = st.last_tick_at {
+                            let dt = now.duration_since(prev).as_secs_f32();
+                            if dt > 0.0 {
+                                let inst = (tn - st.last_tick_n) as f32 / dt;
+                                st.server_tps = if st.server_tps <= 0.0 {
+                                    inst
+                                } else {
+                                    st.server_tps * 0.8 + inst * 0.2
+                                };
+                            }
+                        }
+                    }
+                    st.last_tick_n = tn;
+                    st.last_tick_at = Some(now);
+                }
+                // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
                 if let (Some(tn), Some(exp)) = (tn, *expected) {
                     if tn != exp {
                         eprintln!("[mirror] 失步: 收到 tick n={tn} 期望 {exp}（本地镜像将重建）");
