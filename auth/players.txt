@@ -1,0 +1,9 @@
+# PlayerID allowlist for t99 Arena.
+# One glob per line, matched against the whole ID.
+# Lines without glob metacharacters are exact matches.
+# Blank lines and lines starting with '#' are ignored.
+
+bot-*
+human-1a2b3c4d
+deepseekv41flash-submit-a1b2c3d4
+submit-11aa22bb

@@ -1,0 +1,58 @@
+# t99 Arena 运行时配置（长期设置）
+#
+# 取值优先级：CLI > 环境变量（T99_*） > 本文件 > 内建默认值。
+# 每局的 url / key / player_id / 期望版本由 Grader 生成的运行时清单提供，
+# 不写进本文件。key 是共享房间口令，不是秘密。
+#
+# 配置路径：--config / T99_CONFIG；缺省 ./config.toml
+# 规则集：./ruleset.toml（只读，不随服务器启动参数改变）
+
+[server]
+address = "127.0.0.1"      # 对外服务时改成 0.0.0.0 或具体网卡地址
+port = 6666
+loglevel = "INFO"          # ERROR / WARN / INFO / DEBUG / TRACE
+debug = false
+stalemate_accel = false    # 竞技固定 false；true 仅展览
+lobby_timeout_secs = 10
+restart_timeout_secs = 8
+write_timeout_secs = 5
+
+[auth]
+check_player_id = true
+case_sensitive = true
+# 一行一个 glob，整行匹配；无元字符即精确匹配。
+id_files = ["auth/players.txt"]
+
+[match]
+players = 99
+lobby = true
+# 0 = 每局随机，启动时向 stdout 输出；指定值则直接使用。
+seed = 0
+# 不设 roster：席位每局随机分配，PlayerID 负责唯一性。
+
+[client]
+server = "ws://127.0.0.1:6666"
+observer = false
+spectate = 0
+# player_id / key 由运行时清单、CLI 或环境变量注入，不写在这里。
+
+[control]
+left = "A"
+right = "D"
+rotate = ["W", "X"]
+rotateC = ["Z", "<LC>"]
+softdrop = "S"
+harddrop = "<SP>"
+hold = ["C", "<LS>"]
+attack = "<TAB>"
+manual = "arrow"            # arrow / wasd；只影响对手手动选择，不影响移动键
+attack_fallback = "random"  # ko / random / badge / attacker
+
+[display]
+vsync = true
+framerate = 240             # 仅 vsync = false 时作为上限
+opponent_framerate = 60     # 对手盘面显示采样率
+ghost = true
+shadow_locked = true
+result_hold_secs = 0        # 0 = 保留到用户关闭/下一局；服务器不持有结算期
+# 输入采样率 = 显示帧率；不再单独配置 sample_rate。

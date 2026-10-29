@@ -1,0 +1,83 @@
+# t99 规则集（只读陈述，不是运行时旋钮）
+#
+# id 必须与编译进 server / client / HeadlessClient 的 RULESET_ID 一致；
+# 服务器 hello 与 ready 用它做精确匹配，不匹配立即拒绝。
+# 阶段参数是当前调参基线，不追求与原版 T99 完全一致。
+#
+# 时间单位：
+#   *_ticks = 60Hz 逻辑帧（整数）
+#   gravity_* = 毫格/秒
+
+[ruleset]
+id = "9f3c1a7e"             # 短 UUID；由 canonical ruleset 派生，正式比赛保持稳定
+
+board_width = 10
+board_height = 20
+hidden_rows = 4             # 允许 2..20
+
+preview = 6
+match_seconds = 900         # 99p 15min；0 = 按玩家人数自动
+
+# 跨阶段不变量
+bag_randomizer = true
+srs = true
+hold = true
+irs = true                  # 目标规则；当前引擎的 ARE 预输入缓冲待补
+ihs = true                  # 同上
+allow_rot180 = false
+death = "block"
+
+das_ticks = 10              # 166.7ms
+arr_ticks = 2               # 33.3ms
+soft_milli_per_sec = 60000
+
+lock_delay = "move"         # 移动重置
+lock_delay_ticks = 30       # 500ms
+lock_resets_max = 15
+
+pending_cap_rows = 12
+send_cap_rows = 20
+p_same_hole_pct = 70
+spawn_y_milli = 4000
+
+combo_bonus = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 5]
+target_bonus = [0, 0, 1, 3, 5, 7, 9]
+badge_tier_units = [2, 6, 14, 30]
+
+# 阶段表：按 ratio_min_pm 降序；进入下一阶段的条件是存活比例低于阈值。
+# are_ticks 取整数逻辑帧；当前为 100/100/83/67ms，后续调参可改。
+[[ruleset.stage]]
+ratio_min_pm = 500
+gravity_base = 750
+gravity_ramp_per_min = 120
+gravity_cap = 1125
+clear_delay_ticks = 18
+are_ticks = 6
+garbage_stage_ticks = 72
+
+[[ruleset.stage]]
+ratio_min_pm = 300
+gravity_base = 1500
+gravity_ramp_per_min = 400
+gravity_cap = 2250
+clear_delay_ticks = 15
+are_ticks = 6
+garbage_stage_ticks = 54
+
+[[ruleset.stage]]
+ratio_min_pm = 100
+gravity_base = 3000
+gravity_ramp_per_min = 1000
+gravity_cap = 4500
+clear_delay_ticks = 12
+are_ticks = 5
+garbage_stage_ticks = 39
+
+[[ruleset.stage]]
+ratio_min_pm = 0
+gravity_base = 6000
+gravity_ramp_per_min = 2000
+gravity_cap = 60000
+clear_delay_ticks = 9
+are_ticks = 4
+garbage_stage_ticks = 27
