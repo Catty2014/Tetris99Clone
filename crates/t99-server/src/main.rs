@@ -6,7 +6,7 @@
 //! - 观战：role=observer&spectate=N，与游玩客户端同协议、无输入权。
 //! - 对局结束后所有人类席位请求 restart 或 8s 超时即开新局（新种子）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -16,8 +16,8 @@ use tungstenite::handshake::server::{Request, Response};
 use tungstenite::Message;
 
 use t99_bots::BotAdapter;
-use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, ENGINE_SEMANTICS};
-use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS};
+use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, RULESET_ID};
+use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
 
 /// 逻辑帧墙钟周期：16.6667ms。引擎时基本身是 FRAME_TICKS，这里只负责节流。
 const FRAME_NS: u64 = 1_000_000_000 / 60;
@@ -42,9 +42,9 @@ struct Args {
     /// 0 杀加速燃烧（展览机制；正式 Arena 关闭）
     stall_accel: bool,
     /// lobby 模式：席位由网络玩家（外部程序/提交程序/人类）接入，人数到齐自动开局；开局后加入无效。
-    /// 与 --bots 同用时为混合局：0..human_seats 席网络玩家，其余席位进程内/子进程 bot
+    /// 与 --bots 同用时为混合局：前 human_seats 个席位由网络玩家随机占用，其余席位进程内/子进程 bot
     lobby: bool,
-    /// lobby 名册（逗号分隔，长度=席位数）；缺省自动生成 p<i>-<hash>
+    /// 可选 PlayerID allowlist（逗号分隔）；不是席位顺序。缺省接受任意非空 ID。
     ids: Option<String>,
 }
 
@@ -129,6 +129,19 @@ fn event_json(t: &TimedKey) -> serde_json::Value {
     }
 }
 
+/// 从空席位中随机选一个；PlayerID 只用于去重，不再决定席位顺序。
+fn pick_seat(free: &[usize], salt: &str) -> usize {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut h = now ^ 0x9e37_79b9_7f4a_7c15;
+    for b in salt.bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x1000_0000_01b3);
+    }
+    free[(h as usize) % free.len()]
+}
+
 /// 每连接的写线程：阻塞在 writer_rx 上逐条写出（含 hello/tick/result/pong）。
 /// 退出条件：通道关闭（大厅登记与 NetPlayerAdapter 都 drop 了 tx）、收到 MSG_CLOSE、
 /// 或写失败（对端消失/写超时）。
@@ -207,7 +220,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     match m {
                         ToGame::ObserverJoin { idx } => {
                             let hello = serde_json::json!({
-                                "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
+                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players,
                                 "seat": -1, "role": "observer",
                                 "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                             });
@@ -249,7 +262,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
                 let hello = serde_json::json!({
-                    "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
+                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
                     "role": if c.seat.is_some() { "player" } else { "observer" },
                     "time_limit_secs": args.time_limit_secs,
@@ -328,7 +341,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     ToGame::ObserverJoin { idx } => {
                         // 单线程回放：先 hello + 全部历史 tick，再激活直播，时序必然正确
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
+                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
@@ -482,7 +495,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 match m {
                     ToGame::ObserverJoin { idx } => {
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
+                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
@@ -525,35 +538,23 @@ fn main() {
         if args.stall_accel { "开" } else { "关" },
         if args.lobby { " [lobby]" } else { "" },
     );
-    // lobby 名册：合法 ID 集合（连接时校验、一次性领取；计分周期的身份锚点）
-    let roster: Arc<Mutex<std::collections::HashSet<String>>> = Arc::new(Mutex::new(
-        if args.lobby {
-            match &args.ids {
-                Some(list) => list.split(',').map(|x| x.trim().to_string()).collect(),
-                None => (0..human_seats)
-                    .map(|i| {
-                        let h = &format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos() as u64 + (i as u64) * 0x9E37);
-                        format!("p{i}-{}", &h[..6.min(h.len())])
-                    })
+    // 可选 allowlist；没有名册顺序：席位随机分配，PlayerID 只负责唯一性。
+    let allowed: Option<Arc<HashSet<String>>> = if args.lobby {
+        args.ids.as_ref().map(|list| {
+            Arc::new(
+                list.split(',')
+                    .map(|x| x.trim().to_string())
+                    .filter(|x| !x.is_empty())
                     .collect(),
-            }
-        } else {
-            Default::default()
-        },
-    ));
+            )
+        })
+    } else {
+        None
+    };
     if args.lobby {
-        {
-            let r = roster.lock().unwrap();
-            let ids: Vec<&String> = r.iter().collect();
-            eprintln!("[roster] key={} 席位数 {} 合法 ID：", args.key, ids.len());
-            for id in ids {
-                eprintln!("  {id}");
-            }
-        }
-        // 名册长度必须等于网络席位数，否则永远等不齐（少）或有人领不到位（多）
-        let n_ids = roster.lock().unwrap().len();
-        if n_ids != human_seats {
-            eprintln!("[roster] 警告：名册 {} 个 ID ≠ 网络席位 {}（human_seats），lobby 将无法开局", n_ids, human_seats);
+        match &allowed {
+            Some(a) => eprintln!("[auth] allowlist {} IDs；席位随机分配", a.len()),
+            None => eprintln!("[auth] 无 allowlist，接受任意非空 PlayerID；席位随机分配"),
         }
     }
     let hall: Arc<Mutex<Hall>> = Arc::new(Mutex::new(Hall::default()));
@@ -581,7 +582,7 @@ fn main() {
         let human_seats = human_seats;
         let running = running.clone();
         let lobby = args.lobby;
-        let roster = roster.clone();
+        let allowed = allowed.clone();
         std::thread::spawn(move || {
             stream.set_nodelay(true).ok();
             let mut query = String::new();
@@ -620,13 +621,13 @@ fn main() {
                 return;
             }
             if role != "observer" && lobby {
-                let mut r = roster.lock().unwrap();
-                if !r.remove(&id) {
-                    err(&mut ws, "id_invalid");
-                    eprintln!("[roster] 拒绝非法/重复 ID: {id}");
-                    return;
+                if let Some(a) = &allowed {
+                    if !a.contains(&id) {
+                        err(&mut ws, "id_invalid");
+                        eprintln!("[auth] 拒绝不在 allowlist 的 ID: {id}");
+                        return;
+                    }
                 }
-                eprintln!("[roster] 领取: {id}");
             }
             if role != "observer" && running.load(Ordering::SeqCst) {
                 err(&mut ws, "match_running");
@@ -640,11 +641,22 @@ fn main() {
             let want_restart = Arc::new(AtomicBool::new(false));
             let (idx, seat) = {
                 let mut h = hall.lock().unwrap();
+                if h.clients.iter().flatten().any(|c| c.id == id) {
+                    drop(h);
+                    err(&mut ws, "id_duplicate");
+                    eprintln!("[auth] 拒绝重复 PlayerID: {id}");
+                    return;
+                }
                 let seat = if role == "observer" {
                     None
                 } else {
                     let taken: Vec<usize> = h.clients.iter().flatten().filter_map(|c| c.seat).collect();
-                    (0..human_seats).find(|s| !taken.contains(s))
+                    let free: Vec<usize> = (0..human_seats).filter(|s| !taken.contains(s)).collect();
+                    if free.is_empty() {
+                        None
+                    } else {
+                        Some(pick_seat(&free, &id))
+                    }
                 };
                 if role != "observer" && seat.is_none() {
                     drop(h);

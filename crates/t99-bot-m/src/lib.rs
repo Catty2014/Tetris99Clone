@@ -1465,7 +1465,7 @@ pub fn run_ws(profile: Profile, url: &str, id: &str, key: &str) {
                 let line = t.to_string();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 match v["type"].as_str().unwrap_or("") {
-                    "hello" if v["protocol"].as_u64().is_some() => {
+                    "hello" if v.get("frame_hz").is_some() => {
                         let proto = v["protocol"].as_u64().unwrap_or(0) as u32;
                         if !(PROTOCOL_MIN..=PROTOCOL_MAX).contains(&proto) {
                             eprintln!("[t99-bot-{}] 协议不兼容: {}", profile.name, proto);

@@ -18,8 +18,8 @@ use web_time::Instant;
 use std::time::Instant;
 use t99_bots::BotAdapter;
 use t99_core::engine::ActiveView;
-use t99_core::{Cell, Key, Kind, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
-use t99_proto::PlayerAdapter;
+use t99_core::{Cell, Key, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
+use t99_proto::{PlayerAdapter, PROTOCOL};
 
 const CELL: f32 = 26.0;
 const MINI: f32 = 4.0;
@@ -623,6 +623,7 @@ fn repeat_keys(repeat: &mut RepeatState, now: Instant) -> Vec<Key> {
 #[cfg(test)]
 mod repeat_tests {
     use super::*;
+    use t99_core::Kind;
 
     #[test]
     fn das_then_arr_emits_one_step_per_interval() {
@@ -655,6 +656,13 @@ mod repeat_tests {
         };
         let ev = repeat_keys(&mut s, t0 + Duration::from_millis(ARR_MS + 1));
         assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
+    }
+
+    #[test]
+    fn version_gate_rejects_mismatch() {
+        assert!(version_ok(PROTOCOL as u64, t99_core::RULESET_ID));
+        assert!(!version_ok(PROTOCOL as u64 + 1, t99_core::RULESET_ID));
+        assert!(!version_ok(PROTOCOL as u64, "deadbeef"));
     }
 
     #[test]
@@ -1427,6 +1435,10 @@ fn sync(
 
 /// 网络线程：连接服务器，维护本地镜像（事件流重演），转发输入/重启
 #[cfg(not(target_arch = "wasm32"))]
+fn version_ok(protocol: u64, ruleset: &str) -> bool {
+    protocol == PROTOCOL as u64 && ruleset == t99_core::RULESET_ID
+}
+
 fn net_thread(
     url: String,
     id: String,
@@ -1478,16 +1490,6 @@ fn net_thread(
                     st.server_tps = 0.0;
                     st.last_tick_n = 0;
                     st.last_tick_at = None;
-                }
-                // 引擎语义版本校验：客户端二进制落后/超前于服务器 → 镜像必然分叉
-                let srv_rev = v["engine_rev"].as_u64().unwrap_or(0) as u32;
-                if srv_rev != 0 && srv_rev != t99_core::ENGINE_SEMANTICS {
-                    eprintln!(
-                        "[mirror] 引擎版本不匹配: 服务器 {} 本地 {} —— 镜像不可信，请重编客户端",
-                        srv_rev,
-                        t99_core::ENGINE_SEMANTICS
-                    );
-                    *status.lock().unwrap() = format!("引擎版本不匹配({srv_rev}≠{})，镜像不可信", t99_core::ENGINE_SEMANTICS);
                 }
                 let players = v["players"].as_u64().unwrap_or(2) as usize;
                 let seed = v["seed"].as_u64().unwrap_or(0);
@@ -1614,12 +1616,32 @@ fn net_thread(
         match ws.read() {
             Ok(Message::Text(t)) => {
                 let text = t.to_string();
-                // 私有 hello（带 protocol）是 NetPlayerAdapter 的 setup 握手，必须先回 ready；
-                // 它不含 match/seed，不能交给 mirror 的 hello 分支。
+                // hello 是版本闸门：protocol / ruleset 任一不匹配，立即拒绝并关闭。
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    if v["type"] == "hello" && v.get("protocol").is_some() {
-                        let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
-                        continue;
+                    if v["type"] == "hello" {
+                        let p = v["protocol"].as_u64().unwrap_or(0);
+                        let r = v["ruleset"].as_str().unwrap_or("");
+                        if !version_ok(p, r) {
+                            let msg = serde_json::json!({
+                                "type": "error",
+                                "code": "unsupported_version",
+                                "protocol": PROTOCOL,
+                                "ruleset": t99_core::RULESET_ID,
+                            });
+                            let _ = ws.send(Message::Text(msg.to_string().into()));
+                            *status.lock().unwrap() = format!(
+                                "版本不匹配: 服务器 protocol={p} ruleset={r}，本机 protocol={PROTOCOL} ruleset={}",
+                                t99_core::RULESET_ID
+                            );
+                            stats.lock().unwrap().connected = false;
+                            return;
+                        }
+                        // 私有 hello（带 frame_hz）是 NetPlayerAdapter 的 setup；
+                        // 它不含 match/seed，不能交给 mirror 的 hello 分支。
+                        if v.get("frame_hz").is_some() {
+                            let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
+                            continue;
+                        }
                     }
                 }
                 if !handle_msg(&text, &mirror, &status, &mut expected) {

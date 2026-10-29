@@ -29,6 +29,7 @@ pub struct Hello {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub protocol: u32,
+    pub ruleset: &'static str,
     pub frame_hz: u32,
     pub player_id: usize,
     pub players: usize,
@@ -47,6 +48,7 @@ pub fn hello_for(pid: usize, players: usize, preview: usize) -> Hello {
     Hello {
         kind: "hello",
         protocol: PROTOCOL,
+        ruleset: t99_core::RULESET_ID,
         frame_hz: 60,
         player_id: pid,
         players,
@@ -868,5 +870,7 @@ mod tests {
         let s = serde_json::to_string(&h).unwrap();
         assert!(s.contains(r#""type":"hello""#));
         assert!(s.contains(r#""player_id":3"#));
+        assert!(s.contains(r#""protocol":7"#));
+        assert!(s.contains(r#""ruleset":"9f3c1a7e""#));
     }
 }

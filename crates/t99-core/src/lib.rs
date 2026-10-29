@@ -25,6 +25,8 @@ pub const MILLI_CELL: Milli = 1000;
 /// 引擎语义版本：任何影响模拟结果的引擎改动都必须递增（镜像失步的语义类防护——
 /// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
 pub const ENGINE_SEMANTICS: u32 = 2;
+/// 规则集身份；与 ruleset.toml 的 `id` 和服务器 hello 一致。
+pub const RULESET_ID: &str = "9f3c1a7e";
 
 pub const W: usize = 10;
 pub const HIDDEN: usize = 4;
