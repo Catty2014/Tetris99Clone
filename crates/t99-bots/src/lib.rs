@@ -241,8 +241,17 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 pub fn desired_target(s: &Snapshot) -> Key {
     let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
     if !s.targeted_by.is_empty() && pending >= 3 {
-        let fattest = s
+        // 待进已满的瞄准者会把攻击丢弃，优先反打仍有余量者；全员饱和才退回原逻辑
+        let roomy: Vec<usize> = s
             .targeted_by
+            .iter()
+            .copied()
+            .filter(|&p| {
+                s.garbage_cap == 0 || s.pending_all.get(p).copied().unwrap_or(0) < s.garbage_cap
+            })
+            .collect();
+        let pool: &[usize] = if roomy.is_empty() { &s.targeted_by } else { &roomy };
+        let fattest = pool
             .iter()
             .copied()
             .max_by_key(|&p| s.badges_all.get(p).copied().unwrap_or(0))

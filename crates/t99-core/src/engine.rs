@@ -105,6 +105,10 @@ pub struct Snapshot {
     pub targeted_by: Vec<usize>,
     /// 全员徽章数（index=pid；徽章随 KO 转移，围猎徽章领先者的决策依据）
     pub badges_all: Vec<u32>,
+    /// 全员待进垃圾行数（index=pid）
+    pub pending_all: Vec<u32>,
+    /// 待进队列上限（行）
+    pub garbage_cap: u32,
     /// 最近一次消行判定（1s 显示窗口由客户端按帧龄过滤）
     pub last_clear: Option<ClearView>,
 }
@@ -988,11 +992,21 @@ impl Match {
         if others.is_empty() {
             return None;
         }
+        let cap = self.cfg.ruleset.pending_cap_rows;
+        // 待进队列已满（≥cap）的目标会把攻击丢弃，优先在仍有空间的候选里挑
+        let roomy: Vec<usize> = {
+            let pending_of = |i: usize| -> u32 {
+                self.players[i].pending.iter().map(|g| g.rows).sum()
+            };
+            others.iter().copied().filter(|&i| pending_of(i) < cap).collect()
+        };
+        // 全员饱和才退化为原先的全体候选（此时攻击本就会被截断，行为与旧版一致）
+        let pool: &[usize] = if roomy.is_empty() { others } else { &roomy };
         match mode {
             TargetMode::Badges => {
                 // 按徽章数（而非档位）排序：档位阈值稀疏（2/6/14/30），多数持有者挤在同档，
                 // 同档按 pid 排序会把集火退化成「打最低 pid」，级联断链。
-                let mut v = others.to_vec();
+                let mut v = pool.to_vec();
                 v.sort_by(|&a, &b| {
                     self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b))
                 });
@@ -1004,13 +1018,13 @@ impl Match {
                     stack_height(&self.players[i]) as i64
                         + self.players[i].pending.iter().map(|g| g.rows as i64).sum::<i64>()
                 };
-                let mut v = others.to_vec();
+                let mut v = pool.to_vec();
                 v.sort_by(|&a, &b| near_death(b).cmp(&near_death(a)).then(a.cmp(&b)));
                 Some(v[0])
             }
             TargetMode::Random => {
-                let idx = self.players[pid].rng_misc.below(others.len() as u64) as usize;
-                Some(others[idx])
+                let idx = self.players[pid].rng_misc.below(pool.len() as u64) as usize;
+                Some(pool[idx])
             }
             TargetMode::Attackers => {
                 let mut atk: Vec<usize> = others
@@ -1056,9 +1070,30 @@ impl Match {
                     .copied()
                     .filter(|&i| self.players[i].last_target == Some(pid))
                     .collect();
+                // 饱和目标收不下攻击，优先反打仍有余量的攻击者
+                let cap = self.cfg.ruleset.pending_cap_rows;
+                let roomy_atk: Vec<usize> = atk
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        self.players[i].pending.iter().map(|g| g.rows).sum::<u32>() < cap
+                    })
+                    .collect();
+                if !roomy_atk.is_empty() {
+                    atk = roomy_atk;
+                }
                 if atk.is_empty() {
-                    let idx = self.players[pid].rng_misc.below(others.len() as u64) as usize;
-                    vec![(others[idx], rows)]
+                    let cap = self.cfg.ruleset.pending_cap_rows;
+                    let roomy: Vec<usize> = others
+                        .iter()
+                        .copied()
+                        .filter(|&i| {
+                            self.players[i].pending.iter().map(|g| g.rows).sum::<u32>() < cap
+                        })
+                        .collect();
+                    let pool: &[usize] = if roomy.is_empty() { &others } else { &roomy };
+                    let idx = self.players[pid].rng_misc.below(pool.len() as u64) as usize;
+                    vec![(pool[idx], rows)]
                 } else {
                     atk.sort_unstable();
                     let base = rows / atk.len() as u32;
@@ -1683,6 +1718,12 @@ impl Match {
             burn_x10: ((self.burn_ticks() as u128 * 10 / self.cfg.ruleset.frame_ticks().max(1) as u128) as u16).max(1),
             pid: pid_field,
             badges_all: self.players.iter().map(|p| p.badges).collect(),
+            pending_all: self
+                .players
+                .iter()
+                .map(|p| p.pending.iter().map(|g| g.rows).sum::<u32>())
+                .collect(),
+            garbage_cap: self.cfg.ruleset.pending_cap_rows,
             targeted_by: (0..self.players.len())
                 .filter(|&q| q != pid && self.players[q].alive && self.players[q].last_target == Some(pid))
                 .collect(),
@@ -2100,6 +2141,35 @@ mod tests {
         let recv = m.resolve_receivers(0, 4);
         assert_eq!(recv.len(), 1);
         assert_eq!(recv[0].0, 1); // 退化为存活他人
+    }
+
+    #[test]
+    fn kos_skips_saturated_target() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 11, ruleset: Ruleset::default() });
+        let cap = m.cfg.ruleset.pending_cap_rows;
+        {
+            // p1：堆更高且待进已满 —— 旧逻辑会把攻击送进它的满队列后丢弃
+            let p1 = &mut m.players[1];
+            for r in 8..ROWS {
+                for c in 0..W {
+                    p1.board[r * W + c] = CELL_GARBAGE;
+                }
+            }
+            p1.pending.push(Garb { rows: cap, sender: 0, state: GarbState::Yellow(1200 * TMS) });
+            // p2：堆略低、待进无人
+            let p2 = &mut m.players[2];
+            for r in 12..ROWS {
+                for c in 0..W {
+                    p2.board[r * W + c] = CELL_GARBAGE;
+                }
+            }
+        }
+        m.apply_key(0, Key::TargetKos);
+        assert_eq!(m.players[0].last_target, Some(2), "Kos 应避开待进已满的目标");
+        let s = m.snapshot(0);
+        assert_eq!(s.garbage_cap, cap);
+        assert_eq!(s.pending_all[1], cap);
+        assert_eq!(s.pending_all[2], 0);
     }
 
     #[test]

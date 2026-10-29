@@ -8,6 +8,8 @@
 //! v6：frame 增 `targeted_by`（正在瞄准本方的存活 pid 列表，反攻决策）、
 //! `time_secs_left`（对局倒计时）、`burn_x10`（倒计时燃烧倍率）。
 //! v7：frame 增 `badges`（全员徽章数组；徽章随 KO 转移，围猎徽章领先者的依据）。
+//! v8 起 frame 增可选 `pending_all` / `garbage_cap`（全员待进行数与队列上限，
+//! 供 bot 避开已饱和目标）；协议号不变，缺席按默认值处理，旧读取方不受影响。
 //! 读取方须容忍字段缺席（serde default）。
 
 use serde::{Deserialize, Serialize};
@@ -105,6 +107,12 @@ pub struct FrameMsg {
     /// v7：全员徽章数组（index=pid，含已死者；徽章随 KO 转移）
     #[serde(default)]
     pub badges_all: Vec<u32>,
+    /// 全员待进垃圾行数（index=pid，含已死者）
+    #[serde(default)]
+    pub pending_all: Vec<u32>,
+    /// 待进队列上限（行）；pending_all[p] ≥ 该值的玩家会丢弃攻击
+    #[serde(default)]
+    pub garbage_cap: u32,
     /// v6：对局倒计时剩余秒
     #[serde(default)]
     pub time_secs_left: u32,
@@ -205,6 +213,8 @@ impl FrameMsg {
             pieces: s.pieces,
             targeted_by: s.targeted_by.clone(),
             badges_all: s.badges_all.clone(),
+            pending_all: s.pending_all.clone(),
+            garbage_cap: s.garbage_cap,
             time_secs_left: s.match_secs_left,
             burn_x10: s.burn_x10,
         }

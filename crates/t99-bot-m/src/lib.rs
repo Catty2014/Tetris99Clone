@@ -75,6 +75,12 @@ pub struct FrameIn {
     /// v7：全员徽章数组（index=pid；徽章随 KO 转移）
     #[serde(default)]
     pub badges_all: Vec<u32>,
+    /// 全员待进垃圾行数（index=pid）；缺席时为空 → 不做饱和过滤
+    #[serde(default)]
+    pub pending_all: Vec<u32>,
+    /// 待进队列上限（行）；0 表示未知
+    #[serde(default)]
+    pub garbage_cap: u32,
     #[serde(default)]
     pub time_secs_left: u32,
     #[serde(default)]
@@ -111,6 +117,15 @@ pub struct LockIn {
 impl FrameIn {
     pub fn pending(&self) -> u32 {
         self.garbage.red + self.garbage.yellow + self.garbage.gray
+    }
+
+    /// 该玩家还能否收下攻击：待进 < 队列上限才有空间。
+    /// 上限为 0（旧服务端未下发）或待进数组缺席时视为有空间。
+    pub fn has_garbage_room(&self, pid: usize) -> bool {
+        if self.garbage_cap == 0 {
+            return true;
+        }
+        self.pending_all.get(pid).copied().unwrap_or(0) < self.garbage_cap
     }
 }
 
@@ -1314,8 +1329,15 @@ impl Brain {
         // Master：仅当真正受威胁（待进垃圾 ≥3 行）才反攻，否则坚持围猎/进攻。
         let counter_first = if p.name == "gm" || p.name.starts_with("berserk") { false } else { fr.pending() >= 3 };
         if counter_first && !fr.targeted_by.is_empty() {
-            let fattest = fr
+            // 待进已满的瞄准者收不下攻击，优先反打仍有余量者；全员饱和才退回原逻辑
+            let roomy: Vec<usize> = fr
                 .targeted_by
+                .iter()
+                .copied()
+                .filter(|&p| fr.has_garbage_room(p))
+                .collect();
+            let pool: &[usize] = if roomy.is_empty() { &fr.targeted_by } else { &roomy };
+            let fattest = pool
                 .iter()
                 .copied()
                 .max_by_key(|&p| fr.badges_all.get(p).copied().unwrap_or(0))
