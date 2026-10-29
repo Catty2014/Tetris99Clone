@@ -18,8 +18,9 @@ spectate = 0
 [control]
 # Headed-client input timing. Headless clients emit discrete events and ignore these.
 # ARR is the repeat interval after DAS; 0 means instant repeat.
-das_ms = 167
-arr_ms = 33
+das_ticks = 10             # logical ticks; runtime converts with server tick_hz
+arr_ticks = 2
+dual_charge = false
 
 # Key names:
 #   letters: uppercase letter itself ("A", "Z")

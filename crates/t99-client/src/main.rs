@@ -24,9 +24,11 @@ use t99_proto::{PlayerAdapter, PROTOCOL};
 const CELL: f32 = 26.0;
 const MINI: f32 = 4.0;
 const FRAME_US: u64 = 16_666;
-/// 有头客户端输入时序；M4 接 client.toml 后改为运行时配置。
-const DAS_MS: u64 = 167;
-const ARR_MS: u64 = 33;
+/// 有头客户端输入时序：按 tick 配置，运行时用服务器 tick_hz 转 time。
+const DAS_TICKS: u32 = 10;
+const ARR_TICKS: u32 = 2;
+const DEFAULT_TICK_HZ: u32 = 60;
+const DUAL_CHARGE: bool = false;
 /// ARR=0 时一次补发的最大格数（棋盘宽 10）。
 const MAX_REPEAT_PER_FRAME: usize = 10;
 const THUMB_HZ: f64 = 10.0;
@@ -100,6 +102,8 @@ pub enum NetCmd {
 struct MirrorState {
     engine: Option<Match>,
     my_seat: usize,
+    /// 服务器逻辑 tick 速率；DAS/ARR tick 转 time 与 FixedUpdate 都依赖它
+    tick_hz: u32,
     /// 最近一次私有 frame 的帧号；用于给 input 填 n
     pending_frame_n: u64,
     /// 已回复过的 frame 帧号，避免同一帧重复发 input
@@ -156,13 +160,21 @@ struct InputQueue {
     target_idx: usize,
 }
 
+#[derive(Default, Clone, Copy)]
+struct DirState {
+    held: bool,
+    charged: bool,
+    next: Option<Instant>,
+}
+
 /// 有头客户端的 DAS/ARR 状态：引擎不再按住自动重复。
+/// 每方向独立保存 charge；active 决定当前发哪个方向的脉冲。
 #[derive(Resource, Default)]
 struct RepeatState {
-    left: bool,
-    right: bool,
-    dir: i8,
-    next: Option<Instant>,
+    left: DirState,
+    right: DirState,
+    active: i8,
+    dual_charge: bool,
 }
 
 #[derive(Resource)]
@@ -477,6 +489,32 @@ impl Scheme {
     }
 }
 
+fn session_tick_hz(session: &Session) -> u32 {
+    match session {
+        Session::Net { mirror, .. } => {
+            let h = mirror.lock().unwrap().tick_hz;
+            if h == 0 {
+                DEFAULT_TICK_HZ
+            } else {
+                h
+            }
+        }
+        _ => DEFAULT_TICK_HZ,
+    }
+}
+
+fn sync_tick_rate(
+    session: Res<Session>,
+    mut fixed: ResMut<Time<Fixed>>,
+    mut last: Local<u32>,
+) {
+    let hz = session_tick_hz(&session);
+    if *last != hz {
+        fixed.set_timestep_hz(hz as f64);
+        *last = hz;
+    }
+}
+
 fn poll_input(
     mut queue: ResMut<InputQueue>,
     mut repeat: ResMut<RepeatState>,
@@ -488,42 +526,62 @@ fn poll_input(
     let now = Instant::now();
     let jp = |c: &[KeyCode]| c.iter().any(|c| keys.just_pressed(*c));
     let jr = |c: &[KeyCode]| c.iter().any(|c| keys.just_released(*c));
+    let tick_hz = session_tick_hz(&session);
+    let das = Duration::from_secs_f64(DAS_TICKS as f64 / tick_hz as f64);
+    let arr = Duration::from_secs_f64(ARR_TICKS as f64 / tick_hz as f64);
+    repeat.dual_charge = DUAL_CHARGE;
+    // 先发已到期的 DAS/ARR 脉冲，再处理本帧新按键；保证打断时 DAS 在前。
+    for key in repeat_keys(&mut repeat, now, das, arr) {
+        push_key(&mut queue, key, now);
+    }
     // 主操作：移动/软降。横向 DAS/ARR 在这里展开，引擎只收离散事件。
     let (ml, mr, sf) = (scheme.move_l(), scheme.move_r(), scheme.soft());
     if jp(&ml) {
         push_key(&mut queue, Key::LeftDown, now);
-        repeat.left = true;
-        repeat.dir = -1;
-        repeat.next = Some(now + Duration::from_millis(DAS_MS));
+        repeat.left.held = true;
+        repeat.active = -1;
+        if repeat.left.charged {
+            repeat.left.next = Some(now);
+        } else if repeat.left.next.is_none() {
+            repeat.left.next = Some(now + das);
+        }
     }
     if jr(&ml) {
         push_key(&mut queue, Key::LeftUp, now);
-        repeat.left = false;
-        if repeat.dir == -1 {
-            repeat.dir = if repeat.right { 1 } else { 0 };
-            repeat.next = if repeat.dir != 0 {
-                Some(now + Duration::from_millis(DAS_MS))
+        repeat.left.held = false;
+        if repeat.active == -1 {
+            if repeat.right.held {
+                repeat.active = 1;
+                if repeat.right.charged {
+                    repeat.right.next = Some(now);
+                }
             } else {
-                None
-            };
+                repeat.active = 0;
+            }
         }
     }
     if jp(&mr) {
         push_key(&mut queue, Key::RightDown, now);
-        repeat.right = true;
-        repeat.dir = 1;
-        repeat.next = Some(now + Duration::from_millis(DAS_MS));
+        repeat.right.held = true;
+        repeat.active = 1;
+        if repeat.right.charged {
+            repeat.right.next = Some(now);
+        } else if repeat.right.next.is_none() {
+            repeat.right.next = Some(now + das);
+        }
     }
     if jr(&mr) {
         push_key(&mut queue, Key::RightUp, now);
-        repeat.right = false;
-        if repeat.dir == 1 {
-            repeat.dir = if repeat.left { -1 } else { 0 };
-            repeat.next = if repeat.dir != 0 {
-                Some(now + Duration::from_millis(DAS_MS))
+        repeat.right.held = false;
+        if repeat.active == 1 {
+            if repeat.left.held {
+                repeat.active = -1;
+                if repeat.left.charged {
+                    repeat.left.next = Some(now);
+                }
             } else {
-                None
-            };
+                repeat.active = 0;
+            }
         }
     }
     if jp(&sf) {
@@ -589,44 +647,83 @@ fn poll_input(
             push_key(&mut queue, Key::TargetPlayer(pid as u16), now);
         }
     }
-    for key in repeat_keys(&mut repeat, now) {
-        push_key(&mut queue, key, now);
-    }
 }
 
 /// 返回本帧应补发的离散方向事件；不直接碰 Bevy，便于单测。
-fn repeat_keys(repeat: &mut RepeatState, now: Instant) -> Vec<Key> {
+fn repeat_keys(
+    state: &mut RepeatState,
+    now: Instant,
+    das: Duration,
+    arr: Duration,
+) -> Vec<Key> {
     let mut out = Vec::new();
-    if repeat.dir == 0 {
-        return out;
+    let dual = state.dual_charge;
+    let active = state.active;
+    if active == -1 {
+        advance_dir(&mut state.left, now, Key::LeftDown, das, arr, true, &mut out);
+    } else if active == 1 {
+        advance_dir(&mut state.right, now, Key::RightDown, das, arr, true, &mut out);
     }
-    let mut next = repeat
-        .next
-        .unwrap_or_else(|| now + Duration::from_millis(DAS_MS));
-    if now < next {
-        return out;
-    }
-    let key = if repeat.dir < 0 {
-        Key::LeftDown
-    } else {
-        Key::RightDown
-    };
-    if ARR_MS == 0 {
-        for _ in 0..MAX_REPEAT_PER_FRAME {
-            out.push(key);
+    if dual {
+        if active != -1 {
+            advance_dir(&mut state.left, now, Key::LeftDown, das, arr, false, &mut out);
         }
-        next = now + Duration::from_millis(16);
-    } else {
-        let arr = Duration::from_millis(ARR_MS);
-        let mut budget = 16;
-        while now >= next && budget > 0 {
-            out.push(key);
-            next += arr;
-            budget -= 1;
+        if active != 1 {
+            advance_dir(&mut state.right, now, Key::RightDown, das, arr, false, &mut out);
         }
     }
-    repeat.next = Some(next);
     out
+}
+
+fn advance_dir(
+    d: &mut DirState,
+    now: Instant,
+    key: Key,
+    das: Duration,
+    arr: Duration,
+    emit: bool,
+    out: &mut Vec<Key>,
+) {
+    if !d.held {
+        return;
+    }
+    let mut next = match d.next {
+        Some(n) => n,
+        None => {
+            let n = now + das;
+            d.next = Some(n);
+            n
+        }
+    };
+    if !d.charged {
+        if now < next {
+            return;
+        }
+        d.charged = true;
+        if emit {
+            out.push(key);
+        }
+        d.next = Some(now + arr);
+        return;
+    }
+    if arr.is_zero() {
+        if emit {
+            for _ in 0..MAX_REPEAT_PER_FRAME {
+                out.push(key);
+            }
+        }
+        d.next = Some(now + Duration::from_millis(16));
+        return;
+    }
+    let mut budget = 16;
+    while now >= next && budget > 0 {
+        if emit {
+            out.push(key);
+        }
+        next += arr;
+        budget -= 1;
+    }
+    d.next = Some(next);
 }
 
 #[cfg(test)]
@@ -637,19 +734,19 @@ mod repeat_tests {
     #[test]
     fn das_then_arr_emits_one_step_per_interval() {
         let t0 = Instant::now();
-        let mut s = RepeatState {
-            left: true,
-            right: false,
-            dir: -1,
-            next: Some(t0 + Duration::from_millis(DAS_MS)),
-        };
-        assert!(repeat_keys(&mut s, t0).is_empty());
+        let das = Duration::from_millis(167);
+        let arr = Duration::from_millis(33);
+        let mut s = RepeatState::default();
+        s.left.held = true;
+        s.active = -1;
+        s.left.next = Some(t0 + das);
+        assert!(repeat_keys(&mut s, t0, das, arr).is_empty());
         assert_eq!(
-            repeat_keys(&mut s, t0 + Duration::from_millis(DAS_MS)),
+            repeat_keys(&mut s, t0 + das, das, arr),
             vec![Key::LeftDown]
         );
         assert_eq!(
-            repeat_keys(&mut s, t0 + Duration::from_millis(DAS_MS + ARR_MS)),
+            repeat_keys(&mut s, t0 + das + arr, das, arr),
             vec![Key::LeftDown]
         );
     }
@@ -657,14 +754,56 @@ mod repeat_tests {
     #[test]
     fn arr_backlog_emits_multiple_steps() {
         let t0 = Instant::now();
-        let mut s = RepeatState {
-            left: false,
-            right: true,
-            dir: 1,
+        let das = Duration::from_millis(167);
+        let arr = Duration::from_millis(33);
+        let mut s = RepeatState::default();
+        s.right.held = true;
+        s.active = 1;
+        s.right.charged = true;
+        s.right.next = Some(t0);
+        let ev = repeat_keys(&mut s, t0 + arr + Duration::from_millis(1), das, arr);
+        assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
+    }
+
+    #[test]
+    fn das_interruption_preserves_other_charge() {
+        let t0 = Instant::now();
+        let das = Duration::from_millis(167);
+        let arr = Duration::from_millis(33);
+        let mut s = RepeatState::default();
+        s.right = DirState {
+            held: true,
+            charged: true,
             next: Some(t0),
         };
-        let ev = repeat_keys(&mut s, t0 + Duration::from_millis(ARR_MS + 1));
-        assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
+        s.active = 1;
+        // 按左：right 仍然 held + charged，只切 active
+        s.left.held = true;
+        s.active = -1;
+        s.left.next = Some(t0 + das);
+        // 松左：right 恢复 active
+        s.left.held = false;
+        s.active = 1;
+        s.right.next = Some(t0);
+        assert_eq!(repeat_keys(&mut s, t0, das, arr), vec![Key::RightDown]);
+        assert!(s.right.charged);
+    }
+
+    #[test]
+    fn dual_charge_advances_inactive_without_emitting() {
+        let t0 = Instant::now();
+        let das = Duration::from_millis(167);
+        let arr = Duration::from_millis(33);
+        let mut s = RepeatState {
+            left: DirState { held: true, charged: false, next: Some(t0 + das) },
+            right: DirState { held: true, charged: false, next: Some(t0 + das) },
+            active: -1,
+            dual_charge: true,
+        };
+        let ev = repeat_keys(&mut s, t0 + das, das, arr);
+        assert_eq!(ev, vec![Key::LeftDown]);
+        assert!(s.left.charged);
+        assert!(s.right.charged);
     }
 
     #[test]
@@ -1513,6 +1652,10 @@ fn net_thread(
                 let mut g = mirror.lock().unwrap();
                 g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
                 g.my_seat = if seat >= 0 { seat as usize } else { spectate };
+                g.tick_hz = v["tick_hz"]
+                    .as_u64()
+                    .or_else(|| v["frame_hz"].as_u64())
+                    .unwrap_or(DEFAULT_TICK_HZ as u64) as u32;
                 g.pending_frame_n = 0;
                 g.last_input_n = 0;
                 drop(g);
@@ -1774,7 +1917,7 @@ fn main() {
         .insert_resource(RepeatState::default())
         .insert_resource(scheme)
         .add_systems(Startup, setup)
-        .add_systems(Update, (poll_input, sync).chain())
+        .add_systems(Update, (sync_tick_rate, poll_input, sync).chain())
         .add_systems(FixedUpdate, tick)
         .run();
 }
