@@ -1313,48 +1313,9 @@ impl Brain {
         self.exec(fr, a, &g)
     }
 
-    fn target_mode(&self, fr: &FrameIn) -> Option<Ev> {
-        let dbg = std::env::var("T99_BOT_TARGET").is_ok();
-        let trace = |m: &str| if dbg { eprintln!("[target:{} f{}] {}", self.profile.name, fr.n, m); };
-        // 攻防策略（徽章转移感知）：
-        // 被瞄 → 集中反打徽章最肥的瞄准者（击杀吞其全部徽章，双倍收益）；
-        // 无人瞄 → 场上徽章领先者 ≥ harvest_badges 即围猎（TargetBadges，制造转移链）；
-        // 否则抢人头。平摊式 TargetAttackers 会让火力全被抵消，谁也打不死谁。
-        let p = &self.profile;
-        let leader = fr
-            .badges_all
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != fr.seat)
-            .max_by_key(|&(_, &b)| b);
-        // GM（「可以不活，其余参赛者必须死」）：围猎永远优先于反攻；
-        // Master：仅当真正受威胁（待进垃圾 ≥3 行）才反攻，否则坚持围猎/进攻。
-        let counter_first = if p.name == "gm" || p.name.starts_with("berserk") { false } else { fr.pending() >= 3 };
-        if counter_first && !fr.targeted_by.is_empty() {
-            // 待进已满的瞄准者收不下攻击，优先反打仍有余量者；全员饱和才退回原逻辑
-            let roomy: Vec<usize> = fr
-                .targeted_by
-                .iter()
-                .copied()
-                .filter(|&p| fr.has_garbage_room(p))
-                .collect();
-            let pool: &[usize] = if roomy.is_empty() { &fr.targeted_by } else { &roomy };
-            let fattest = pool
-                .iter()
-                .copied()
-                .max_by_key(|&p| fr.badges_all.get(p).copied().unwrap_or(0))
-                .unwrap_or(0);
-            trace(&format!("被瞄{} 待进{} → 反打 pid{} (徽章{})", fr.targeted_by.len(), fr.pending(), fattest, fr.badges_all.get(fattest).copied().unwrap_or(0)));
-            return Some(Ev::TargetPlayer(fattest as u16));
-        }
-        if let Some((lp, &b)) = leader {
-            if b >= p.harvest_badges {
-                trace(&format!("围猎领先者 pid{} (徽章{}) 被瞄{}", lp, b, fr.targeted_by.len()));
-                return Some(Ev::TargetBadges);
-            }
-        }
-        // 兜底：TargetRandom——固定 Kos 会让所有 bot 压向同一最高堆，撞 12 行上限后
-        // 大量攻击被丢弃；扩散到仍有空间的目标才能把攻击真正打出去。
+    fn target_mode(&self, _fr: &FrameIn) -> Option<Ev> {
+        // 99 人基准实测：均匀随机（引擎只在待进未满的目标里抽）优于反攻/围猎。
+        // 集中火力会撞上 12 行待进上限并被消行抵消，实际进场更少。
         Some(Ev::TargetRandom)
     }
 
