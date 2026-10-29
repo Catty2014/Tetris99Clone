@@ -8,7 +8,7 @@
 //! 中央棋盘 + 左侧垃圾条 + 右侧 Next6 + 下方菱形目标指示。
 
 use bevy::prelude::*;
-use bevy::text::{TextLayoutInfo, TextSpan};
+use bevy::text::{Font, TextLayoutInfo, TextSpan};
 use bevy::window::PresentMode;
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -297,8 +297,18 @@ fn frame_rect(cmd: &mut Commands, center: Vec2, w: f32, h: f32, color: Color, z:
     }
 }
 
-fn setup(mut cmd: Commands, assets: Res<AssetServer>, display: Res<DisplaySettings>) {
-    let font: Handle<Font> = assets.load("fonts/CJK.otf");
+/// 内嵌 CJK 字体：不依赖 assets 目录或运行工作目录。
+#[derive(Resource)]
+struct UiFont(Handle<Font>);
+
+fn load_ui_font(mut cmd: Commands, mut fonts: ResMut<Assets<Font>>) {
+    let font = Font::try_from_bytes(include_bytes!("../assets/fonts/CJK.otf").to_vec())
+        .expect("内置 CJK 字体损坏");
+    cmd.insert_resource(UiFont(fonts.add(font)));
+}
+
+fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>) {
+    let font: Handle<Font> = ui_font.0.clone();
     cmd.spawn(Camera2d);
     cmd.spawn((
         Sprite::from_color(Color::srgb(0.06, 0.07, 0.10), Vec2::new(W as f32 * CELL + 8.0, H as f32 * CELL + 8.0)),
@@ -846,6 +856,12 @@ mod repeat_tests {
     use t99_core::Kind;
 
     #[test]
+    fn embedded_cjk_font_parses() {
+        let bytes = include_bytes!("../assets/fonts/CJK.otf").to_vec();
+        assert!(Font::try_from_bytes(bytes).is_ok());
+    }
+
+    #[test]
     fn das_then_arr_emits_one_step_per_interval() {
         let t0 = Instant::now();
         let das = Duration::from_millis(167);
@@ -1320,7 +1336,7 @@ fn sync(
     mut cmd: Commands,
     session: Res<Session>,
     views: Res<Views>,
-    font_assets: Res<AssetServer>,
+    font_assets: Res<UiFont>,
     mut thumbs: ResMut<Thumbs>,
     queue: Res<InputQueue>,
     mut prev: ResMut<PrevPiece>,
@@ -1592,7 +1608,7 @@ fn sync(
         tc.0 = if sel == 4 { hot } else { dim };
     }
     // —— 小窗层（节流） ——
-    let font: Handle<Font> = font_assets.load("fonts/CJK.otf");
+    let font: Handle<Font> = font_assets.0.clone();
     let alive_others = session
         .with_engine(|e, seat| (0..e.players.len()).filter(|&p| p != seat && e.players[p].alive).count())
         .unwrap_or(0);
@@ -2135,7 +2151,7 @@ fn main() {
         .insert_resource(timing)
         .insert_resource(display)
         .insert_resource(keymap)
-        .add_systems(Startup, setup)
+        .add_systems(Startup, (load_ui_font, setup).chain())
         .add_systems(Update, (sync_tick_rate, poll_input, sync).chain())
         .add_systems(FixedUpdate, tick)
         .run();
