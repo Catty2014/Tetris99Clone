@@ -8,6 +8,7 @@ license.workspace = true
 t99-core = { path = "../t99-core" }
 t99-bots = { path = "../t99-bots" }
 t99-proto = { path = "../t99-proto" }
+t99-config = { path = "../t99-config" }
 
 [dependencies.bevy]
 version = "=0.16.0"

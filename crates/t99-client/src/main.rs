@@ -24,11 +24,7 @@ use t99_proto::{PlayerAdapter, PROTOCOL};
 const CELL: f32 = 26.0;
 const MINI: f32 = 4.0;
 const FRAME_US: u64 = 16_666;
-/// 有头客户端输入时序：按 tick 配置，运行时用服务器 tick_hz 转 time。
-const DAS_TICKS: u32 = 10;
-const ARR_TICKS: u32 = 2;
 const DEFAULT_TICK_HZ: u32 = 60;
-const DUAL_CHARGE: bool = false;
 /// ARR=0 时一次补发的最大格数（棋盘宽 10）。
 const MAX_REPEAT_PER_FRAME: usize = 10;
 const THUMB_HZ: f64 = 10.0;
@@ -177,11 +173,28 @@ struct RepeatState {
     dual_charge: bool,
 }
 
+#[derive(Resource, Clone, Copy)]
+struct InputTiming {
+    das_ticks: u32,
+    arr_ticks: u32,
+    dual_charge: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Resource, Clone, Copy)]
+struct DisplaySettings {
+    ghost: bool,
+    shadow_locked: bool,
+    opponent_framerate: u32,
+    result_hold_secs: u64,
+}
+
 #[derive(Resource)]
 struct Views {
     cells: Vec<Entity>,
     active: Vec<Entity>,
     ghost: Vec<Entity>,
+    ghost_enabled: bool,
     hold: Vec<Entity>,
     next: Vec<Entity>,
     meter: Vec<Entity>,
@@ -284,7 +297,7 @@ fn frame_rect(cmd: &mut Commands, center: Vec2, w: f32, h: f32, color: Color, z:
     }
 }
 
-fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
+fn setup(mut cmd: Commands, assets: Res<AssetServer>, display: Res<DisplaySettings>) {
     let font: Handle<Font> = assets.load("fonts/CJK.otf");
     cmd.spawn(Camera2d);
     cmd.spawn((
@@ -416,7 +429,7 @@ fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
         .id();
     cmd.entity(dbg_bot).add_children(&[dbg_bot_status, dbg_bot_rest]);
     cmd.insert_resource(Views {
-        cells, active, ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub,
+        cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub,
         dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_bot_rest, dbg_bot_bg,
     });
     cmd.insert_resource(Thumbs::default());
@@ -518,6 +531,7 @@ fn sync_tick_rate(
 fn poll_input(
     mut queue: ResMut<InputQueue>,
     mut repeat: ResMut<RepeatState>,
+    timing: Res<InputTiming>,
     keys: Res<ButtonInput<KeyCode>>,
     session: Res<Session>,
     thumbs: Res<Thumbs>,
@@ -527,9 +541,9 @@ fn poll_input(
     let jp = |c: &[KeyCode]| c.iter().any(|c| keys.just_pressed(*c));
     let jr = |c: &[KeyCode]| c.iter().any(|c| keys.just_released(*c));
     let tick_hz = session_tick_hz(&session);
-    let das = Duration::from_secs_f64(DAS_TICKS as f64 / tick_hz as f64);
-    let arr = Duration::from_secs_f64(ARR_TICKS as f64 / tick_hz as f64);
-    repeat.dual_charge = DUAL_CHARGE;
+    let das = Duration::from_secs_f64(timing.das_ticks as f64 / tick_hz as f64);
+    let arr = Duration::from_secs_f64(timing.arr_ticks as f64 / tick_hz as f64);
+    repeat.dual_charge = timing.dual_charge;
     // 先发已到期的 DAS/ARR 脉冲，再处理本帧新按键；保证打断时 DAS 在前。
     for key in repeat_keys(&mut repeat, now, das, arr) {
         push_key(&mut queue, key, now);
@@ -1263,9 +1277,11 @@ fn sync(
                 place(&mut vq, views.active[i], board_pos(col, row), kind_color(a.kind.id()), 1.0);
             }
         }
-        for (i, &(row, col)) in ghost_cells(&s).iter().enumerate() {
-            if i < views.ghost.len() && (0..H as i64).contains(&row) && (0..W as i64).contains(&col) {
-                place(&mut vq, views.ghost[i], board_pos(col, row), kind_color(a.kind.id()), 0.25);
+        if views.ghost_enabled {
+            for (i, &(row, col)) in ghost_cells(&s).iter().enumerate() {
+                if i < views.ghost.len() && (0..H as i64).contains(&row) && (0..W as i64).contains(&col) {
+                    place(&mut vq, views.ghost[i], board_pos(col, row), kind_color(a.kind.id()), 0.25);
+                }
             }
         }
     }
@@ -1847,7 +1863,11 @@ fn main() {
     let mut my_id = "player1".to_string();
     let mut my_key = "k".to_string();
     let mut observer = false;
+    let mut observer_explicit = false;
     let mut spectate = 0usize;
+    let mut spectate_explicit = false;
+    let mut config_path: Option<String> = None;
+    let mut local = false;
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
@@ -1862,12 +1882,47 @@ fn main() {
             "--server" => { server = args.get(i + 1).cloned(); i += 1; }
             "--id" => { my_id = args.get(i + 1).cloned().unwrap_or(my_id); i += 1; }
             "--key" => { my_key = args.get(i + 1).cloned().unwrap_or(my_key); i += 1; }
-            "--observer" => { observer = true; }
-            "--spectate" => { spectate = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(spectate); i += 1; }
+            "--observer" => { observer = true; observer_explicit = true; }
+            "--spectate" => { spectate = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(spectate); spectate_explicit = true; i += 1; }
+            "--config" => { config_path = args.get(i + 1).cloned(); i += 1; }
+            "--local" => { local = true; }
             _ => {}
         }
         i += 1;
     }
+    let cfg = t99_config::load_client(config_path.as_deref().map(std::path::Path::new))
+        .unwrap_or_else(|e| {
+            eprintln!("[config] {e}");
+            std::process::exit(2);
+        });
+    if !observer_explicit {
+        observer = cfg.client.observer;
+    }
+    if !spectate_explicit {
+        spectate = cfg.client.spectate;
+    }
+    if local {
+        server = None;
+    } else if server.is_none() && !cfg.client.server.is_empty() {
+        server = Some(cfg.client.server.clone());
+    }
+    if cfg.display.framerate > 0 {
+        eprintln!(
+            "[config] framerate={} 尚未实现 limiter；当前仍不限制 FPS",
+            cfg.display.framerate
+        );
+    }
+    let timing = InputTiming {
+        das_ticks: cfg.control.das_ticks,
+        arr_ticks: cfg.control.arr_ticks,
+        dual_charge: cfg.control.dual_charge,
+    };
+    let display = DisplaySettings {
+        ghost: cfg.display.ghost,
+        shadow_locked: cfg.display.shadow_locked,
+        opponent_framerate: cfg.display.opponent_framerate,
+        result_hold_secs: cfg.display.result_hold_secs,
+    };
     let session = if let Some(url) = server {
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1903,8 +1958,12 @@ fn main() {
         ..default()
     };
     if !cfg!(target_arch = "wasm32") {
-        // 不锁帧：输入采集节奏即渲染循环（ADR-019）。wasm 上 rAF 节奏即显示刷新率。
-        window.present_mode = PresentMode::Immediate;
+        // 默认不锁帧；vsync=true 时交给显示器刷新率。
+        window.present_mode = if cfg.display.vsync {
+            PresentMode::AutoVsync
+        } else {
+            PresentMode::Immediate
+        };
     }
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -1915,6 +1974,8 @@ fn main() {
         .insert_resource(session)
         .insert_resource(InputQueue::default())
         .insert_resource(RepeatState::default())
+        .insert_resource(timing)
+        .insert_resource(display)
         .insert_resource(scheme)
         .add_systems(Startup, setup)
         .add_systems(Update, (sync_tick_rate, poll_input, sync).chain())

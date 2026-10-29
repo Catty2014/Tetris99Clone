@@ -7,6 +7,7 @@ members = [
     "crates/t99-headless",
     "crates/t99-client",
     "crates/t99-server",
+    "crates/t99-config",
     # 隐藏档外部 bot（Arena 公开包剔除本目录）
     "crates/t99-bot-m",
 ]
