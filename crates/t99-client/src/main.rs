@@ -83,7 +83,8 @@ fn fit_grid(alive_others: usize) -> usize {
 
 /// 网络指令（Bevy → net 线程）
 pub enum NetCmd {
-    Input(Vec<TimedKey>),
+    /// n = 服务器私有 frame 的帧号；服务器按同帧号匹配 input
+    Input { n: u64, evs: Vec<TimedKey> },
     Restart,
 }
 
@@ -92,6 +93,10 @@ pub enum NetCmd {
 struct MirrorState {
     engine: Option<Match>,
     my_seat: usize,
+    /// 最近一次私有 frame 的帧号；用于给 input 填 n
+    pending_frame_n: u64,
+    /// 已回复过的 frame 帧号，避免同一帧重复发 input
+    last_input_n: u64,
 }
 
 /// 连接诊断（调试 HUD 用）：对局 ID、RTT、丢包率、连接状态
@@ -392,10 +397,6 @@ fn setup(mut cmd: Commands, assets: Res<AssetServer>) {
 
 // ———— 输入采集（Update 节奏 = 渲染循环，不锁帧时远高于 60Hz） ————
 
-fn g_seat(mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>) -> usize {
-    mirror.lock().unwrap().my_seat
-}
-
 fn push_key(q: &mut InputQueue, k: Key, now: Instant) {
     q.entries.push_back((now, k));
 }
@@ -590,20 +591,22 @@ fn tick(mut session: ResMut<Session>, mut queue: ResMut<InputQueue>) {
             engine.frame(&inputs);
         }
         Session::Net { mirror, tx, observer, .. } => {
-            // 客户端只上报输入；对局由服务端权威推进，镜像本地重演
+            // 客户端只上报输入；对局由服务端权威推进，镜像本地重演。
+            // 每收到一个新的私有 frame 回一次 input；空事件也回，保持席位存活。
             if !*observer {
-                let alive = mirror
-                    .lock()
-                    .unwrap()
-                    .engine
-                    .as_ref()
-                    .map(|e| e.players[g_seat(&mirror)].alive)
-                    .unwrap_or(false);
-                if alive {
+                let (frame_n, alive, sent_n) = {
+                    let g = mirror.lock().unwrap();
+                    let alive = g
+                        .engine
+                        .as_ref()
+                        .map(|e| e.players[g.my_seat].alive)
+                        .unwrap_or(false);
+                    (g.pending_frame_n, alive, g.last_input_n)
+                };
+                if alive && frame_n > sent_n {
                     let ev = drain_input(&mut queue);
-                    if !ev.is_empty() {
-                        let _ = tx.send(NetCmd::Input(ev));
-                    }
+                    let _ = tx.send(NetCmd::Input { n: frame_n, evs: ev });
+                    mirror.lock().unwrap().last_input_n = frame_n;
                 }
             }
         }
@@ -882,7 +885,7 @@ fn sync(
     views: Res<Views>,
     font_assets: Res<AssetServer>,
     mut thumbs: ResMut<Thumbs>,
-    mut queue: ResMut<InputQueue>,
+    queue: Res<InputQueue>,
     mut prev: ResMut<PrevPiece>,
     fixed: Res<Time<Fixed>>,
     time: Res<Time>,
@@ -1307,7 +1310,9 @@ fn net_thread(
         st.player_id = id.clone();
     }
     if let tungstenite::stream::MaybeTlsStream::Plain(tcp) = ws.get_ref() {
-        let _ = tcp.set_read_timeout(Some(std::time::Duration::from_millis(40)));
+        // 2ms 只是为了让 rx 里的 input 及时写回私有 frame；P1 的 session core 会用
+        // 独立写线程替掉这里的读超时轮询。服务端已经没有这个轮询。
+        let _ = tcp.set_read_timeout(Some(std::time::Duration::from_millis(2)));
     }
     let handle_msg = |t: &str, mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>, status: &std::sync::Arc<std::sync::Mutex<String>>, expected: &mut Option<u64>| -> bool {
         let v: serde_json::Value = match serde_json::from_str(&t) { Ok(v) => v, Err(_) => return true };
@@ -1345,8 +1350,16 @@ fn net_thread(
                 let mut g = mirror.lock().unwrap();
                 g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
                 g.my_seat = if seat >= 0 { seat as usize } else { spectate };
+                g.pending_frame_n = 0;
+                g.last_input_n = 0;
                 drop(g);
                 *status.lock().unwrap() = format!("对局 #{} 进行中", v["match"].as_u64().unwrap_or(0));
+            }
+            "frame" => {
+                // 私有帧只用于输入时序：镜像仍按 tick 推进，n 原样回填到 input
+                if let Some(n) = v["n"].as_u64() {
+                    mirror.lock().unwrap().pending_frame_n = n;
+                }
             }
             "tick" => {
                 // 服务器 tick 速率：按 tick 序号差 / 到达时间差做 EMA
@@ -1448,7 +1461,16 @@ fn net_thread(
         }
         match ws.read() {
             Ok(Message::Text(t)) => {
-                if !handle_msg(&t.to_string(), &mirror, &status, &mut expected) {
+                let text = t.to_string();
+                // 私有 hello（带 protocol）是 NetPlayerAdapter 的 setup 握手，必须先回 ready；
+                // 它不含 match/seed，不能交给 mirror 的 hello 分支。
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if v["type"] == "hello" && v.get("protocol").is_some() {
+                        let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
+                        continue;
+                    }
+                }
+                if !handle_msg(&text, &mirror, &status, &mut expected) {
                     break 'conn; // 失步 → 触发重连
                 }
             }
@@ -1464,8 +1486,9 @@ fn net_thread(
         }
         while let Ok(cmd) = rx.try_recv() {
             let msg = match cmd {
-                NetCmd::Input(evs) => serde_json::json!({
+                NetCmd::Input { n, evs } => serde_json::json!({
                     "type": "input",
+                    "n": n,
                     "events": evs.iter().map(|t| match t.key {
                         Key::TargetPlayer(v) => serde_json::json!([t.t_us, t.key.name(), v]),
                         _ => serde_json::json!([t.t_us, t.key.name()]),

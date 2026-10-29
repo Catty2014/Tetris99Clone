@@ -417,7 +417,7 @@ impl PlayerAdapter for SubprocessAdapter {
             self.misses += 1;
             return vec![];
         }
-        let frame = FrameMsg::from_snapshot(snap, 0);
+        let frame = FrameMsg::from_snapshot(snap, snap.pid);
         self.last_n = frame.n;
         let msg = serde_json::to_string(&frame).unwrap_or_default();
         if !self.send(&msg) {
@@ -566,7 +566,7 @@ impl PlayerAdapter for NetPlayerAdapter {
             self.misses += 1;
             return vec![];
         }
-        let frame = FrameMsg::from_snapshot(snap, 0);
+        let frame = FrameMsg::from_snapshot(snap, snap.pid);
         self.last_n = frame.n;
         let msg = serde_json::to_string(&frame).unwrap_or_default();
         let dbg = std::env::var("T99_NET_DEBUG").is_ok();

@@ -19,7 +19,8 @@ use t99_bots::BotAdapter;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, ENGINE_SEMANTICS};
 use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, MAX_CONSECUTIVE_MISS};
 
-const FRAME_MS: u64 = 16;
+/// 逻辑帧墙钟周期：16.6667ms。引擎时基本身是 FRAME_TICKS，这里只负责节流。
+const FRAME_NS: u64 = 1_000_000_000 / 60;
 const RESTART_TIMEOUT: Duration = Duration::from_secs(8);
 const LOBBY_TIMEOUT: Duration = Duration::from_secs(10);
 /// 结算展示期：结果广播后至少保留此时长再开下一局
@@ -294,8 +295,19 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         // 当前局的全部 tick（供中途加入的观战端回放）
         let mut history: Vec<String> = Vec::new();
         let mut in_match = true;
+        // 墙钟节拍：绝对 deadline，避免 sleep 误差累积；逻辑帧本身仍是 16.6667ms
+        let mut sched_origin = Instant::now();
+        let mut frame_idx: u64 = 0;
         while in_match {
-            let t0 = Instant::now();
+            let deadline = sched_origin
+                + Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / 60);
+            let now = Instant::now();
+            if now < deadline {
+                std::thread::sleep(deadline - now);
+            } else if now.duration_since(deadline) > Duration::from_nanos(2 * FRAME_NS) {
+                // 落后超过 2 帧：重置调度原点，避免追帧风暴；引擎仍只推进一帧
+                sched_origin = now - Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / 60);
+            }
             // 消息并入下一帧
             while let Ok(m) = rx.try_recv() {
                 match m {
@@ -369,10 +381,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             if engine.over.is_some() || engine.frame_n >= args.max_frames {
                 in_match = false;
             }
-            let spent = t0.elapsed();
-            if spent < Duration::from_millis(FRAME_MS) {
-                std::thread::sleep(Duration::from_millis(FRAME_MS) - spent);
-            }
+            frame_idx += 1;
         }
 
         // 结算广播
