@@ -307,7 +307,27 @@ loop:
 | `history: Vec<String>` 全量 | `keyframe` 每 5s + 最近 tick |
 | `FRAME_MS=16` | `FRAME_US=16667` 累加器 |
 
-## 11. 非目标
+## 11. 实现进度
+
+截至 2026-10-29，`cs-arch` 分支：
+
+- **P0 已完成**（`f946c34`）：服务器墙钟改为绝对 deadline，300 帧实测 4.9835s、平均 16.6672ms；`FrameMsg` 使用真实 `snap.pid`；人类 lobby 客户端回 `ready` 并按私有 `frame.n` 回 `input`。
+- **P1a 已完成**（`5fdf3e9`）：`PlayerAdapter` 增加 `begin_frame`/`try_input`/`end_frame`，服务器先全量发帧，再用共享 deadline 收集；99 席全网络 300 帧实测 59.07 TPS、65.8% 单核、0 setup 失败。
+- **P1b 待做**：`input(n_intent)` 事件流与 `lead_frames`，去掉私有 `frame` 请求/应答；WAN 下当前 16ms deadline 仍会丢帧。
+- **P2 待做**：`t99-session` 抽取、`t99-headless connect`、`Policy`。
+- **P3/P4 待做**：Client mirror/输入采样解耦、wasm/digest、候选 SDK。
+
+性能对照（同一 99p harness，5s 局）：
+
+| 版本 | TPS | 单核 CPU | 说明 |
+|---|---:|---:|---|
+| 旧 2ms 轮询，串行 act | 4.03 | 54.1% | 74.47s |
+| `5229c86` reader/writer | 34.17 | 27.0% | 8.78s |
+| P1a phase-split | 59.07 | 65.8% | 5.08s，接近 60 |
+
+P1a 的 CPU 上升是因为真正跑满了 60 TPS，且每帧多了一次 99 席轮询；CPU/帧约 11ms，仍低于 16.7ms 预算。
+
+## 12. 非目标
 
 - 不向 99 个玩家广播对手棋盘快照。
 - 不把服务器权威模拟降到 30/5Hz。
