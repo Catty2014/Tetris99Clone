@@ -540,6 +540,47 @@ impl RulesetConfig {
         if r.lock_delay != "move" {
             return Err(ConfigError::Rules("lock_delay must be move".into()));
         }
+        if r.lock_delay_ticks == 0 {
+            return Err(ConfigError::Rules("lock_delay_ticks must be > 0".into()));
+        }
+        if r.combo_bonus.len() != 11 {
+            return Err(ConfigError::Rules(format!(
+                "combo_bonus must have 11 entries, got {}",
+                r.combo_bonus.len()
+            )));
+        }
+        if r.target_bonus.len() != 7 {
+            return Err(ConfigError::Rules(format!(
+                "target_bonus must have 7 entries, got {}",
+                r.target_bonus.len()
+            )));
+        }
+        if r.badge_tier_units.len() != 4 {
+            return Err(ConfigError::Rules(format!(
+                "badge_tier_units must have 4 entries, got {}",
+                r.badge_tier_units.len()
+            )));
+        }
+        if r.stage.is_empty() {
+            return Err(ConfigError::Rules("stage table is empty".into()));
+        }
+        if r.stage.last().map(|s| s.ratio_min_pm) != Some(0) {
+            return Err(ConfigError::Rules("last stage must have ratio_min_pm = 0".into()));
+        }
+        for w in r.stage.windows(2) {
+            if w[0].ratio_min_pm <= w[1].ratio_min_pm {
+                return Err(ConfigError::Rules(
+                    "stage ratio_min_pm must be strictly descending".into(),
+                ));
+            }
+        }
+        for (i, s) in r.stage.iter().enumerate() {
+            if s.clear_delay_ticks == 0 || s.are_ticks == 0 || s.garbage_stage_ticks == 0 {
+                return Err(ConfigError::Rules(format!(
+                    "stage {i}: clear/are/garbage ticks must be > 0"
+                )));
+            }
+        }
         let trigger = match r.initial_trigger.as_str() {
             "edge" => t99_core::InitialTrigger::Edge,
             "held" => t99_core::InitialTrigger::Held,
@@ -667,6 +708,21 @@ seed = 0
         // gravity 是 time rate，不是 tick 数
         assert_eq!(r.phases[0].gravity_base, 750);
         assert_eq!(r.match_ticks, 900 * 1000 * t99_core::TMS);
+    }
+
+    #[test]
+    fn ruleset_rejects_bad_arrays_and_stages() {
+        let mut c = RulesetConfig::default();
+        c.ruleset.combo_bonus.pop();
+        assert!(c.to_ruleset().is_err());
+
+        let mut c = RulesetConfig::default();
+        c.ruleset.stage.reverse();
+        assert!(c.to_ruleset().is_err());
+
+        let mut c = RulesetConfig::default();
+        c.ruleset.stage[0].are_ticks = 0;
+        assert!(c.to_ruleset().is_err());
     }
 
     #[test]
