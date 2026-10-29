@@ -144,6 +144,7 @@ pub enum Ev {
     TargetBadges,
     TargetKos,
     TargetAttackers,
+    TargetRandom,
     /// 手动锁定单个玩家（载荷 pid）
     TargetPlayer(u16),
 }
@@ -164,6 +165,7 @@ impl Ev {
             Ev::TargetBadges => "target_badges",
             Ev::TargetKos => "target_kos",
             Ev::TargetAttackers => "target_attackers",
+            Ev::TargetRandom => "target_random",
             Ev::TargetPlayer(_) => "target_player",
         }
     }
@@ -1351,9 +1353,9 @@ impl Brain {
                 return Some(Ev::TargetBadges);
             }
         }
-        // 兜底：TargetKos——引擎会集火堆最高（最接近死亡）者，pack 击杀产生首枚徽章，
-        // 徽章经济启动后由围猎接管（「永远反攻」只会让火力被抵消，谁也拿不到击杀）。
-        Some(Ev::TargetKos)
+        // 兜底：TargetRandom——固定 Kos 会让所有 bot 压向同一最高堆，撞 12 行上限后
+        // 大量攻击被丢弃；扩散到仍有空间的目标才能把攻击真正打出去。
+        Some(Ev::TargetRandom)
     }
 
     fn grid(&self, fr: &FrameIn) -> Grid {

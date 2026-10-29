@@ -267,7 +267,9 @@ pub fn desired_target(s: &Snapshot) -> Key {
             .map(|(p, &b)| (p, b));
         match leader {
             Some((_, b)) if b >= 3 => Key::TargetBadges,
-            _ => Key::TargetKos,
+            // 兜底改为扩散攻击：固定打最高堆会让 99 个 bot 同时压向同一目标，
+            // 撞上 12 行上限后大量攻击被丢弃；随机在仍有空间的目标间摊开。
+            _ => Key::TargetRandom,
         }
     }
 }
