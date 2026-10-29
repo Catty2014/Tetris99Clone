@@ -385,8 +385,9 @@ CLI > 环境变量 > 配置文件 > 内建默认值
 
 静态配置与运行时清单分开：
 
-- `config.toml`：服务器、控制、显示等长期设置，不写每局密钥。
-- 运行时清单：由 Grader 为每个参赛进程生成，包含 `server.url`、`key`、`player_id`、期望的 `protocol`/`ruleset` 等；以 0600 权限写入临时文件，并同时以 CLI 和环境变量传入，三份内容一致。
+- `config.toml`：服务器、控制、显示等长期设置；每局 key 由运行时清单提供，不写进长期配置。
+- 运行时清单：由 Grader 为每个参赛进程生成，包含 `server.url`、`key`、`player_id`、期望的 `protocol`/`ruleset` 等；写入临时文件，并同时以 CLI 和环境变量传入，三份内容一致。
+- `key` 是所有参赛者共享的房间口令，不是秘密，也不是身份凭证；文件权限、argv 和日志暴露不作为安全边界。身份由 `player_id` 和 allowlist 负责；若需要防止冒用，另加签名或 per-player token。
 
 参赛程序（含 bot）在运行时总会同时收到三种来源，内容一致，可以任选其一读取。自己实现 wire protocol 的程序只需要 `server.url`、`key`、`player_id` 这一小组；`[control]`、`[display]` 主要服务官方 Client。协议与规则集的最终权威仍是服务器 `hello`，运行时清单里的 `protocol`/`ruleset` 只用于提前自检。
 
