@@ -16,6 +16,7 @@ use tungstenite::handshake::server::{Request, Response};
 use tungstenite::Message;
 
 use t99_bots::BotAdapter;
+use t99_core::engine::TargetPolicy;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, RULESET_ID};
 use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
 
@@ -55,6 +56,8 @@ struct Args {
     dump_matrix: bool,
     /// 参考局：强制所有席位随机锁敌（忽略客户端目标键）
     force_random_target: bool,
+    /// 评测：强制目标策略（优先于 force_random_target）
+    force_target: Option<TargetPolicy>,
 }
 
 fn parse_args() -> Args {
@@ -118,6 +121,14 @@ fn parse_args() -> Args {
         eprintln!("[ruleset] {e}");
         std::process::exit(2);
     });
+    let force_target = get("--force-target").map(|s| {
+        parse_target_policy(&s).unwrap_or_else(|| {
+            eprintln!(
+                "[force-target] 未知策略 `{s}`；可选 random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|spreadweak|randomtop"
+            );
+            std::process::exit(2);
+        })
+    });
     Args {
         address: get("--address").unwrap_or(cfg.server.address),
         port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(cfg.server.port),
@@ -144,6 +155,22 @@ fn parse_args() -> Args {
         auth_files: cfg.auth.id_files,
         dump_matrix: flag("--dump-matrix"),
         force_random_target: flag("--force-random-target"),
+        force_target,
+    }
+}
+
+fn parse_target_policy(s: &str) -> Option<TargetPolicy> {
+    match s.to_ascii_lowercase().as_str() {
+        "random" => Some(TargetPolicy::Random),
+        "kos" => Some(TargetPolicy::Kos),
+        "badges" => Some(TargetPolicy::Badges),
+        "spread" => Some(TargetPolicy::Spread),
+        "huntweak" => Some(TargetPolicy::HuntWeak),
+        "avoidattackers" => Some(TargetPolicy::AvoidAttackers),
+        "spreadsafe" => Some(TargetPolicy::SpreadSafe),
+        "spreadweak" => Some(TargetPolicy::SpreadWeak),
+        "randomtop" => Some(TargetPolicy::RandomTop),
+        _ => None,
     }
 }
 
@@ -378,7 +405,9 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         }
         ruleset.stall_accel = args.stall_accel;
         let mut engine = Match::new(MatchConfig { players, seed, ruleset });
-        if args.force_random_target {
+        if let Some(policy) = args.force_target {
+            engine.force_target_policy(policy);
+        } else if args.force_random_target {
             engine.force_random_targets();
         }
         // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。

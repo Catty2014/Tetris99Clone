@@ -3,6 +3,29 @@
 use crate::*;
 use std::collections::VecDeque;
 
+/// 目标策略：离线评测用的强制锁敌行为，按策略而非 TargetMode 选择对手。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetPolicy {
+    /// 在有余量的目标里均匀随机
+    Random,
+    /// 堆高 + 待进最高
+    Kos,
+    /// 徽章最多
+    Badges,
+    /// 按堆高加权随机（堆越高概率越大）
+    Spread,
+    /// 优先高堆、低徽章（弱且接近死亡）
+    HuntWeak,
+    /// 在有余量目标里排除“正在瞄准我的人”，再均匀随机
+    AvoidAttackers,
+    /// 按堆高加权随机，但排除正在瞄准我的人（避免 1:1 对消）
+    SpreadSafe,
+    /// 按 (堆高+1)/(徽章+1) 加权随机，优先弱且接近死亡的目标
+    SpreadWeak,
+    /// 在堆最高的前 5 个有余量目标里均匀随机（避免单点饱和）
+    RandomTop,
+}
+
 #[derive(Clone, Debug)]
 pub struct MatchConfig {
     pub players: usize,
@@ -355,6 +378,8 @@ pub struct Match {
     match_ticks_left: Ticks,
     /// 参考局：强制所有玩家随机锁敌，忽略目标键
     pub force_random_target: bool,
+    /// 强制目标策略（优先级高于 force_random_target 与一切目标键）
+    pub force_policy: Option<TargetPolicy>,
 }
 
 impl Match {
@@ -431,6 +456,7 @@ impl Match {
             last_death_frame: None,
             match_ticks_left,
             force_random_target: false,
+            force_policy: None,
         };
         for pid in 0..m.players.len() {
             m.spawn(pid, None, false);
@@ -446,6 +472,14 @@ impl Match {
         self.force_random_target = true;
         for p in &mut self.players {
             p.target_mode = TargetMode::Random;
+        }
+    }
+
+    /// 评测：所有玩家按指定策略锁敌，并忽略后续一切目标键。
+    pub fn force_target_policy(&mut self, p: TargetPolicy) {
+        self.force_policy = Some(p);
+        for player in &mut self.players {
+            player.target_mode = TargetMode::Random;
         }
     }
 
@@ -984,7 +1018,7 @@ impl Match {
             Key::TargetAttackers => self.set_target_mode(pid, TargetMode::Attackers),
             Key::TargetRandom => self.set_target_mode(pid, TargetMode::Random),
             Key::TargetPlayer(v) => {
-                if self.force_random_target {
+                if self.force_random_target || self.force_policy.is_some() {
                     return;
                 }
                 let t = v as usize;
@@ -998,7 +1032,7 @@ impl Match {
     }
 
     fn set_target_mode(&mut self, pid: usize, mode: TargetMode) {
-        if self.force_random_target {
+        if self.force_random_target || self.force_policy.is_some() {
             return;
         }
         self.players[pid].target_mode = mode;
@@ -1025,6 +1059,9 @@ impl Match {
         };
         // 全员饱和才退化为原先的全体候选（此时攻击本就会被截断，行为与旧版一致）
         let pool: &[usize] = if roomy.is_empty() { others } else { &roomy };
+        if let Some(policy) = self.force_policy {
+            return self.pick_target_policy(pid, pool, policy);
+        }
         match mode {
             TargetMode::Badges => {
                 // 按徽章数（而非档位）排序：档位阈值稀疏（2/6/14/30），多数持有者挤在同档，
@@ -1071,6 +1108,137 @@ impl Match {
                     let idx = self.players[pid].rng_misc.below(others.len() as u64) as usize;
                     Some(others[idx])
                 }
+            }
+        }
+    }
+
+    /// 强制策略选目标；pool 已过滤掉待进饱和的候选。
+    fn pick_target_policy(&mut self, pid: usize, pool: &[usize], policy: TargetPolicy) -> Option<usize> {
+        if pool.is_empty() {
+            return None;
+        }
+        match policy {
+            TargetPolicy::Random => {
+                let idx = self.players[pid].rng_misc.below(pool.len() as u64) as usize;
+                Some(pool[idx])
+            }
+            TargetPolicy::Kos => {
+                let mut v = pool.to_vec();
+                v.sort_by(|&a, &b| {
+                    let na = stack_height(&self.players[a]) as i64
+                        + self.players[a].pending.iter().map(|g| g.rows as i64).sum::<i64>();
+                    let nb = stack_height(&self.players[b]) as i64
+                        + self.players[b].pending.iter().map(|g| g.rows as i64).sum::<i64>();
+                    nb.cmp(&na).then(a.cmp(&b))
+                });
+                Some(v[0])
+            }
+            TargetPolicy::Badges => {
+                let mut v = pool.to_vec();
+                v.sort_by(|&a, &b| {
+                    self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b))
+                });
+                Some(v[0])
+            }
+            TargetPolicy::Spread => {
+                let weights: Vec<u64> = pool
+                    .iter()
+                    .map(|&i| stack_height(&self.players[i]) as u64 + 1)
+                    .collect();
+                let sum: u64 = weights.iter().sum();
+                if sum == 0 {
+                    return Some(pool[0]);
+                }
+                let mut roll = self.players[pid].rng_misc.below(sum);
+                for (&target, &w) in pool.iter().zip(weights.iter()) {
+                    if roll < w {
+                        return Some(target);
+                    }
+                    roll -= w;
+                }
+                Some(*pool.last().unwrap())
+            }
+            TargetPolicy::HuntWeak => {
+                let mut best = pool[0];
+                let mut best_score = i64::MIN;
+                for &i in pool {
+                    let score = stack_height(&self.players[i]) as i64
+                        - 2 * self.players[i].badges as i64;
+                    if score > best_score || (score == best_score && i < best) {
+                        best_score = score;
+                        best = i;
+                    }
+                }
+                Some(best)
+            }
+            TargetPolicy::AvoidAttackers => {
+                let safe: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.players[i].last_target != Some(pid))
+                    .collect();
+                let cand: &[usize] = if safe.is_empty() { pool } else { &safe };
+                let idx = self.players[pid].rng_misc.below(cand.len() as u64) as usize;
+                Some(cand[idx])
+            }
+            TargetPolicy::SpreadSafe => {
+                let safe: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.players[i].last_target != Some(pid))
+                    .collect();
+                let cand: &[usize] = if safe.is_empty() { pool } else { &safe };
+                let weights: Vec<u64> = cand
+                    .iter()
+                    .map(|&i| stack_height(&self.players[i]) as u64 + 1)
+                    .collect();
+                let sum: u64 = weights.iter().sum();
+                if sum == 0 {
+                    return Some(cand[0]);
+                }
+                let mut roll = self.players[pid].rng_misc.below(sum);
+                for (&target, &w) in cand.iter().zip(weights.iter()) {
+                    if roll < w {
+                        return Some(target);
+                    }
+                    roll -= w;
+                }
+                Some(*cand.last().unwrap())
+            }
+            TargetPolicy::SpreadWeak => {
+                let weights: Vec<u64> = pool
+                    .iter()
+                    .map(|&i| {
+                        let w = (stack_height(&self.players[i]) as u64 + 1) * 4
+                            / (self.players[i].badges as u64 + 1);
+                        w.max(1)
+                    })
+                    .collect();
+                let sum: u64 = weights.iter().sum();
+                if sum == 0 {
+                    return Some(pool[0]);
+                }
+                let mut roll = self.players[pid].rng_misc.below(sum);
+                for (&target, &w) in pool.iter().zip(weights.iter()) {
+                    if roll < w {
+                        return Some(target);
+                    }
+                    roll -= w;
+                }
+                Some(*pool.last().unwrap())
+            }
+            TargetPolicy::RandomTop => {
+                let mut v = pool.to_vec();
+                v.sort_by(|&a, &b| {
+                    let na = stack_height(&self.players[a]) as i64
+                        + self.players[a].pending.iter().map(|g| g.rows as i64).sum::<i64>();
+                    let nb = stack_height(&self.players[b]) as i64
+                        + self.players[b].pending.iter().map(|g| g.rows as i64).sum::<i64>();
+                    nb.cmp(&na).then(a.cmp(&b))
+                });
+                v.truncate(5);
+                let idx = self.players[pid].rng_misc.below(v.len() as u64) as usize;
+                Some(v[idx])
             }
         }
     }
