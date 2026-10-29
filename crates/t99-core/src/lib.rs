@@ -289,7 +289,13 @@ pub fn sanitize_events(raw: &[TimedKey]) -> Option<Vec<TimedKey>> {
             return None;
         }
         prev_t = e.t_us as i64;
-        if raw[..i].iter().any(|p| p.key.kind() == e.key.kind()) {
+        // 横向移动是离散事件：同一帧可以连续发多个 left_down/right_down；
+        // DAS/ARR 由有头客户端折算，不再由引擎按住自动重复。
+        let directional = matches!(
+            e.key,
+            Key::LeftDown | Key::LeftUp | Key::RightDown | Key::RightUp
+        );
+        if !directional && raw[..i].iter().any(|p| p.key.kind() == e.key.kind()) {
             return None;
         }
     }
@@ -339,8 +345,7 @@ pub struct Ruleset {
     pub preview: usize,
     pub lock_ticks: Ticks,
     pub lock_resets_max: u32,
-    pub das_ticks: Ticks,
-    pub arr_ticks: Ticks,
+    /// 软降速度；横向 DAS/ARR 属于有头客户端输入时序，不在规则集内。
     pub soft_milli_per_sec: Milli,
     /// 节奏相位表，按 ratio_min_pm 降序
     pub phases: Vec<PhaseSpec>,
@@ -379,8 +384,6 @@ impl Default for Ruleset {
             preview: 6,
             lock_ticks: 500 * TMS,
             lock_resets_max: 15,
-            das_ticks: 10 * FRAME_TICKS,
-            arr_ticks: 2 * FRAME_TICKS,
             soft_milli_per_sec: 60_000,
             phases: vec![
                 // P1：重力跟随 T99/准则 L1（0.8s/行 ≈ 0.0125G；自然流速待实机校准，ADR-014）；

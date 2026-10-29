@@ -1,6 +1,6 @@
 //! t99 人类客户端（T99 版 UI）：内嵌引擎，Bevy 只做表现与输入。
 //!
-//! 输入（与程序/Bot 同物理，引擎侧 DAS/ARR；采样打点见 poll_input）：
+//! 输入（与程序/Bot 同物理，客户端侧 DAS/ARR；采样打点见 poll_input）：
 //!   A/D 移动（按住连发）  S 软降  空格 硬降  X/J 顺时针  Z/K 逆时针  C/Shift Hold
 //!   Tab 循环目标模式；方向键 = 副操作：导航对手小窗并手动锁定目标
 //!
@@ -11,6 +11,7 @@ use bevy::prelude::*;
 use bevy::text::{TextLayoutInfo, TextSpan};
 use bevy::window::PresentMode;
 use std::collections::VecDeque;
+use std::time::Duration;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,6 +23,11 @@ use t99_proto::PlayerAdapter;
 const CELL: f32 = 26.0;
 const MINI: f32 = 4.0;
 const FRAME_US: u64 = 16_666;
+/// 有头客户端输入时序；M4 接 client.toml 后改为运行时配置。
+const DAS_MS: u64 = 167;
+const ARR_MS: u64 = 33;
+/// ARR=0 时一次补发的最大格数（棋盘宽 10）。
+const MAX_REPEAT_PER_FRAME: usize = 10;
 const THUMB_HZ: f64 = 10.0;
 const TW: f32 = 44.0; // 小窗宽（含边框）
 const TH: f32 = 88.0;
@@ -147,6 +153,15 @@ struct InputQueue {
     /// 方向键导航游标（shown 列表索引）
     cursor: Option<usize>,
     target_idx: usize,
+}
+
+/// 有头客户端的 DAS/ARR 状态：引擎不再按住自动重复。
+#[derive(Resource, Default)]
+struct RepeatState {
+    left: bool,
+    right: bool,
+    dir: i8,
+    next: Option<Instant>,
 }
 
 #[derive(Resource)]
@@ -461,23 +476,54 @@ impl Scheme {
     }
 }
 
-fn poll_input(mut queue: ResMut<InputQueue>, keys: Res<ButtonInput<KeyCode>>, session: Res<Session>, thumbs: Res<Thumbs>, scheme: Res<Scheme>) {
+fn poll_input(
+    mut queue: ResMut<InputQueue>,
+    mut repeat: ResMut<RepeatState>,
+    keys: Res<ButtonInput<KeyCode>>,
+    session: Res<Session>,
+    thumbs: Res<Thumbs>,
+    scheme: Res<Scheme>,
+) {
     let now = Instant::now();
     let jp = |c: &[KeyCode]| c.iter().any(|c| keys.just_pressed(*c));
     let jr = |c: &[KeyCode]| c.iter().any(|c| keys.just_released(*c));
-    // 主操作：移动/软降（压放式，引擎侧 DAS/ARR）
+    // 主操作：移动/软降。横向 DAS/ARR 在这里展开，引擎只收离散事件。
     let (ml, mr, sf) = (scheme.move_l(), scheme.move_r(), scheme.soft());
     if jp(&ml) {
         push_key(&mut queue, Key::LeftDown, now);
+        repeat.left = true;
+        repeat.dir = -1;
+        repeat.next = Some(now + Duration::from_millis(DAS_MS));
     }
     if jr(&ml) {
         push_key(&mut queue, Key::LeftUp, now);
+        repeat.left = false;
+        if repeat.dir == -1 {
+            repeat.dir = if repeat.right { 1 } else { 0 };
+            repeat.next = if repeat.dir != 0 {
+                Some(now + Duration::from_millis(DAS_MS))
+            } else {
+                None
+            };
+        }
     }
     if jp(&mr) {
         push_key(&mut queue, Key::RightDown, now);
+        repeat.right = true;
+        repeat.dir = 1;
+        repeat.next = Some(now + Duration::from_millis(DAS_MS));
     }
     if jr(&mr) {
         push_key(&mut queue, Key::RightUp, now);
+        repeat.right = false;
+        if repeat.dir == 1 {
+            repeat.dir = if repeat.left { -1 } else { 0 };
+            repeat.next = if repeat.dir != 0 {
+                Some(now + Duration::from_millis(DAS_MS))
+            } else {
+                None
+            };
+        }
     }
     if jp(&sf) {
         push_key(&mut queue, Key::SoftDown, now);
@@ -532,6 +578,82 @@ fn poll_input(mut queue: ResMut<InputQueue>, keys: Res<ButtonInput<KeyCode>>, se
             let pid = thumbs.views.get(next).map(|t| t.pid).unwrap_or(next + 1);
             push_key(&mut queue, Key::TargetPlayer(pid as u16), now);
         }
+    }
+    for key in repeat_keys(&mut repeat, now) {
+        push_key(&mut queue, key, now);
+    }
+}
+
+/// 返回本帧应补发的离散方向事件；不直接碰 Bevy，便于单测。
+fn repeat_keys(repeat: &mut RepeatState, now: Instant) -> Vec<Key> {
+    let mut out = Vec::new();
+    if repeat.dir == 0 {
+        return out;
+    }
+    let mut next = repeat
+        .next
+        .unwrap_or_else(|| now + Duration::from_millis(DAS_MS));
+    if now < next {
+        return out;
+    }
+    let key = if repeat.dir < 0 {
+        Key::LeftDown
+    } else {
+        Key::RightDown
+    };
+    if ARR_MS == 0 {
+        for _ in 0..MAX_REPEAT_PER_FRAME {
+            out.push(key);
+        }
+        next = now + Duration::from_millis(16);
+    } else {
+        let arr = Duration::from_millis(ARR_MS);
+        let mut budget = 16;
+        while now >= next && budget > 0 {
+            out.push(key);
+            next += arr;
+            budget -= 1;
+        }
+    }
+    repeat.next = Some(next);
+    out
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+
+    #[test]
+    fn das_then_arr_emits_one_step_per_interval() {
+        let t0 = Instant::now();
+        let mut s = RepeatState {
+            left: true,
+            right: false,
+            dir: -1,
+            next: Some(t0 + Duration::from_millis(DAS_MS)),
+        };
+        assert!(repeat_keys(&mut s, t0).is_empty());
+        assert_eq!(
+            repeat_keys(&mut s, t0 + Duration::from_millis(DAS_MS)),
+            vec![Key::LeftDown]
+        );
+        assert_eq!(
+            repeat_keys(&mut s, t0 + Duration::from_millis(DAS_MS + ARR_MS)),
+            vec![Key::LeftDown]
+        );
+    }
+
+    #[test]
+    fn arr_backlog_emits_multiple_steps() {
+        let t0 = Instant::now();
+        let mut s = RepeatState {
+            left: false,
+            right: true,
+            dir: 1,
+            next: Some(t0),
+        };
+        let ev = repeat_keys(&mut s, t0 + Duration::from_millis(ARR_MS + 1));
+        assert_eq!(ev, vec![Key::RightDown, Key::RightDown]);
     }
 }
 
@@ -1588,6 +1710,7 @@ fn main() {
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .insert_resource(session)
         .insert_resource(InputQueue::default())
+        .insert_resource(RepeatState::default())
         .insert_resource(scheme)
         .add_systems(Startup, setup)
         .add_systems(Update, (poll_input, sync).chain())

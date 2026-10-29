@@ -501,12 +501,6 @@ impl Match {
     fn step_player(&mut self, pid: usize, dt: Ticks) {
         // 垃圾队列独立推进（任何相位；T99：黄→红→进场，连击阻挡）
         self.tick_garbage(pid, dt);
-        // DAS 充能推进（任何相位，充能封顶；ARR 仅在 Play 放行——ARE 期间保持满充不连发）
-        let das_t = self.cfg.ruleset.das_ticks;
-        if self.players[pid].das.dir.is_some() {
-            let p = &mut self.players[pid];
-            p.das.das = (p.das.das + dt).min(das_t);
-        }
         // 相位推进
         match self.players[pid].phase {
             PlayerPhase::Clear(mut t) => {
@@ -585,37 +579,6 @@ impl Match {
             }
         } else {
             self.players[pid].lock_timer = 0;
-        }
-        // ARR 连发（DAS 已充能；arr 仅在 Play 相位累积）
-        let (das_t, arr_t) = (self.cfg.ruleset.das_ticks, self.cfg.ruleset.arr_ticks);
-        if let Some(dir) = self.players[pid].das.dir {
-            let charged = self.players[pid].das.das >= das_t;
-            if charged {
-                self.players[pid].das.arr += dt;
-                if arr_t == 0 {
-                    while self.try_shift(pid, dir) {}
-                    self.players[pid].das.arr = 0;
-                } else {
-                    let mut budget = 12;
-                    loop {
-                        {
-                            let p = &mut self.players[pid];
-                            if p.das.arr < arr_t {
-                                break;
-                            }
-                            p.das.arr -= arr_t;
-                        }
-                        if !self.try_shift(pid, dir) {
-                            self.players[pid].das.arr = 0;
-                            break;
-                        }
-                        budget -= 1;
-                        if budget == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -729,43 +692,28 @@ impl Match {
         }
         match key {
             Key::LeftDown => {
-                let p = &mut self.players[pid];
-                p.das.left = true;
-                if p.das.dir != Some(-1) {
-                    p.das.dir = Some(-1);
-                    p.das.das = 0;
-                    p.das.arr = 0;
-                    drop(p);
-                    self.try_shift(pid, -1);
-                }
+                // 离散移动：每个 left_down 移一格；DAS/ARR 由客户端展开。
+                self.players[pid].das.left = true;
+                self.players[pid].das.dir = Some(-1);
+                self.try_shift(pid, -1);
             }
             Key::LeftUp => {
-                let p = &mut self.players[pid];
-                p.das.left = false;
-                if p.das.dir == Some(-1) {
-                    p.das.dir = if p.das.right { Some(1) } else { None };
-                    p.das.das = 0;
-                    p.das.arr = 0;
+                self.players[pid].das.left = false;
+                if self.players[pid].das.dir == Some(-1) {
+                    let right = self.players[pid].das.right;
+                    self.players[pid].das.dir = if right { Some(1) } else { None };
                 }
             }
             Key::RightDown => {
-                let p = &mut self.players[pid];
-                p.das.right = true;
-                if p.das.dir != Some(1) {
-                    p.das.dir = Some(1);
-                    p.das.das = 0;
-                    p.das.arr = 0;
-                    drop(p);
-                    self.try_shift(pid, 1);
-                }
+                self.players[pid].das.right = true;
+                self.players[pid].das.dir = Some(1);
+                self.try_shift(pid, 1);
             }
             Key::RightUp => {
-                let p = &mut self.players[pid];
-                p.das.right = false;
-                if p.das.dir == Some(1) {
-                    p.das.dir = if p.das.left { Some(-1) } else { None };
-                    p.das.das = 0;
-                    p.das.arr = 0;
+                self.players[pid].das.right = false;
+                if self.players[pid].das.dir == Some(1) {
+                    let left = self.players[pid].das.left;
+                    self.players[pid].das.dir = if left { Some(-1) } else { None };
                 }
             }
             Key::SoftDown => self.players[pid].soft = true,
@@ -1565,10 +1513,14 @@ mod tests {
             TimedKey { t_us: 5, key: Key::HardDrop },
             TimedKey { t_us: 5, key: Key::RotCw }
         ]).is_none());
-        // 同帧重复键（含不同载荷的 target_player）
+        // 同帧重复方向键合法（离散移动）；其他动作仍拒绝
         assert!(sanitize_events(&[
             TimedKey { t_us: 0, key: Key::LeftDown },
             TimedKey { t_us: 100, key: Key::LeftDown }
+        ]).is_some());
+        assert!(sanitize_events(&[
+            TimedKey { t_us: 0, key: Key::RotCw },
+            TimedKey { t_us: 100, key: Key::RotCw }
         ]).is_none());
         assert!(sanitize_events(&[
             TimedKey { t_us: 0, key: Key::TargetPlayer(1) },
@@ -1584,6 +1536,20 @@ mod tests {
             TimedKey { t_us: 0, key: Key::LeftDown },
             TimedKey { t_us: 1000, key: Key::LeftUp }
         ]).is_some());
+    }
+
+    #[test]
+    fn discrete_direction_events_move_one_cell_each() {
+        let mut m = solo();
+        let x0 = m.players[0].active.expect("spawned piece").x;
+        let evs = vec![
+            TimedKey { t_us: 0, key: Key::LeftDown },
+            TimedKey { t_us: 1000, key: Key::LeftDown },
+            TimedKey { t_us: 2000, key: Key::LeftUp },
+        ];
+        m.frame(&[evs]);
+        let x1 = m.players[0].active.expect("piece alive").x;
+        assert_eq!(x1, x0 - 2, "each left_down must move exactly one cell");
     }
 
     #[test]

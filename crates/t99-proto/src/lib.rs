@@ -213,12 +213,37 @@ pub struct InputMsg {
 }
 
 #[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum EventRepr {
+    Object {
+        t_us: u32,
+        k: String,
+        #[serde(default)]
+        v: Option<u16>,
+    },
+    Array3((u32, String, u16)),
+    Array2((u32, String)),
+}
+
+#[derive(Debug)]
 pub struct EventIn {
     pub t_us: u32,
     pub k: String,
     /// 载荷（仅 target_player 使用）
-    #[serde(default)]
     pub v: Option<u16>,
+}
+
+impl<'de> Deserialize<'de> for EventIn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match EventRepr::deserialize(deserializer)? {
+            EventRepr::Object { t_us, k, v } => EventIn { t_us, k, v },
+            EventRepr::Array3((t_us, k, v)) => EventIn { t_us, k, v: Some(v) },
+            EventRepr::Array2((t_us, k)) => EventIn { t_us, k, v: None },
+        })
+    }
 }
 
 impl InputMsg {
@@ -822,6 +847,19 @@ mod tests {
         let bad = r#"{"type":"input","n":1,"events":[{"t_us":0,"k":"warp"}]}"#;
         let m: InputMsg = serde_json::from_str(bad).unwrap();
         assert!(m.to_timed().is_none());
+    }
+
+    #[test]
+    fn input_msg_accepts_array_events() {
+        let raw = r#"{"type":"input","n":7,"events":[[0,"left_down"],[800,"left_up"],[4000,"target_player",9],[9000,"hard"]]}"#;
+        let m: InputMsg = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.n, 7);
+        let ev = m.to_timed().unwrap();
+        assert_eq!(ev.len(), 4);
+        assert_eq!(ev[0].t_us, 0);
+        assert_eq!(ev[0].key, Key::LeftDown);
+        assert_eq!(ev[2].key, Key::TargetPlayer(9));
+        assert_eq!(ev[3].key, Key::HardDrop);
     }
 
     #[test]
