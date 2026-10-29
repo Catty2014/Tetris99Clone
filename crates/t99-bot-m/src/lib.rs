@@ -17,6 +17,9 @@ pub const HID: usize = 4;
 pub const ROWS: usize = 24;
 pub const MILLI: i64 = 1000;
 
+/// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况不受此限。
+pub const TARGET_DWELL_FRAMES: u64 = 30;
+
 /// 服务器 hello.protocol
 pub const PROTOCOL_MIN: u32 = 5;
 pub const PROTOCOL_MAX: u32 = 8;
@@ -1110,6 +1113,8 @@ pub struct Brain {
     soft_held: bool,
     last_mode: Option<Ev>,
     frames: u64,
+    /// 上次目标切换（或首次评估）所在帧
+    last_switch: u64,
     pub t_spins: u32,
     /// 本块内已证不可达的候选（fin_rot, fin_x）——BFS 失败后拉黑并重规划
     blocked: Vec<(u8, i32)>,
@@ -1196,6 +1201,7 @@ impl Brain {
             soft_held: false,
             last_mode: None,
             frames: 0,
+            last_switch: 0,
             t_spins: 0,
             blocked: vec![],
             blocked_sig: (0, '-', 0, false),
@@ -1204,11 +1210,13 @@ impl Brain {
 
     pub fn decide(&mut self, fr: &FrameIn) -> Act {
         self.frames += 1;
-        // 目标策略：每 60 帧（不影响软降持键）
-        if self.frames % 60 == 0 {
+        // 目标策略：最小驻留 30 帧；被瞄且待进垃圾 ≥3 时紧急豁免；首次评估立即执行
+        let urgent = !fr.targeted_by.is_empty() && fr.pending() >= 3;
+        if urgent || self.last_mode.is_none() || self.frames.saturating_sub(self.last_switch) >= TARGET_DWELL_FRAMES {
             let want = self.target_mode(fr);
             if self.last_mode != want {
                 self.last_mode = want;
+                self.last_switch = self.frames;
                 if let Some(k) = want {
                     return Act { evs: vec![(0, k)], soft_hold: self.soft_held };
                 }

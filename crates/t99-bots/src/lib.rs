@@ -238,9 +238,9 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 被瞄 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
 /// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
 /// 平摊式的 TargetAttackers 会让火力全被 1:1 抵消，谁也打不死谁。
-pub fn counter_or_hunt(s: &Snapshot, last_mode: &Option<Key>) -> Option<Key> {
+pub fn desired_target(s: &Snapshot) -> Key {
     let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
-    let want = if !s.targeted_by.is_empty() && pending >= 3 {
+    if !s.targeted_by.is_empty() && pending >= 3 {
         let fattest = s
             .targeted_by
             .iter()
@@ -260,14 +260,17 @@ pub fn counter_or_hunt(s: &Snapshot, last_mode: &Option<Key>) -> Option<Key> {
             Some((_, b)) if b >= 3 => Key::TargetBadges,
             _ => Key::TargetKos,
         }
-    };
-    if &Some(want) != last_mode {
-        Some(want)
-    } else {
-        None
     }
 }
 // 注：反攻条件加 pending≥3（真正受威胁才反打），否则坚持围猎，避免「永远反攻」僵局。
+
+/// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况与 Random 目标不受此限。
+pub const TARGET_DWELL_FRAMES: u64 = 30;
+
+/// 是否允许本帧重新评估目标切换。`has_mode` = 已有既定目标；`urgent` = 受威胁且待进垃圾 ≥3。
+pub fn switch_due(frames: u64, last_switch: u64, has_mode: bool, urgent: bool) -> bool {
+    urgent || !has_mode || frames.saturating_sub(last_switch) >= TARGET_DWELL_FRAMES
+}
 
 // ———— NullBot ————
 
@@ -479,11 +482,12 @@ pub struct AdvancedBot {
     plan: Option<Plan>,
     frames: u64,
     last_mode: Option<Key>,
+    last_switch: u64,
 }
 
 impl AdvancedBot {
     pub fn new() -> Self {
-        AdvancedBot { plan: None, frames: 0, last_mode: None }
+        AdvancedBot { plan: None, frames: 0, last_mode: None, last_switch: 0 }
     }
 }
 
@@ -527,13 +531,17 @@ impl PlanBot for AdvancedBot {
         &mut self.frames
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        if self.frames % 120 != 0 {
+        let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
+        let urgent = !s.targeted_by.is_empty() && pending >= 3;
+        let want = desired_target(s);
+        // Random 目标不做驻留限制（仅 BasicBot 开局用，Advanced 预留）
+        if !switch_due(self.frames, self.last_switch, self.last_mode.is_some(), urgent) && want != Key::TargetRandom {
             return None;
         }
-        let want = counter_or_hunt(s, &self.last_mode);
-        if want != self.last_mode {
-            self.last_mode = want;
-            return want;
+        if Some(want) != self.last_mode {
+            self.last_mode = Some(want);
+            self.last_switch = self.frames;
+            return Some(want);
         }
         None
     }
@@ -554,11 +562,12 @@ pub struct ExpertBot {
     plan: Option<Plan>,
     frames: u64,
     last_mode: Option<Key>,
+    last_switch: u64,
 }
 
 impl ExpertBot {
     pub fn new() -> Self {
-        ExpertBot { plan: None, frames: 0, last_mode: None }
+        ExpertBot { plan: None, frames: 0, last_mode: None, last_switch: 0 }
     }
 }
 
@@ -644,19 +653,16 @@ impl PlanBot for ExpertBot {
         &mut self.frames
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        if self.frames % 60 != 0 {
+        let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
+        let urgent = !s.targeted_by.is_empty() && pending >= 3;
+        let want = desired_target(s);
+        if !switch_due(self.frames, self.last_switch, self.last_mode.is_some(), urgent) && want != Key::TargetRandom {
             return None;
         }
-        let grid = grid_of(s);
-        // 危险时反攻保命（同反打逻辑），否则标准攻防
-        let want = if max_height(&grid) >= 15 && !s.targeted_by.is_empty() {
-            counter_or_hunt(s, &self.last_mode)
-        } else {
-            counter_or_hunt(s, &self.last_mode)
-        };
-        if want != self.last_mode {
-            self.last_mode = want;
-            return want;
+        if Some(want) != self.last_mode {
+            self.last_mode = Some(want);
+            self.last_switch = self.frames;
+            return Some(want);
         }
         None
     }
@@ -748,6 +754,18 @@ mod tests {
             }
         }
         m
+    }
+
+    #[test]
+    fn switch_due_dwell() {
+        // 初始（无既定目标）立即允许
+        assert!(switch_due(1, 0, false, false));
+        // 刚切换，29 帧内禁止
+        assert!(!switch_due(1 + 29, 1, true, false));
+        // 满 30 帧允许
+        assert!(switch_due(1 + 30, 1, true, false));
+        // 紧急立即允许
+        assert!(switch_due(1, 1, true, true));
     }
 
     #[test]
