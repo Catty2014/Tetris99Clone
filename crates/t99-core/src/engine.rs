@@ -232,6 +232,10 @@ pub struct Player {
     pub inserted: u32,
     /// 历史最大待进行数（含红黄灰）
     pub peak_pending: u32,
+    /// 给每个 pid 实际交付的垃圾行（index=pid）
+    pub sent_to: Vec<u32>,
+    /// 自己消行抵消掉的、来自每个 pid 的垃圾行（index=pid）
+    pub canceled_from: Vec<u32>,
     pub pieces: u32,
     pub target_mode: TargetMode,
     pub last_target: Option<usize>,
@@ -349,6 +353,8 @@ pub struct Match {
     last_death_frame: Option<u64>,
     /// 对局倒计时剩余（tick），归零按排序键终局
     match_ticks_left: Ticks,
+    /// 参考局：强制所有玩家随机锁敌，忽略目标键
+    pub force_random_target: bool,
 }
 
 impl Match {
@@ -395,6 +401,8 @@ impl Match {
                 canceled: 0,
                 inserted: 0,
                 peak_pending: 0,
+                sent_to: vec![0; cfg.players],
+                canceled_from: vec![0; cfg.players],
                 pieces: 0,
                 target_mode: TargetMode::Kos,
                 last_target: None,
@@ -422,6 +430,7 @@ impl Match {
             phase_ticks: 0,
             last_death_frame: None,
             match_ticks_left,
+            force_random_target: false,
         };
         for pid in 0..m.players.len() {
             m.spawn(pid, None, false);
@@ -430,6 +439,14 @@ impl Match {
             }
         }
         m
+    }
+
+    /// 参考局：所有玩家强制随机锁敌，并忽略后续一切目标键。
+    pub fn force_random_targets(&mut self) {
+        self.force_random_target = true;
+        for p in &mut self.players {
+            p.target_mode = TargetMode::Random;
+        }
     }
 
     fn draw(&mut self, pid: usize) -> Kind {
@@ -967,6 +984,9 @@ impl Match {
             Key::TargetAttackers => self.set_target_mode(pid, TargetMode::Attackers),
             Key::TargetRandom => self.set_target_mode(pid, TargetMode::Random),
             Key::TargetPlayer(v) => {
+                if self.force_random_target {
+                    return;
+                }
                 let t = v as usize;
                 if t < self.players.len() && t != pid && self.players[t].alive {
                     self.players[pid].target_mode = TargetMode::Manual(t);
@@ -978,6 +998,9 @@ impl Match {
     }
 
     fn set_target_mode(&mut self, pid: usize, mode: TargetMode) {
+        if self.force_random_target {
+            return;
+        }
         self.players[pid].target_mode = mode;
         let others: Vec<usize> = self
             .players
@@ -1211,9 +1234,13 @@ impl Match {
         let mut canceled = 0;
         while n > 0 && !self.players[pid].pending.is_empty() {
             let take = n.min(self.players[pid].pending[0].rows);
+            let sender = self.players[pid].pending[0].sender;
             self.players[pid].pending[0].rows -= take;
             n -= take;
             canceled += take;
+            if let Some(slot) = self.players[pid].canceled_from.get_mut(sender) {
+                *slot += take;
+            }
             if self.players[pid].pending[0].rows == 0 {
                 self.players[pid].pending.remove(0);
             }
@@ -1440,6 +1467,11 @@ impl Match {
                     let now: u32 = p.pending.iter().map(|g| g.rows).sum();
                     p.peak_pending = p.peak_pending.max(now);
                     delivered += rows;
+                    // 实际交付按接收方记账（send_cap/待进上限截断后的量）
+                    let sender = &mut self.players[pid];
+                    if let Some(slot) = sender.sent_to.get_mut(rid) {
+                        *slot += rows;
+                    }
                 }
             }
             self.players[pid].sent += delivered;

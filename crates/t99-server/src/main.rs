@@ -51,6 +51,10 @@ struct Args {
     auth_check: bool,
     auth_case_sensitive: bool,
     auth_files: Vec<String>,
+    /// 结算时向 stderr 输出逐对送出/抵消矩阵
+    dump_matrix: bool,
+    /// 参考局：强制所有席位随机锁敌（忽略客户端目标键）
+    force_random_target: bool,
 }
 
 fn parse_args() -> Args {
@@ -63,6 +67,13 @@ fn parse_args() -> Args {
             }
         }
         None
+    };
+    // 布尔开关：`--x` 或 `--x 1` 开启，`--x 0`/`--x false` 关闭
+    let flag = |name: &str| -> bool {
+        match get(name) {
+            Some(v) => v != "0" && v != "false",
+            None => args.iter().any(|a| a == name),
+        }
     };
     let cfg = t99_config::load_server(
         get("--config").as_deref().map(std::path::Path::new),
@@ -131,6 +142,8 @@ fn parse_args() -> Args {
         auth_check: cfg.auth.check_player_id,
         auth_case_sensitive: cfg.auth.case_sensitive,
         auth_files: cfg.auth.id_files,
+        dump_matrix: flag("--dump-matrix"),
+        force_random_target: flag("--force-random-target"),
     }
 }
 
@@ -365,6 +378,9 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         }
         ruleset.stall_accel = args.stall_accel;
         let mut engine = Match::new(MatchConfig { players, seed, ruleset });
+        if args.force_random_target {
+            engine.force_random_targets();
+        }
         // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。
         let seat_ids: Vec<String> = {
             let h = hall.lock().unwrap();
@@ -570,6 +586,22 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 "eliminated_at_frame": r.death_frame,
             })).collect::<Vec<_>>(),
         });
+        // 逐对送出/抵消矩阵（stderr，仅观测；match_result 仍只写 stdout 一行）
+        if args.dump_matrix {
+            for (pid, p) in engine.players.iter().enumerate() {
+                for (rid, &rows) in p.sent_to.iter().enumerate() {
+                    if rows > 0 {
+                        eprintln!("[matrix-sent] from={pid} to={rid} rows={rows}");
+                    }
+                }
+                for (src, &rows) in p.canceled_from.iter().enumerate() {
+                    if rows > 0 {
+                        eprintln!("[matrix-cancel] by={pid} from={src} rows={rows}");
+                    }
+                }
+            }
+        }
+
         println!("{out}");
         use std::io::Write;
         let _ = std::io::stdout().flush();
