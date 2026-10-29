@@ -129,13 +129,29 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 5.1 握手
 
+服务器在鉴权、席位分配完成后先发 `hello`：
+
 ```json
-{"type":"hello","engine_rev":7,"match_id":123,"seed":20261029,
+{"type":"hello","protocol":7,"ruleset":"9f3c1a7e","match_id":123,"seed":20261029,
  "players":99,"seat":7,"role":"player","profile":"program",
  "logic_hz":60,"lead_frames":2,"tick_hz":60,
  "summary_hz":5,"opp_view_hz":30,
  "time_limit_secs":300,"stall_accel":false}
 ```
+
+- `protocol` 是整数，表示 wire 语义；`ruleset` 是短 UUID 字符串，只表示规则集身份，不展开规则内容。
+- 官方实现只支持一种 `protocol + ruleset` 组合；开发构建可以维护一个 allowlist，但正式构建不协商、不降级、不猜测。
+- 客户端必须精确匹配。不认识或不接受时，立即回 `error {code:"unsupported_version"}` 并关闭连接，**不能发 `ready`，不能进入对局**。
+- 接受时回：
+
+```json
+{"type":"ready","protocol":7,"ruleset":"9f3c1a7e"}
+```
+
+- 服务器再次校验；不匹配同样关闭连接。`ready` 超时 2s 视为拒绝。
+- 在 `ready` 之前服务器不发 `tick`、`state`、`summary` 或 `frame`。
+- `ruleset` 应对规则集内容做确定性派生（例如 canonical ruleset 的 UUIDv5 短串），同一规则集在整届比赛中保持稳定；不要每次启动随机生成。
+- 参赛者在整个参赛周期内只会看到一种组合；`ruleset` 变化必须换版本并重建客户端镜像。
 
 `profile` 取值：`program`、`human`、`observer`。`lead_frames` 写进 ruleset，所有程序席位一致。
 
@@ -226,7 +242,7 @@ loop:
 ### 7.1 SessionCore
 
 - `Transport` trait：native WS、wasm WS、stdio。
-- 握手、`engine_rev` 校验、`frame_n` 估计、RTT/丢包统计。
+- 握手、`protocol` / `ruleset` 精确校验、`frame_n` 估计、RTT/丢包统计。
 - `InputQueue`：带时间戳的 ring；按逻辑帧边界封装 `input`。
 - `resync`：检测 tick 不连续或 hash 不匹配时请求 keyframe。
 
@@ -288,7 +304,7 @@ loop:
 ## 9. 风险与未决
 
 1. **keyframe 完整性。** 现有 `Snapshot` 未必覆盖 `Match` 的全部内部状态，尤其是 pending garbage 顺序。需要扩展 `Snapshot` 或实现 `Match::encode_state`；否则 keyframe 只能恢复画面，不能作为精确重演起点。
-2. **确定性。** 引擎只在 ruleset 推导处使用 `f64`（`match_ticks_for`），逻辑本身是整数 tick；`engine_rev` 必须严格匹配。wasm 与 native 的 f64 行为一致，但版本漂移仍要拒绝镜像。
+2. **确定性。** 引擎只在 ruleset 推导处使用 `f64`（`match_ticks_for`），逻辑本身是整数 tick；`protocol` 与 `ruleset` 都必须严格匹配。wasm 与 native 的 f64 行为一致，但版本漂移仍要拒绝镜像。
 3. **`lead_frames` 公平性。** 正式赛固定为 2 帧，写进 ruleset；所有程序席位一致，不按 RTT 单独放宽。
 4. **`state` 序列化成本。** 99 个程序席位每帧 99 份 JSON 是 P1 之后的主要 CPU；先用基准测量，再决定二进制或增量。
 5. **tick 连续性。** mirror 不能丢 tick；慢客户端只能断开并 resync，不能静默降采样。
