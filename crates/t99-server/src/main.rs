@@ -17,7 +17,7 @@ use tungstenite::handshake::server::{Request, Response};
 use tungstenite::Message;
 
 use t99_bots::BotAdapter;
-use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks};
+use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, ENGINE_SEMANTICS};
 use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, MAX_CONSECUTIVE_MISS};
 
 const FRAME_MS: u64 = 16;
@@ -194,7 +194,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     match m {
                         ToGame::ObserverJoin { idx } => {
                             let hello = serde_json::json!({
-                                "type": "hello", "match": match_no, "match_id": match_id, "seed": seed, "players": players,
+                                "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
                                 "seat": -1, "role": "observer",
                                 "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                             });
@@ -236,7 +236,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
                 let hello = serde_json::json!({
-                    "type": "hello", "match": match_no, "match_id": match_id, "seed": seed, "players": players,
+                    "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
                     "role": if c.seat.is_some() { "player" } else { "observer" },
                     "time_limit_secs": args.time_limit_secs,
@@ -305,7 +305,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     ToGame::ObserverJoin { idx } => {
                         // 单线程回放：先 hello + 全部历史 tick，再激活直播，时序必然正确
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "seed": seed, "players": players,
+                            "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
@@ -430,7 +430,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 match m {
                     ToGame::ObserverJoin { idx } => {
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "seed": seed, "players": players,
+                            "type": "hello", "match": match_no, "match_id": match_id, "engine_rev": ENGINE_SEMANTICS, "seed": seed, "players": players,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });

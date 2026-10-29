@@ -1187,6 +1187,16 @@ fn net_thread(
                     st.match_id = v["match_id"].as_u64().unwrap_or(0);
                     st.connected = true;
                 }
+                // 引擎语义版本校验：客户端二进制落后/超前于服务器 → 镜像必然分叉
+                let srv_rev = v["engine_rev"].as_u64().unwrap_or(0) as u32;
+                if srv_rev != 0 && srv_rev != t99_core::ENGINE_SEMANTICS {
+                    eprintln!(
+                        "[mirror] 引擎版本不匹配: 服务器 {} 本地 {} —— 镜像不可信，请重编客户端",
+                        srv_rev,
+                        t99_core::ENGINE_SEMANTICS
+                    );
+                    *status.lock().unwrap() = format!("引擎版本不匹配({srv_rev}≠{})，镜像不可信", t99_core::ENGINE_SEMANTICS);
+                }
                 let players = v["players"].as_u64().unwrap_or(2) as usize;
                 let seed = v["seed"].as_u64().unwrap_or(0);
                 let seat = v["seat"].as_i64().unwrap_or(-1);

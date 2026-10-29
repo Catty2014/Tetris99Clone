@@ -22,6 +22,10 @@ pub const MAX_T_US: u32 = 16_666;
 pub type Milli = i64;
 pub const MILLI_CELL: Milli = 1000;
 
+/// 引擎语义版本：任何影响模拟结果的引擎改动都必须递增（镜像失步的语义类防护——
+/// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
+pub const ENGINE_SEMANTICS: u32 = 2;
+
 pub const W: usize = 10;
 pub const HIDDEN: usize = 4;
 pub const H: usize = 20;
