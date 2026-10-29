@@ -52,6 +52,8 @@ fn kind_color(id: Cell) -> Color {
         6 => Color::srgb(0.35, 0.50, 0.95),
         7 => Color::srgb(0.95, 0.60, 0.25),
         8 => Color::srgb(0.55, 0.55, 0.58),
+        // 红闪暗相位：仍是方块，只是转暗
+        9 => Color::srgb(0.42, 0.10, 0.10),
         _ => Color::BLACK,
     }
 }
@@ -1445,11 +1447,8 @@ fn sync(
     show_grid(&mut vq, &views.meter, 1, &|r, _| {
         let idx = (H - 1 - r) as u32;
         if idx < s.garbage_red {
-            if red_on {
-                Some(5)
-            } else {
-                None
-            }
+            // 红闪方块始终存在：亮红/暗红交替，不再整格隐藏
+            Some(if red_on { 5 } else { 9 })
         } else if idx < s.garbage_red + s.garbage_yellow {
             Some(2)
         } else if idx < s.garbage_red + s.garbage_yellow + s.garbage_gray {
@@ -1684,11 +1683,8 @@ fn sync(
                 show_grid(&mut vq, &tv.meter, 1, &|r, _| {
                     let idx = (H - 1 - r) as u32;
                     if idx < snap.garbage_red {
-                        if red_on {
-                            Some(5)
-                        } else {
-                            None
-                        }
+                        // 同主棋盘：暗相位转暗红而非隐藏
+                        Some(if red_on { 5 } else { 9 })
                     } else if idx < snap.garbage_red + snap.garbage_yellow {
                         Some(2)
                     } else if idx < snap.garbage_red + snap.garbage_yellow + snap.garbage_gray {
