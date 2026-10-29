@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -290,6 +290,19 @@ pub trait PlayerAdapter {
     fn setup(&mut self, hello: &Hello) -> Result<(), AdapterError>;
     /// 返回该帧原始事件（引擎内部会再 sanitize）
     fn act(&mut self, snap: &Snapshot) -> Vec<TimedKey>;
+    /// 异步帧：只发送本帧快照，不等待回包。返回 true 表示该适配器进入异步收集；
+    /// false 表示仍由 `act` 同步完成（进程内 bot）。
+    fn begin_frame(&mut self, _snap: &Snapshot) -> bool {
+        false
+    }
+    /// 异步帧：非阻塞取回本帧输入。None = 尚未到达；Some = 已完成（可为空）。
+    fn try_input(&mut self) -> Option<Vec<TimedKey>> {
+        None
+    }
+    /// 异步帧：共享 deadline 已到，强制收尾并返回本帧输入。
+    fn end_frame(&mut self) -> Vec<TimedKey> {
+        vec![]
+    }
     fn consecutive_misses(&self) -> u32;
     fn is_dead(&self) -> bool;
     fn finish(&mut self, result: &ResultMsg);
@@ -469,6 +482,74 @@ impl PlayerAdapter for SubprocessAdapter {
         vec![]
     }
 
+    fn begin_frame(&mut self, snap: &Snapshot) -> bool {
+        if self.dead || self.child.is_none() {
+            self.misses += 1;
+            return true;
+        }
+        let frame = FrameMsg::from_snapshot(snap, snap.pid);
+        self.last_n = frame.n;
+        let msg = serde_json::to_string(&frame).unwrap_or_default();
+        if !self.send(&msg) {
+            self.dead = true;
+            self.misses += 1;
+        }
+        true
+    }
+
+    fn try_input(&mut self) -> Option<Vec<TimedKey>> {
+        if self.dead {
+            return Some(vec![]);
+        }
+        loop {
+            let line = match self.rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(line) => line,
+                    Err(TryRecvError::Empty) => return None,
+                    Err(TryRecvError::Disconnected) => {
+                        self.dead = true;
+                        self.misses += 1;
+                        return Some(vec![]);
+                    }
+                },
+                None => {
+                    self.dead = true;
+                    return Some(vec![]);
+                }
+            };
+            if line.is_empty() {
+                self.dead = true;
+                self.misses += 1;
+                return Some(vec![]);
+            }
+            match serde_json::from_str::<InputMsg>(&line) {
+                Ok(m) if m.n == self.last_n => match m.to_timed() {
+                    Some(events) => {
+                        self.misses = 0;
+                        return Some(events);
+                    }
+                    None => {
+                        self.misses += 1;
+                        return Some(vec![]);
+                    }
+                },
+                Ok(_) => continue,
+                Err(_) => {
+                    self.misses += 1;
+                    return Some(vec![]);
+                }
+            }
+        }
+    }
+
+    fn end_frame(&mut self) -> Vec<TimedKey> {
+        if self.check_exit() {
+            self.dead = true;
+        }
+        self.misses += 1;
+        vec![]
+    }
+
     fn consecutive_misses(&self) -> u32 {
         self.misses
     }
@@ -595,7 +676,18 @@ impl PlayerAdapter for NetPlayerAdapter {
                     if dbg && self.last_n < 5 {
                         eprintln!("[net:{}<-] {}", self.label, &line[..line.len().min(120)]);
                     }
-                    match serde_json::from_str::<InputMsg>(&line) {
+                    let val: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.misses += 1;
+                            return vec![];
+                        }
+                    };
+                    // 同一连接会混入 ping/pong 等非 input 文本；忽略而不是算作坏帧
+                    if val["type"].as_str() != Some("input") {
+                        continue;
+                    }
+                    match serde_json::from_value::<InputMsg>(val) {
                         Ok(m) if m.n == self.last_n => match m.to_timed() {
                             Some(events) => {
                                 self.misses = 0;
@@ -622,6 +714,80 @@ impl PlayerAdapter for NetPlayerAdapter {
                 None => break,
             }
         }
+        self.misses += 1;
+        vec![]
+    }
+
+    fn begin_frame(&mut self, snap: &Snapshot) -> bool {
+        if self.dead {
+            self.misses += 1;
+            return true;
+        }
+        let frame = FrameMsg::from_snapshot(snap, snap.pid);
+        self.last_n = frame.n;
+        let msg = serde_json::to_string(&frame).unwrap_or_default();
+        let dbg = std::env::var("T99_NET_DEBUG").is_ok();
+        if dbg && self.last_n < 5 {
+            eprintln!("[net:{}->] frame n={}", self.label, self.last_n);
+        }
+        if !self.send(&msg) {
+            self.dead = true;
+            self.misses += 1;
+        }
+        true
+    }
+
+    fn try_input(&mut self) -> Option<Vec<TimedKey>> {
+        if self.dead {
+            return Some(vec![]);
+        }
+        loop {
+            match self.rx.try_recv() {
+                Ok(line) => {
+                    if line.is_empty() {
+                        self.dead = true;
+                        self.misses += 1;
+                        return Some(vec![]);
+                    }
+                    let val: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            self.misses += 1;
+                            return Some(vec![]);
+                        }
+                    };
+                    if val["type"].as_str() != Some("input") {
+                        continue;
+                    }
+                    match serde_json::from_value::<InputMsg>(val) {
+                        Ok(m) if m.n == self.last_n => match m.to_timed() {
+                            Some(events) => {
+                                self.misses = 0;
+                                return Some(events);
+                            }
+                            None => {
+                                self.misses += 1;
+                                return Some(vec![]);
+                            }
+                        },
+                        Ok(_) => continue,
+                        Err(_) => {
+                            self.misses += 1;
+                            return Some(vec![]);
+                        }
+                    }
+                }
+                Err(TryRecvError::Empty) => return None,
+                Err(TryRecvError::Disconnected) => {
+                    self.dead = true;
+                    self.misses += 1;
+                    return Some(vec![]);
+                }
+            }
+        }
+    }
+
+    fn end_frame(&mut self) -> Vec<TimedKey> {
         self.misses += 1;
         vec![]
     }

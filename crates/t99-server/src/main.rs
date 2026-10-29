@@ -17,7 +17,7 @@ use tungstenite::Message;
 
 use t99_bots::BotAdapter;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, ENGINE_SEMANTICS};
-use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, MAX_CONSECUTIVE_MISS};
+use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS};
 
 /// 逻辑帧墙钟周期：16.6667ms。引擎时基本身是 FRAME_TICKS，这里只负责节流。
 const FRAME_NS: u64 = 1_000_000_000 / 60;
@@ -351,19 +351,51 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 }
             }
             let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; players];
+            // 阶段一：所有异步席位先发本帧快照；进程内 bot 仍同步 act。
+            let mut pending: Vec<usize> = Vec::new();
             for pid in 0..players {
                 if !engine.players[pid].alive {
                     continue;
                 }
                 if let Some(b) = bots[pid].as_mut() {
                     let snap = engine.snapshot(pid);
-                    inputs[pid] = b.act(&snap);
-                    // 外部程序死亡/持续不应答：宿主强制判负
-                    if b.is_dead() || b.consecutive_misses() > MAX_CONSECUTIVE_MISS {
-                        engine.kill(pid, "program_dead");
+                    if b.begin_frame(&snap) {
+                        pending.push(pid);
+                    } else {
+                        inputs[pid] = b.act(&snap);
                     }
                 } else if let Some(ev) = next_inputs.remove(&pid) {
                     inputs[pid] = ev;
+                }
+            }
+            // 阶段二：共享 deadline 收集，等最慢的一席，而不是逐个等 RTT。
+            if !pending.is_empty() {
+                let deadline = Instant::now() + FRAME_DEADLINE;
+                loop {
+                    let mut still = Vec::with_capacity(pending.len());
+                    for pid in pending.drain(..) {
+                        let b = bots[pid].as_mut().expect("pending 席位必有 adapter");
+                        match b.try_input() {
+                            Some(ev) => inputs[pid] = ev,
+                            None => still.push(pid),
+                        }
+                    }
+                    pending = still;
+                    if pending.is_empty() || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                for pid in pending.drain(..) {
+                    inputs[pid] = bots[pid].as_mut().expect("pending 席位必有 adapter").end_frame();
+                }
+            }
+            // 外部程序死亡/持续不应答：宿主强制判负
+            for pid in 0..players {
+                if let Some(b) = bots[pid].as_mut() {
+                    if b.is_dead() || b.consecutive_misses() > MAX_CONSECUTIVE_MISS {
+                        engine.kill(pid, "program_dead");
+                    }
                 }
             }
             engine.frame(&inputs);
