@@ -3733,6 +3733,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "t99-bots",
+ "t99-config",
  "t99-core",
  "t99-proto",
  "tungstenite",

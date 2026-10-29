@@ -6,7 +6,7 @@
 //! - 观战：role=observer&spectate=N，与游玩客户端同协议、无输入权。
 //! - 对局结束后所有人类席位请求 restart 或 8s 超时即开新局（新种子）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -21,14 +21,12 @@ use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, Su
 
 /// 逻辑帧墙钟周期：16.6667ms。引擎时基本身是 FRAME_TICKS，这里只负责节流。
 const FRAME_NS: u64 = 1_000_000_000 / 60;
-const RESTART_TIMEOUT: Duration = Duration::from_secs(8);
-const LOBBY_TIMEOUT: Duration = Duration::from_secs(10);
-/// 写线程的写超时：对端不读时不至于永久卡在 send 上
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
 const MSG_CLOSE: &str = "\u{0}close";
 
+#[derive(Clone)]
 struct Args {
+    address: String,
     port: u16,
     key: String,
     players: usize,
@@ -44,6 +42,14 @@ struct Args {
     lobby: bool,
     /// 可选 PlayerID allowlist（逗号分隔）；不是席位顺序。缺省接受任意非空 ID。
     ids: Option<String>,
+    loglevel: String,
+    debug: bool,
+    lobby_timeout: Duration,
+    restart_timeout: Duration,
+    write_timeout: Duration,
+    auth_check: bool,
+    auth_case_sensitive: bool,
+    auth_files: Vec<String>,
 }
 
 fn parse_args() -> Args {
@@ -57,8 +63,18 @@ fn parse_args() -> Args {
         }
         None
     };
-    let players: usize = get("--players").and_then(|s| s.parse().ok()).unwrap_or(4);
-    let lobby = args.iter().any(|a| a == "--lobby");
+    let cfg = t99_config::load_server(
+        get("--config").as_deref().map(std::path::Path::new),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("[config] {e}");
+        std::process::exit(2);
+    });
+    let players: usize = get("--players")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(cfg.match_section.players);
+    let no_lobby = args.iter().any(|a| a == "--no-lobby");
+    let lobby = !no_lobby && (args.iter().any(|a| a == "--lobby") || cfg.match_section.lobby);
     // 缺省 bot 阵容只用于非 lobby 局；lobby 不给 --bots 时即纯网络局（全部席位网络玩家），
     // 显式给 --bots 时保留，形成混合局（前 human_seats 席网络，其余进程内/子进程 bot）
     let bots: Vec<String> = get("--bots")
@@ -67,18 +83,70 @@ fn parse_args() -> Args {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+    let mut seed = get("--seed")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(cfg.match_section.seed);
+    if seed == 0 {
+        seed = random_seed();
+        eprintln!("[seed] {seed}");
+    }
     Args {
-        port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(8138),
+        address: get("--address").unwrap_or(cfg.server.address),
+        port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(cfg.server.port),
         key: get("--key").unwrap_or_else(|| "t99".into()),
         // Bot 数即席位下限：bot 覆盖全部席位时为纯 Bot 局（人类 0 席）
         players: players.max(bots.len()),
         bots,
-        seed: get("--seed").and_then(|s| s.parse().ok()).unwrap_or(42),
+        seed,
         max_frames: get("--max-frames").and_then(|s| s.parse().ok()).unwrap_or(54_000),
         time_limit_secs: get("--time-limit-secs").and_then(|s| s.parse().ok()).unwrap_or(0),
-        stall_accel: get("--stall-accel").map(|s| s != "0" && s != "false").unwrap_or(true),
+        stall_accel: get("--stall-accel")
+            .map(|s| s != "0" && s != "false")
+            .unwrap_or(cfg.server.stalemate_accel),
         lobby,
         ids: get("--ids"),
+        loglevel: get("--loglevel").unwrap_or(cfg.server.loglevel),
+        debug: args.iter().any(|a| a == "--debug") || cfg.server.debug,
+        lobby_timeout: Duration::from_secs(cfg.server.lobby_timeout_secs),
+        restart_timeout: Duration::from_secs(cfg.server.restart_timeout_secs),
+        write_timeout: Duration::from_secs(cfg.server.write_timeout_secs),
+        auth_check: cfg.auth.check_player_id,
+        auth_case_sensitive: cfg.auth.case_sensitive,
+        auth_files: cfg.auth.id_files,
+    }
+}
+
+fn random_seed() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    now ^ (std::process::id() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+struct IdFilter {
+    patterns: Vec<String>,
+    case_sensitive: bool,
+}
+
+impl IdFilter {
+    fn allows(&self, id: &str) -> bool {
+        let id = if self.case_sensitive { id.to_string() } else { id.to_ascii_lowercase() };
+        self.patterns.iter().any(|p| {
+            let p = if self.case_sensitive { p.clone() } else { p.to_ascii_lowercase() };
+            glob_match(p.as_bytes(), id.as_bytes())
+        })
+    }
+}
+
+fn glob_match(p: &[u8], s: &[u8]) -> bool {
+    if p.is_empty() {
+        return s.is_empty();
+    }
+    match p[0] {
+        b'*' => glob_match(&p[1..], s) || (!s.is_empty() && glob_match(p, &s[1..])),
+        b'?' => !s.is_empty() && glob_match(&p[1..], &s[1..]),
+        c => !s.is_empty() && s[0] == c && glob_match(&p[1..], &s[1..]),
     }
 }
 
@@ -178,7 +246,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let lobby_start = Instant::now();
         // 首局再等首个客户端（含观战）入场，至多 30s：观战端先就位再开局。
         // 注意：此处不可盲清空 rx——宽限期内加入的观战端依赖 ObserverJoin 激活补史。
-        if match_no == 1 {
+        if match_no == 1 && human_seats > 0 {
             while lobby_start.elapsed() < Duration::from_secs(30) {
                 let any = hall.lock().unwrap().clients.iter().flatten().next().is_some();
                 if any {
@@ -187,7 +255,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
-        while lobby_start.elapsed() < LOBBY_TIMEOUT {
+        while lobby_start.elapsed() < args.lobby_timeout {
             let filled = hall
                 .lock()
                 .unwrap()
@@ -556,8 +624,11 @@ fn main() {
     let args = parse_args();
     let human_seats = args.players - args.bots.len();
     eprintln!(
-        "t99-server: 端口 {} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 0杀加速 {}{}",
+        "t99-server: {}:{} loglevel={} debug={} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 0杀加速 {} restart_timeout={}s{}",
+        args.address,
         args.port,
+        args.loglevel,
+        args.debug,
         args.key,
         args.players,
         human_seats,
@@ -565,24 +636,50 @@ fn main() {
         args.seed,
         if args.time_limit_secs > 0 { format!("{}s", args.time_limit_secs) } else { "auto".into() },
         if args.stall_accel { "开" } else { "关" },
+        args.restart_timeout.as_secs(),
         if args.lobby { " [lobby]" } else { "" },
     );
     // 可选 allowlist；没有名册顺序：席位随机分配，PlayerID 只负责唯一性。
-    let allowed: Option<Arc<HashSet<String>>> = if args.lobby {
-        args.ids.as_ref().map(|list| {
-            Arc::new(
-                list.split(',')
-                    .map(|x| x.trim().to_string())
-                    .filter(|x| !x.is_empty())
-                    .collect(),
-            )
+    let mut patterns: Vec<String> = args
+        .ids
+        .as_ref()
+        .map(|list| {
+            list.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
         })
+        .unwrap_or_default();
+    if args.lobby && patterns.is_empty() && args.auth_check {
+        for f in &args.auth_files {
+            let text = std::fs::read_to_string(f).unwrap_or_else(|e| {
+                eprintln!("[auth] 读取 {f} 失败: {e}");
+                std::process::exit(2);
+            });
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                patterns.push(line.to_string());
+            }
+        }
+        if patterns.is_empty() {
+            eprintln!("[auth] check_player_id=true 但没有有效 pattern；拒绝启动");
+            std::process::exit(2);
+        }
+    }
+    let allowed: Option<Arc<IdFilter>> = if args.lobby && !patterns.is_empty() {
+        Some(Arc::new(IdFilter {
+            patterns,
+            case_sensitive: args.auth_case_sensitive,
+        }))
     } else {
         None
     };
     if args.lobby {
         match &allowed {
-            Some(a) => eprintln!("[auth] allowlist {} IDs；席位随机分配", a.len()),
+            Some(a) => eprintln!("[auth] {} patterns；席位随机分配", a.patterns.len()),
             None => eprintln!("[auth] 无 allowlist，接受任意非空 PlayerID；席位随机分配"),
         }
     }
@@ -593,7 +690,7 @@ fn main() {
 
     {
         let hall = hall.clone();
-        let args = Args { port: args.port, key: args.key.clone(), players: args.players, bots: args.bots.clone(), seed: args.seed, max_frames: args.max_frames, time_limit_secs: args.time_limit_secs, stall_accel: args.stall_accel, lobby: args.lobby, ids: args.ids.clone() };
+        let args = args.clone();
         let running = running.clone();
         std::thread::spawn(move || {
             let hs = args.players - args.bots.len();
@@ -601,7 +698,8 @@ fn main() {
         });
     }
 
-    let listener = TcpListener::bind(("0.0.0.0", args.port)).expect("绑定端口失败");
+    let listener = TcpListener::bind((args.address.as_str(), args.port)).expect("绑定端口失败");
+    let write_timeout = args.write_timeout;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let hall = hall.clone();
@@ -651,7 +749,7 @@ fn main() {
             }
             if role != "observer" && lobby {
                 if let Some(a) = &allowed {
-                    if !a.contains(&id) {
+                    if !a.allows(&id) {
                         err(&mut ws, "id_invalid");
                         eprintln!("[auth] 拒绝不在 allowlist 的 ID: {id}");
                         return;
@@ -736,7 +834,7 @@ fn main() {
             let writer_ws = match ws.get_ref().try_clone() {
                 Ok(s) => {
                     // 对端不读时 send 不无限阻塞（写超时兜底写线程收尾）
-                    s.set_write_timeout(Some(WRITE_TIMEOUT)).ok();
+                    s.set_write_timeout(Some(write_timeout)).ok();
                     tungstenite::WebSocket::from_raw_socket(
                         s,
                         tungstenite::protocol::Role::Server,

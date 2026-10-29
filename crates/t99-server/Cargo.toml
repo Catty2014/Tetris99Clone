@@ -8,5 +8,6 @@ license.workspace = true
 t99-core = { path = "../t99-core" }
 t99-proto = { path = "../t99-proto" }
 t99-bots = { path = "../t99-bots" }
+t99-config = { path = "../t99-config" }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 serde_json = "1"
