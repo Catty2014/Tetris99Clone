@@ -43,8 +43,12 @@ manual = "arrow"            # arrow / wasd; only affects manual target selection
 attack_fallback = "random"  # ko / random / badge / attacker
 
 [display]
-vsync = true
-framerate = 240             # only a cap when vsync = false
+# Competitive default: uncapped for lowest input latency. 2D rendering is cheap;
+# set true only for testing/recording or when tearing is unacceptable.
+vsync = false
+# 0 = uncapped. Only effective if a frame limiter is implemented; Bevy itself
+# does not cap FPS when vsync is off.
+framerate = 0
 opponent_framerate = 60     # opponent board display sampling rate
 ghost = true
 shadow_locked = true

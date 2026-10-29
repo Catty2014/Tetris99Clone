@@ -60,7 +60,7 @@ t99-hc              session + Policy，不编译 mirror
 | 域 | 值 | 驱动 | 约束 |
 |---|---:|---|---|
 | logic | 60Hz，16667µs | Server | 唯一权威；`frame_n` 是全局时钟 |
-| input sampling | = 显示帧率 | Client | 随 vsync / framerate；采样时打 `t_us`，不按逻辑帧打点 |
+| input sampling | = update 率 | Client | vsync 开 = 刷新率；vsync 关 = 不限/上限；采样时打 `t_us`，不按逻辑帧打点 |
 | render | vsync / 不限帧 | Client | 只读逻辑状态并插值，不推进 `Match` |
 | opponent view | 30Hz 默认，5–60 可调 | Client | 从 mirror 采样；digest 模式下为订阅参数 |
 | summary | 5Hz | Server → HC | 堆叠、KO、徽章、目标信息 |
@@ -75,7 +75,7 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 3.2 输入
 
-- 输入采样率等于显示帧率（`vsync` 或 `framerate` 决定），不单独配置 `sample_rate`；显示高于 60 时可以高于逻辑帧率，但不产生更多消息。
+- 输入采样率等于 update 率（`vsync` 开时为刷新率，关闭时可高于显示刷新率），不单独配置 `sample_rate`；高于 60 时可以高于逻辑帧率，但不产生更多消息。
 - 一个逻辑帧窗口内的多次采样编码成多个 `t_us` 事件；每逻辑帧最多一个 `input` 批次。
 - 例：采样 240Hz、逻辑 60Hz，一帧 4 个事件，`t_us` 分布在 0–16666。
 - 采样写入带时间戳的 ring；逻辑帧边界只做“取走并封装”，不阻塞采样。
@@ -85,10 +85,12 @@ t99-hc              session + Policy，不编译 mirror
 
 ### 3.3 显示
 
-- `vsync = true` 时以显示器刷新率为准，`framerate` 不生效；`vsync = false` 时 `framerate` 是上限。
+- 竞技默认 `vsync = false`；`vsync = true` 仅用于测试/录制或无法接受 tearing 的场景。
+- `vsync = false` 时 Bevy 的 update 与 render 一起解除帧率限制；`framerate` 只有在实现额外 limiter 后才生效，`0` 表示不限制。
+- 因此输入采样率等于 update 率，而不是固定的显示刷新率；Bevy 仍没有“输入独立于渲染”的模式。
 - 渲染不调用 `engine.frame`，只读最近两个逻辑状态做插值。
 - 自己的盘面 60Hz；对手缩略图默认 30Hz，featured 视图可 60Hz。
-- 输入采样随显示帧率，但不推进逻辑；渲染卡顿只会降低采样密度，不改变已采样事件的 `t_us` 时序。
+- 输入采样随 update，但不推进逻辑；渲染卡顿会同时降低采样密度，不改变已采样事件的 `t_us` 时序。
 
 ### 3.4 HeadlessClient
 
