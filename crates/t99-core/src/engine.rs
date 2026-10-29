@@ -194,6 +194,17 @@ pub struct Player {
     pub hold: Option<Kind>,
     hold_used: bool,
     soft: bool,
+    /// 有状态的旋转/保持键，用于 I*S 的 held 触发
+    held_cw: bool,
+    held_ccw: bool,
+    held_hold: bool,
+    /// 窗口内出现过的 0->1（edge）
+    initial_rot: Option<u8>,
+    initial_hold: bool,
+    rot_last_pressed: Option<u8>,
+    rot_last_released: Option<u8>,
+    /// 本帧已发生锁定；后续 piece-action 不再执行
+    locked_this_frame: bool,
     das: Das,
     lock_timer: Ticks,
     lock_resets: u32,
@@ -217,6 +228,19 @@ pub struct Player {
     pub death_frame: Option<u64>,
     last_garbage_from: Option<usize>,
     pub last_clear: Option<ClearView>,
+}
+
+/// 锁定后本帧不能再作用于下一块的输入；目标选择不算 piece-action。
+fn is_piece_action(key: Key) -> bool {
+    !matches!(
+        key,
+        Key::TargetBadges
+            | Key::TargetKos
+            | Key::TargetAttackers
+            | Key::TargetRandom
+            | Key::TargetPlayer(_)
+            | Key::Noop
+    )
 }
 
 fn collides(p: &Player, kind: Kind, rot: u8, x: i32, y: Milli) -> bool {
@@ -327,6 +351,14 @@ impl Match {
                 hold: None,
                 hold_used: false,
                 soft: false,
+                held_cw: false,
+                held_ccw: false,
+                held_hold: false,
+                initial_rot: None,
+                initial_hold: false,
+                rot_last_pressed: None,
+                rot_last_released: None,
+                locked_this_frame: false,
                 das: Das { left: false, right: false, dir: None, das: 0, arr: 0 },
                 lock_timer: 0,
                 lock_resets: 0,
@@ -420,12 +452,60 @@ impl Match {
         p.lock_resets = 0;
         p.grounded = false;
         p.last_rot_kick = None;
+        self.apply_initial(pid, from_hold);
+    }
+
+    fn initial_triggered(&self, edge: bool, held: bool) -> bool {
+        match self.cfg.ruleset.initial_trigger {
+            InitialTrigger::Edge => edge,
+            InitialTrigger::Held => held,
+            InitialTrigger::Either => edge || held,
+        }
+    }
+
+    fn apply_initial(&mut self, pid: usize, from_hold: bool) {
+        let (edge_rot, edge_hold, held_hold, held_rot) = {
+            let p = &self.players[pid];
+            let held_rot = if p.held_cw && p.held_ccw {
+                p.rot_last_pressed.or(p.initial_rot)
+            } else if p.held_cw {
+                Some(1)
+            } else if p.held_ccw {
+                Some(3)
+            } else {
+                None
+            };
+            (p.initial_rot, p.initial_hold, p.held_hold, held_rot)
+        };
+        let want_hold = self.cfg.ruleset.ihs
+            && !from_hold
+            && self.initial_triggered(edge_hold, held_hold);
+        let want_rot = self.cfg.ruleset.irs
+            && self.initial_triggered(edge_rot.is_some(), held_rot.is_some());
+        let rot = edge_rot.or(held_rot);
+
+        // IHS 先：交换后递归 spawn，from_hold=true 只再应用 IRS。
+        if want_hold {
+            self.players[pid].initial_hold = false;
+            self.do_hold(pid);
+            return;
+        }
+        if want_rot {
+            if let (Some(d), Some(r)) = (rot, self.players[pid].active.map(|a| a.rot)) {
+                self.try_rotate(pid, r + d);
+            }
+        }
+        self.players[pid].initial_rot = None;
+        self.players[pid].initial_hold = false;
     }
 
     /// 帧推进：sanitize 后按事件时刻精确积分。
     pub fn frame(&mut self, inputs: &[Vec<TimedKey>]) {
         if self.over.is_some() {
             return;
+        }
+        for p in &mut self.players {
+            p.locked_this_frame = false;
         }
         let n = self.players.len();
         let mut per: Vec<Vec<TimedKey>> = (0..n)
@@ -675,8 +755,64 @@ impl Match {
         if !self.players[pid].alive {
             return;
         }
-        // 无活动块（Clear/Are）期间：允许 DAS 充能、软降、目标与空操作；其余忽略
+        // 本帧已经锁定：后续 piece-action 不再影响下一块；目标事件仍允许。
+        if self.players[pid].locked_this_frame && is_piece_action(key) {
+            return;
+        }
+        // 无活动块（Clear/Are）期间：允许 DAS 充能、软降、目标与空操作；
+        // 旋转/保持的 down/up 进入 I*S 窗口。
         if self.players[pid].active.is_none() {
+            {
+                let p = &mut self.players[pid];
+                match key {
+                    Key::RotCw => {
+                        p.initial_rot = Some(1);
+                        p.rot_last_pressed = Some(1);
+                        return;
+                    }
+                    Key::RotCcw => {
+                        p.initial_rot = Some(3);
+                        p.rot_last_pressed = Some(3);
+                        return;
+                    }
+                    Key::RotCwDown => {
+                        p.held_cw = true;
+                        p.initial_rot = Some(1);
+                        p.rot_last_pressed = Some(1);
+                        return;
+                    }
+                    Key::RotCwUp => {
+                        p.held_cw = false;
+                        p.rot_last_released = Some(1);
+                        return;
+                    }
+                    Key::RotCcwDown => {
+                        p.held_ccw = true;
+                        p.initial_rot = Some(3);
+                        p.rot_last_pressed = Some(3);
+                        return;
+                    }
+                    Key::RotCcwUp => {
+                        p.held_ccw = false;
+                        p.rot_last_released = Some(3);
+                        return;
+                    }
+                    Key::Hold => {
+                        p.initial_hold = true;
+                        return;
+                    }
+                    Key::HoldDown => {
+                        p.held_hold = true;
+                        p.initial_hold = true;
+                        return;
+                    }
+                    Key::HoldUp => {
+                        p.held_hold = false;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             let gap_ok = matches!(
                 key,
                 Key::LeftDown
@@ -724,6 +860,37 @@ impl Match {
             }
             Key::SoftDown => self.players[pid].soft = true,
             Key::SoftUp => self.players[pid].soft = false,
+            Key::RotCwDown => {
+                self.players[pid].held_cw = true;
+                self.players[pid].rot_last_pressed = Some(1);
+                let r = self.players[pid].active.map(|a| a.rot);
+                if let Some(r) = r {
+                    self.try_rotate(pid, r + 1);
+                }
+            }
+            Key::RotCwUp => {
+                self.players[pid].held_cw = false;
+                self.players[pid].rot_last_released = Some(1);
+            }
+            Key::RotCcwDown => {
+                self.players[pid].held_ccw = true;
+                self.players[pid].rot_last_pressed = Some(3);
+                let r = self.players[pid].active.map(|a| a.rot);
+                if let Some(r) = r {
+                    self.try_rotate(pid, r + 3);
+                }
+            }
+            Key::RotCcwUp => {
+                self.players[pid].held_ccw = false;
+                self.players[pid].rot_last_released = Some(3);
+            }
+            Key::HoldDown => {
+                self.players[pid].held_hold = true;
+                self.do_hold(pid);
+            }
+            Key::HoldUp => {
+                self.players[pid].held_hold = false;
+            }
             Key::RotCw => {
                 let r = self.players[pid].active.map(|a| a.rot);
                 if let Some(r) = r {
@@ -755,6 +922,8 @@ impl Match {
                     if let Some(a) = p.active.as_mut() {
                         a.y = rest;
                     }
+                    // 硬降覆盖同帧软降，且不把软降状态带到下一块
+                    p.soft = false;
                     // 保留 last_rot_kick：T99 语义——旋转后硬降仍成立 T-Spin（硬降不视为横向移动）
                 }
                 self.lock_piece(pid);
@@ -1017,6 +1186,8 @@ impl Match {
             Some(a) => (a.kind, a.rot, a.x, a.y),
             None => return,
         };
+        // 本帧锁定后，剩余 piece-action 不再作用于下一块。
+        self.players[pid].locked_this_frame = true;
         // 落章与锁定区判定
         let mut lockout = true;
         {
@@ -1602,10 +1773,11 @@ mod tests {
             TimedKey { t_us: 0, key: Key::RotCw },
             TimedKey { t_us: 100, key: Key::RotCw }
         ]).is_none());
+        // 目标选择同帧可重复，按顺序后者生效
         assert!(sanitize_events(&[
             TimedKey { t_us: 0, key: Key::TargetPlayer(1) },
             TimedKey { t_us: 100, key: Key::TargetPlayer(2) }
-        ]).is_none());
+        ]).is_some());
         // 越界 t
         assert!(sanitize_events(&[TimedKey { t_us: 16667, key: Key::HardDrop }]).is_none());
         // >16
@@ -1651,6 +1823,48 @@ mod tests {
         assert_eq!((r[1].pid, r[1].rank), (1, 1));
         assert_eq!((r[2].pid, r[2].rank), (2, 3));
         assert_eq!((r[3].pid, r[3].rank), (3, 4));
+    }
+
+    #[test]
+    fn irs_edge_rotates_on_spawn() {
+        let mut m = solo();
+        m.players[0].active = None;
+        m.apply_key(0, Key::RotCwDown);
+        m.apply_key(0, Key::RotCwUp);
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().rot, 1);
+    }
+
+    #[test]
+    fn irs_held_rotates_on_spawn() {
+        let mut m = solo();
+        m.cfg.ruleset.initial_trigger = InitialTrigger::Held;
+        m.players[0].active = None;
+        m.players[0].held_cw = true;
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().rot, 1);
+    }
+
+    #[test]
+    fn ihs_swaps_before_spawn() {
+        let mut m = solo();
+        m.players[0].active = None;
+        m.players[0].hold = Some(Kind::I);
+        m.apply_key(0, Key::HoldDown);
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().kind, Kind::I);
+        assert_eq!(m.players[0].hold, Some(Kind::T));
+    }
+
+    #[test]
+    fn lock_frame_ignores_later_piece_actions() {
+        let mut m = solo();
+        m.apply_key(0, Key::HardDrop);
+        assert!(m.players[0].active.is_none());
+        assert!(m.players[0].locked_this_frame);
+        m.apply_key(0, Key::RotCwDown);
+        m.spawn(0, Some(Kind::T), false);
+        assert_eq!(m.players[0].active.unwrap().rot, 0);
     }
 
     #[test]

@@ -22,8 +22,9 @@ match_seconds = 900         # 99p 15min；0 = 按玩家人数自动
 bag_randomizer = true
 srs = true
 hold = true
-irs = true                  # 目标规则；当前引擎的 ARE 预输入缓冲待补
-ihs = true                  # 同上
+irs = true
+ihs = true
+initial_trigger = "either"  # edge | held | either
 allow_rot180 = false
 death = "block"
 

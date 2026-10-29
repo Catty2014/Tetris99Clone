@@ -60,8 +60,9 @@ pub fn hello_for(pid: usize, player_id: &str, players: usize, preview: usize) ->
         preview,
         keys: vec![
             "left_down", "left_up", "right_down", "right_up", "soft_down", "soft_up", "cw", "ccw",
-            "flip", "hard", "hold", "target_badges", "target_kos", "target_attackers",
-            "target_random", "target_player", "noop",
+            "flip", "hard", "hold", "cw_down", "cw_up", "ccw_down", "ccw_up", "hold_down",
+            "hold_up", "target_badges", "target_kos", "target_attackers", "target_random",
+            "target_player", "noop",
         ],
     }
 }

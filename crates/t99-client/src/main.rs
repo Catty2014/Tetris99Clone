@@ -536,13 +536,22 @@ fn poll_input(
         push_key(&mut queue, Key::HardDrop, now);
     }
     if jp(&scheme.rot()) {
-        push_key(&mut queue, Key::RotCw, now);
+        push_key(&mut queue, Key::RotCwDown, now);
+    }
+    if jr(&scheme.rot()) {
+        push_key(&mut queue, Key::RotCwUp, now);
     }
     if jp(&[KeyCode::KeyZ, KeyCode::KeyK]) {
-        push_key(&mut queue, Key::RotCcw, now);
+        push_key(&mut queue, Key::RotCcwDown, now);
+    }
+    if jr(&[KeyCode::KeyZ, KeyCode::KeyK]) {
+        push_key(&mut queue, Key::RotCcwUp, now);
     }
     if jp(&[KeyCode::KeyC, KeyCode::ShiftLeft]) {
-        push_key(&mut queue, Key::Hold, now);
+        push_key(&mut queue, Key::HoldDown, now);
+    }
+    if jr(&[KeyCode::KeyC, KeyCode::ShiftLeft]) {
+        push_key(&mut queue, Key::HoldUp, now);
     }
     if jp(&[KeyCode::KeyR]) {
         if let Session::Net { tx, .. } = &*session {

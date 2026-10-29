@@ -195,6 +195,13 @@ pub enum Key {
     Rot180,
     HardDrop,
     Hold,
+    /// 有状态的按下/释放，用于 I*S、KeyState 与 DAS 中断
+    RotCwDown,
+    RotCwUp,
+    RotCcwDown,
+    RotCcwUp,
+    HoldDown,
+    HoldUp,
     TargetBadges,
     TargetKos,
     TargetAttackers,
@@ -225,6 +232,12 @@ impl Key {
             Key::TargetRandom => 15,
             Key::TargetPlayer(_) => 16,
             Key::Noop => 17,
+            Key::RotCwDown => 18,
+            Key::RotCwUp => 19,
+            Key::RotCcwDown => 20,
+            Key::RotCcwUp => 21,
+            Key::HoldDown => 22,
+            Key::HoldUp => 23,
         }
     }
 
@@ -247,6 +260,12 @@ impl Key {
             Key::TargetRandom => "target_random",
             Key::TargetPlayer(_) => "target_player",
             Key::Noop => "noop",
+            Key::RotCwDown => "cw_down",
+            Key::RotCwUp => "cw_up",
+            Key::RotCcwDown => "ccw_down",
+            Key::RotCcwUp => "ccw_up",
+            Key::HoldDown => "hold_down",
+            Key::HoldUp => "hold_up",
         }
     }
 
@@ -263,6 +282,12 @@ impl Key {
             "flip" => Key::Rot180,
             "hard" => Key::HardDrop,
             "hold" => Key::Hold,
+            "cw_down" => Key::RotCwDown,
+            "cw_up" => Key::RotCwUp,
+            "ccw_down" => Key::RotCcwDown,
+            "ccw_up" => Key::RotCcwUp,
+            "hold_down" => Key::HoldDown,
+            "hold_up" => Key::HoldUp,
             "target_badges" => Key::TargetBadges,
             "target_kos" => Key::TargetKos,
             "target_attackers" => Key::TargetAttackers,
@@ -293,11 +318,20 @@ pub fn sanitize_events(raw: &[TimedKey]) -> Option<Vec<TimedKey>> {
         prev_t = e.t_us as i64;
         // 横向移动是离散事件：同一帧可以连续发多个 left_down/right_down；
         // DAS/ARR 由有头客户端折算，不再由引擎按住自动重复。
-        let directional = matches!(
+        // 方向移动、目标选择允许同帧重复；后者按顺序生效。
+        let repeatable = matches!(
             e.key,
-            Key::LeftDown | Key::LeftUp | Key::RightDown | Key::RightUp
+            Key::LeftDown
+                | Key::LeftUp
+                | Key::RightDown
+                | Key::RightUp
+                | Key::TargetBadges
+                | Key::TargetKos
+                | Key::TargetAttackers
+                | Key::TargetRandom
+                | Key::TargetPlayer(_)
         );
-        if !directional && raw[..i].iter().any(|p| p.key.kind() == e.key.kind()) {
+        if !repeatable && raw[..i].iter().any(|p| p.key.kind() == e.key.kind()) {
             return None;
         }
     }
@@ -326,6 +360,16 @@ impl TargetMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialTrigger {
+    /// 窗口内出现 0->1
+    Edge,
+    /// 窗口结束时仍按住
+    Held,
+    /// 任一满足
+    Either,
+}
+
 /// 节奏相位（ADR-018）：按存活比例切换；相位内参数缓升，相位间跳变。
 #[derive(Clone, Debug)]
 pub struct PhaseSpec {
@@ -345,6 +389,9 @@ pub struct PhaseSpec {
 #[derive(Clone, Debug)]
 pub struct Ruleset {
     pub preview: usize,
+    pub irs: bool,
+    pub ihs: bool,
+    pub initial_trigger: InitialTrigger,
     pub lock_ticks: Ticks,
     pub lock_resets_max: u32,
     /// 软降速度；横向 DAS/ARR 属于有头客户端输入时序，不在规则集内。
@@ -384,6 +431,9 @@ impl Default for Ruleset {
     fn default() -> Self {
         Ruleset {
             preview: 6,
+            irs: true,
+            ihs: true,
+            initial_trigger: InitialTrigger::Either,
             lock_ticks: 500 * TMS,
             lock_resets_max: 15,
             soft_milli_per_sec: 60_000,
