@@ -127,6 +127,85 @@ struct NetStats {
 }
 
 #[derive(Resource)]
+struct HudMetrics {
+    /// 当前刷新窗口内的最小 FPS
+    fps_min: f32,
+    fps_frames: u32,
+    /// 已刷新的 FPS
+    shown_fps: f32,
+    /// 当前刷新窗口内的最小 TPS
+    tps_min: f32,
+    tps_ticks: u32,
+    shown_tps: f32,
+    last_tick_n: u64,
+}
+
+impl Default for HudMetrics {
+    fn default() -> Self {
+        Self {
+            fps_min: f32::MAX,
+            fps_frames: 0,
+            shown_fps: 0.0,
+            tps_min: f32::MAX,
+            tps_ticks: 0,
+            shown_tps: 0.0,
+            last_tick_n: 0,
+        }
+    }
+}
+
+/// HUD 指标刷新率（M）：每 K 帧刷新一次，K = floor(R / M)
+const DISPLAY_HZ: f32 = 5.0;
+const HUD_DEFAULT: Color = Color::srgb(0.65, 0.70, 0.80);
+const HUD_YELLOW: Color = Color::srgb(0.95, 0.85, 0.20);
+const HUD_ORANGE: Color = Color::srgb(0.95, 0.60, 0.20);
+const HUD_RED: Color = Color::srgb(0.95, 0.35, 0.35);
+
+fn lat_color(ms: u32) -> Color {
+    if ms > 33 {
+        HUD_RED
+    } else if ms > 16 {
+        HUD_YELLOW
+    } else {
+        HUD_DEFAULT
+    }
+}
+
+fn loss_color(pct: u32) -> Color {
+    if pct > 1 {
+        HUD_RED
+    } else if pct > 0 {
+        HUD_YELLOW
+    } else {
+        HUD_DEFAULT
+    }
+}
+
+fn tps_color(tps: f32) -> Color {
+    if tps < 40.0 {
+        HUD_RED
+    } else if tps < 50.0 {
+        HUD_ORANGE
+    } else if tps < 55.0 {
+        HUD_YELLOW
+    } else {
+        HUD_DEFAULT
+    }
+}
+
+fn fps_color(fps: f32) -> Color {
+    if fps < 30.0 {
+        HUD_RED
+    } else if fps < 50.0 {
+        HUD_ORANGE
+    } else if fps < 60.0 {
+        HUD_YELLOW
+    } else {
+        HUD_DEFAULT
+    }
+}
+
+#[derive(Resource)]
 enum Session {
     Local { engine: Match, bots: Vec<Option<BotAdapter>> },
     Net {
@@ -216,9 +295,12 @@ struct Views {
     dbg_top: Entity,
     dbg_top_bg: Entity,
     dbg_bot: Entity,
-    /// 左下行拆两段：状态（Connected 绿 / Disconnected 红）+ 其余（固定哑色）
+    /// 左下行拆段：状态 + Lat/Loss/TPS/FPS 各自独立着色
     dbg_bot_status: Entity,
-    dbg_bot_rest: Entity,
+    dbg_lat: Entity,
+    dbg_loss: Entity,
+    dbg_tps: Entity,
+    dbg_fps: Entity,
     dbg_bot_bg: Entity,
 }
 
@@ -453,7 +535,7 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
             bevy::sprite::Anchor::TopLeft,
         ))
         .id();
-    // 左下行 = 根（空）+ 两个 span：状态（变色）与其余（哑色），同一行内自动连续排布
+    // 左下行 = 根（空）+ 5 个 span：状态 + Lat/Loss/TPS/FPS（数值各自着色）
     let dbg_bot = cmd
         .spawn((
             Text2d::new(""),
@@ -463,6 +545,14 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
             bevy::sprite::Anchor::BottomLeft,
         ))
         .id();
+    let dbg_span = |cmd: &mut Commands, text: &str| {
+        cmd.spawn((
+            TextSpan::new(text),
+            TextFont { font: font.clone(), font_size: 15.0, ..default() },
+            TextColor(HUD_DEFAULT),
+        ))
+        .id()
+    };
     let dbg_bot_status = cmd
         .spawn((
             TextSpan::new(""),
@@ -470,18 +560,16 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
             TextColor(Color::srgb(0.30, 0.90, 0.45)),
         ))
         .id();
-    let dbg_bot_rest = cmd
-        .spawn((
-            TextSpan::new(""),
-            TextFont { font: font.clone(), font_size: 15.0, ..default() },
-            TextColor(Color::srgb(0.75, 0.78, 0.82)),
-        ))
-        .id();
-    cmd.entity(dbg_bot).add_children(&[dbg_bot_status, dbg_bot_rest]);
+    let dbg_lat = dbg_span(&mut cmd, "");
+    let dbg_loss = dbg_span(&mut cmd, "");
+    let dbg_tps = dbg_span(&mut cmd, "");
+    let dbg_fps = dbg_span(&mut cmd, "");
+    cmd.entity(dbg_bot)
+        .add_children(&[dbg_bot_status, dbg_lat, dbg_loss, dbg_tps, dbg_fps]);
     cmd.insert_resource(Views {
         cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge,
         judge_num, judge_sub, judge_sub_num, death_mask, death_rank,
-        dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_bot_rest, dbg_bot_bg,
+        dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_lat, dbg_loss, dbg_tps, dbg_fps, dbg_bot_bg,
     });
     cmd.insert_resource(Thumbs::default());
     cmd.insert_resource(PrevPiece { pieces: 0, y_milli: 0 });
@@ -1194,7 +1282,8 @@ fn set_span(q: &mut Query<&mut TextSpan>, e: Entity, s: String) {
 /// 状态单独着色（Connected 绿 / Disconnected 红 / 本地 Local 哑色），其余恒为哑色。
 fn set_debug_hud_text(
     session: &Session,
-    fps: f32,
+    shown_fps: f32,
+    shown_tps: f32,
     text_q: &mut Query<&mut Text2d>,
     span_q: &mut Query<&mut TextSpan>,
     color_q: &mut Query<&mut TextColor>,
@@ -1204,33 +1293,51 @@ fn set_debug_hud_text(
         Session::Net { stats, .. } => Some(stats.lock().unwrap().clone()),
         Session::Local { .. } => None,
     };
-    let (top_txt, status, status_col, rest_txt) = match stat {
+    let set = |span_q: &mut Query<&mut TextSpan>,
+               color_q: &mut Query<&mut TextColor>,
+               e: Entity,
+               s: String,
+               c: Color| {
+        set_span(span_q, e, s);
+        if let Ok(mut tc) = color_q.get_mut(e) {
+            tc.0 = c;
+        }
+    };
+    set_text(text_q, views.dbg_bot, String::new());
+    match stat {
         Some(st) => {
             let pid = if st.player_id.is_empty() { "(observer)".to_string() } else { st.player_id };
             let mid = if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) };
-            let top_txt = format!("PlayerID {pid} | MatchID {mid}");
+            set_text(text_q, views.dbg_top, format!("PlayerID {pid} | MatchID {mid}"));
             let status = if st.connected { "Connected" } else { "Disconnected" };
-            let status_col = if st.connected { Color::srgb(0.30, 0.90, 0.45) } else { Color::srgb(0.95, 0.35, 0.35) };
-            let rest_txt = if st.connected {
-                format!(" | Lat {}ms | Loss {}% | TPS {:.2} | FPS {:.0}", st.rtt_ms, st.loss_pct, st.server_tps, fps)
+            let status_col = if st.connected { Color::srgb(0.30, 0.90, 0.45) } else { HUD_RED };
+            if let Ok(mut tc) = color_q.get_mut(views.dbg_bot_status) {
+                tc.0 = status_col;
+            }
+            set_span(span_q, views.dbg_bot_status, status.to_string());
+            if st.connected {
+                set(span_q, color_q, views.dbg_lat, format!(" | Lat {}ms", st.rtt_ms), lat_color(st.rtt_ms));
+                set(span_q, color_q, views.dbg_loss, format!(" | Loss {}%", st.loss_pct), loss_color(st.loss_pct));
+                set(span_q, color_q, views.dbg_tps, format!(" | TPS {:.2}", shown_tps), tps_color(shown_tps));
+                set(span_q, color_q, views.dbg_fps, format!(" | FPS {:.0}", shown_fps), fps_color(shown_fps));
             } else {
-                format!(" | Lat - | Loss - | TPS - | FPS {:.0}", fps)
-            };
-            (top_txt, status.to_string(), status_col, rest_txt)
+                set(span_q, color_q, views.dbg_lat, " | Lat - | Loss - | TPS -".into(), HUD_DEFAULT);
+                set(span_q, color_q, views.dbg_loss, String::new(), HUD_DEFAULT);
+                set(span_q, color_q, views.dbg_tps, String::new(), HUD_DEFAULT);
+                set(span_q, color_q, views.dbg_fps, String::new(), HUD_DEFAULT);
+            }
         }
-        None => (
-            "PlayerID local | MatchID -".to_string(),
-            "Local".to_string(),
-            Color::srgb(0.55, 0.60, 0.70),
-            format!(" | FPS {:.0}", fps),
-        ),
-    };
-    set_text(text_q, views.dbg_top, top_txt);
-    set_text(text_q, views.dbg_bot, String::new());
-    set_span(span_q, views.dbg_bot_status, status);
-    set_span(span_q, views.dbg_bot_rest, rest_txt);
-    if let Ok(mut tc) = color_q.get_mut(views.dbg_bot_status) {
-        tc.0 = status_col;
+        None => {
+            set_text(text_q, views.dbg_top, "PlayerID local | MatchID -".to_string());
+            set_span(span_q, views.dbg_bot_status, "Local".to_string());
+            if let Ok(mut tc) = color_q.get_mut(views.dbg_bot_status) {
+                tc.0 = Color::srgb(0.55, 0.60, 0.70);
+            }
+            set(span_q, color_q, views.dbg_lat, String::new(), HUD_DEFAULT);
+            set(span_q, color_q, views.dbg_loss, String::new(), HUD_DEFAULT);
+            set(span_q, color_q, views.dbg_tps, String::new(), HUD_DEFAULT);
+            set(span_q, color_q, views.dbg_fps, format!(" | FPS {:.0}", shown_fps), fps_color(shown_fps));
+        }
     }
 }
 
@@ -1383,7 +1490,7 @@ fn sync(
     mut prev: ResMut<PrevPiece>,
     fixed: Res<Time<Fixed>>,
     time: Res<Time>,
-    mut fps_smooth: Local<f32>,
+    mut hud: ResMut<HudMetrics>,
     mut vq: Query<(&mut Visibility, &mut Sprite, &mut Transform)>,
     mut text_q: Query<&mut Text2d>,
     mut span_q: Query<&mut TextSpan>,
@@ -1395,11 +1502,19 @@ fn sync(
     let half_w = windows.single().map(|w| w.width() / 2.0).unwrap_or(800.0);
     let half_h = windows.single().map(|w| w.height() / 2.0).unwrap_or(450.0);
     let inst_fps = 1.0 / time.delta_secs().max(1e-6);
-    *fps_smooth = if *fps_smooth <= 0.0 {
-        inst_fps
-    } else {
-        *fps_smooth * 0.9 + inst_fps * 0.1
-    };
+    // FPS：K = floor(R / M)，窗口内取最小，满 K 帧刷新一次
+    if hud.shown_fps <= 0.0 {
+        hud.shown_fps = inst_fps;
+        hud.fps_min = inst_fps;
+    }
+    hud.fps_min = hud.fps_min.min(inst_fps);
+    hud.fps_frames += 1;
+    let k_fps = ((inst_fps / DISPLAY_HZ).floor() as u32).max(1);
+    if hud.fps_frames >= k_fps {
+        hud.shown_fps = hud.fps_min;
+        hud.fps_min = inst_fps;
+        hud.fps_frames = 0;
+    }
     let Some(s) = session.with_engine(|e, seat| e.snapshot(seat)) else {
         // 网络模式未就绪：显示连接状态
         if let Session::Net { status, .. } = &*session {
@@ -1409,10 +1524,31 @@ fn sync(
             }
         }
         // 调试 HUD 在等待/断线期同样可见（Disconnected + 横杠占位）
-        set_debug_hud_text(&session, *fps_smooth, &mut text_q, &mut span_q, &mut color_q, &views);
+        set_debug_hud_text(&session, hud.shown_fps, hud.shown_tps, &mut text_q, &mut span_q, &mut color_q, &views);
         place_debug_hud(&views, &mut vq, &mut dbg_tr.0, &dbg_tr.1, half_w, half_h);
         return;
     };
+    // TPS：只在收到新 tick 时采样，K = floor(tick_hz / M)，窗口内取最小后刷新
+    let tick_hz = session_tick_hz(&session);
+    let tps_now = match &*session {
+        Session::Net { stats, .. } => stats.lock().unwrap().server_tps,
+        _ => 0.0,
+    };
+    if s.n != hud.last_tick_n {
+        hud.last_tick_n = s.n;
+        if hud.shown_tps <= 0.0 {
+            hud.shown_tps = tps_now;
+            hud.tps_min = tps_now;
+        }
+        hud.tps_min = hud.tps_min.min(tps_now);
+        hud.tps_ticks += 1;
+        let k_tps = ((tick_hz as f32 / DISPLAY_HZ).floor() as u32).max(1);
+        if hud.tps_ticks >= k_tps {
+            hud.shown_tps = hud.tps_min;
+            hud.tps_min = tps_now;
+            hud.tps_ticks = 0;
+        }
+    }
     // 反攻模式：被本方瞄准的是全部攻击者（引擎把完整攻击分别打给每个攻击者，最多 10 人）
     let attackers_mode = s.target_mode == TargetMode::Attackers;
     // —— 己方棋盘 ——
@@ -1694,7 +1830,7 @@ fn sync(
     }
     // 调试 HUD：左上一行「玩家 ID | 对局码」，左下一行「连接状态 + 延迟/丢包/TPS/FPS」，
     // z=50/51 压在小窗网格之上，背衬条保证其在 99p 7×7 网格盖上仍可读
-    set_debug_hud_text(&session, *fps_smooth, &mut text_q, &mut span_q, &mut color_q_state, &views);
+    set_debug_hud_text(&session, hud.shown_fps, hud.shown_tps, &mut text_q, &mut span_q, &mut color_q_state, &views);
     place_debug_hud(&views, &mut vq, &mut dbg_tr.0, &dbg_tr.1, half_w, half_h);
     // 菱形高亮：当前模式金色，其余灰
     let sel = match s.target_mode {
@@ -2255,6 +2391,7 @@ fn main() {
             ..default()
         }))
         .insert_resource(Time::<Fixed>::from_hz(60.0))
+        .init_resource::<HudMetrics>()
         .insert_resource(session)
         .insert_resource(InputQueue::default())
         .insert_resource(RepeatState::default())
