@@ -82,6 +82,8 @@ pub struct ControlSection {
     pub attack: String,
     pub manual: String,
     pub attack_fallback: String,
+    /// 调试 HUD 显隐开关；默认反斜杠。
+    pub debug_hud: String,
 }
 
 impl Default for ControlSection {
@@ -100,6 +102,7 @@ impl Default for ControlSection {
             attack: "<TAB>".into(),
             manual: "arrow".into(),
             attack_fallback: "random".into(),
+            debug_hud: "\\".into(),
         }
     }
 }
@@ -765,5 +768,6 @@ seed = 0
         assert_eq!(cfg.control.arr_ticks, 2);
         assert_eq!(cfg.display.opponent_framerate, 60);
         assert!(!cfg.display.vsync);
+        assert_eq!(cfg.control.debug_hud, "\\");
     }
 }

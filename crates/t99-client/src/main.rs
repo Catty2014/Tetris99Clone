@@ -28,6 +28,11 @@ const DEFAULT_TICK_HZ: u32 = 60;
 /// ARR=0 时一次补发的最大格数（棋盘宽 10）。
 const MAX_REPEAT_PER_FRAME: usize = 10;
 const THUMB_HZ: f64 = 10.0;
+/// 攻击光点（recent_attacks 飞行动画）。暂时关闭以观察纯连线效果；
+/// 代码保留，改回 true 即可恢复。攻击连线不受影响。
+const SHOW_ATTACK_DOTS: bool = false;
+/// 观战编号输入超时：最后一键后超过该时长自动应用。
+const SPECTATE_IDLE: Duration = Duration::from_secs(3);
 const TW: f32 = 44.0; // 小窗宽（含边框）
 const TH: f32 = 88.0;
 /// 侧栏网格定位：网格外缘恒收在窗口内（半宽 800 留 12px 边距），且不贴死棋盘框
@@ -303,6 +308,8 @@ struct Views {
     dbg_tps: Entity,
     dbg_fps: Entity,
     dbg_bot_bg: Entity,
+    /// 右下调试 HUD（目标/combo/相位参数三行）的半透明背衬
+    dbg_right_bg: Entity,
     /// Next6 下方信息面板：徽章/击杀/档位/攻击加成/存活（逐帧 set_text）
     info: [Entity; 5],
     /// 被瞄警示框：与棋盘框同几何的红色描边，targeted_by 非空时亮起
@@ -360,6 +367,25 @@ struct Thumbs {
 struct PrevPiece {
     pieces: u32,
     y_milli: i64,
+}
+
+/// 调试 HUD 显隐开关（反斜杠）：左右两条调试信息一起切换。
+#[derive(Resource)]
+struct DebugHud {
+    visible: bool,
+}
+
+impl Default for DebugHud {
+    fn default() -> Self {
+        Self { visible: true }
+    }
+}
+
+/// 观战编号输入缓冲：0–9 最多两位，Enter 立即应用，静默 3 秒自动应用。
+#[derive(Resource, Default)]
+struct SpectateInput {
+    buf: String,
+    last: Option<Instant>,
 }
 
 // ———— 布局辅助 ————
@@ -573,7 +599,8 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         .spawn((
             TextSpan::new(""),
             TextFont { font: font.clone(), font_size: 16.0, ..default() },
-            TextColor(Color::WHITE),
+            // COMBO 的数字与 "COMBO" 同色；判定行的攻击力数字才是白色。
+            TextColor(Color::srgb(0.95, 0.6, 0.3)),
         ))
         .id();
     cmd.entity(judge_sub).add_children(&[judge_sub_num]);
@@ -601,6 +628,13 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     };
     let dbg_top_bg = strip_bg(&mut cmd);
     let dbg_bot_bg = strip_bg(&mut cmd);
+    // 右下调试 HUD 背衬：位置/尺寸由 place_debug_hud 按窗口右下角逐帧设定
+    let dbg_right_bg = cmd
+        .spawn((
+            Sprite::from_color(Color::srgba(0.03, 0.04, 0.06, 0.70), Vec2::new(460.0, 86.0)),
+            Transform::from_xyz(0.0, 0.0, 50.0),
+        ))
+        .id();
     let dbg_top = cmd
         .spawn((
             Text2d::new(""),
@@ -668,6 +702,7 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge,
         judge_num, judge_sub, judge_sub_num, death_mask, death_rank,
         dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_lat, dbg_loss, dbg_tps, dbg_fps, dbg_bot_bg,
+        dbg_right_bg,
         info, board_alert,
     });
     cmd.insert_resource(Thumbs {
@@ -699,6 +734,7 @@ struct Keymap {
     nav_r: Vec<KeyCode>,
     nav_u: Vec<KeyCode>,
     nav_d: Vec<KeyCode>,
+    debug_hud: Vec<KeyCode>,
 }
 
 impl Keymap {
@@ -731,6 +767,7 @@ impl Keymap {
             nav_r: nav.1,
             nav_u: nav.2,
             nav_d: nav.3,
+            debug_hud: parse_keys(&[c.debug_hud.clone()])?,
         })
     }
 
@@ -1006,6 +1043,119 @@ fn poll_input(
     }
 }
 
+/// 观战编号切换（仅 observer）：0–9 输入最多两位，Enter 立即应用，
+/// 静默 3 秒自动应用（"25" → 25，"8" → 8）。合法范围 1..=99。
+fn observer_spectate_input(
+    session: Res<Session>,
+    keys: Res<ButtonInput<KeyCode>>,
+    mut input: ResMut<SpectateInput>,
+    mut thumbs: ResMut<Thumbs>,
+) {
+    let Session::Net {
+        mirror,
+        status,
+        observer: true,
+        ..
+    } = &*session
+    else {
+        return;
+    };
+    const DIGITS: [(KeyCode, char); 20] = [
+        (KeyCode::Digit0, '0'),
+        (KeyCode::Digit1, '1'),
+        (KeyCode::Digit2, '2'),
+        (KeyCode::Digit3, '3'),
+        (KeyCode::Digit4, '4'),
+        (KeyCode::Digit5, '5'),
+        (KeyCode::Digit6, '6'),
+        (KeyCode::Digit7, '7'),
+        (KeyCode::Digit8, '8'),
+        (KeyCode::Digit9, '9'),
+        (KeyCode::Numpad0, '0'),
+        (KeyCode::Numpad1, '1'),
+        (KeyCode::Numpad2, '2'),
+        (KeyCode::Numpad3, '3'),
+        (KeyCode::Numpad4, '4'),
+        (KeyCode::Numpad5, '5'),
+        (KeyCode::Numpad6, '6'),
+        (KeyCode::Numpad7, '7'),
+        (KeyCode::Numpad8, '8'),
+        (KeyCode::Numpad9, '9'),
+    ];
+    let now = Instant::now();
+    let apply = |buf: &str,
+                 mirror: &std::sync::Mutex<MirrorState>,
+                 status: &std::sync::Mutex<String>,
+                 thumbs: &mut Thumbs| {
+        let Ok(n) = buf.parse::<u32>() else {
+            return;
+        };
+        if !(1..=99).contains(&n) {
+            return;
+        }
+        mirror.lock().unwrap().my_seat = n as usize - 1;
+        *status.lock().unwrap() = format!("观战 #{n}");
+        // 座位变了：缩略图网格必须按新视角重建
+        thumbs.n = 0;
+        thumbs.last_refresh = None;
+    };
+    // 先处理超时：旧缓冲在 3 秒无输入后生效，再开始接收新数字。
+    if !input.buf.is_empty() {
+        if let Some(last) = input.last {
+            if now.duration_since(last) >= SPECTATE_IDLE {
+                let buf = std::mem::take(&mut input.buf);
+                input.last = None;
+                apply(&buf, mirror, status, &mut thumbs);
+            }
+        }
+    }
+    for (code, digit) in DIGITS {
+        // 最多两位；第三位忽略，等待 Enter 或超时。
+        if keys.just_pressed(code) && input.buf.len() < 2 {
+            input.buf.push(digit);
+            input.last = Some(now);
+        }
+    }
+    if keys.just_pressed(KeyCode::Enter) && !input.buf.is_empty() {
+        let buf = std::mem::take(&mut input.buf);
+        input.last = None;
+        apply(&buf, mirror, status, &mut thumbs);
+    }
+}
+
+/// 调试 HUD 开关：反斜杠翻转左右两条调试信息的显示。
+fn toggle_debug_hud(
+    keys: Res<ButtonInput<KeyCode>>,
+    keymap: Res<Keymap>,
+    mut dbg: ResMut<DebugHud>,
+    views: Res<Views>,
+    mut vq: Query<&mut Visibility>,
+) {
+    if !keymap.debug_hud.iter().any(|k| keys.just_pressed(*k)) {
+        return;
+    }
+    dbg.visible = !dbg.visible;
+    let vis = if dbg.visible {
+        Visibility::Visible
+    } else {
+        Visibility::Hidden
+    };
+    for e in [
+        views.dbg_top,
+        views.dbg_top_bg,
+        views.dbg_bot,
+        views.dbg_bot_bg,
+        views.hud[3],
+        views.hud[4],
+        views.hud[7],
+        views.dbg_right_bg,
+    ] {
+        if let Ok(mut v) = vq.get_mut(e) {
+            *v = vis;
+        }
+    }
+}
+
 /// 返回本帧应补发的离散方向事件；不直接碰 Bevy，便于单测。
 fn repeat_keys(
     state: &mut RepeatState,
@@ -1138,8 +1288,10 @@ mod repeat_tests {
         assert_eq!(m.rot_ccw, vec![KeyCode::KeyZ, KeyCode::ControlLeft]);
         assert_eq!(m.hold, vec![KeyCode::KeyC, KeyCode::ShiftLeft]);
         assert_eq!(m.nav_l, vec![KeyCode::ArrowLeft]);
+        assert_eq!(m.debug_hud, vec![KeyCode::Backslash]);
         assert_eq!(parse_key("<SP>"), Some(KeyCode::Space));
         assert_eq!(parse_key("<TAB>"), Some(KeyCode::Tab));
+        assert_eq!(parse_key("\\"), Some(KeyCode::Backslash));
         assert_eq!(parse_key("a"), None);
     }
 
@@ -1471,6 +1623,11 @@ fn place_debug_hud(
             sp.custom_size = Some(Vec2::new(w, h));
             tr.translation = Vec3::new(-half_w + mx - 9.0 + w / 2.0, cy, 50.0);
         }
+    }
+    // 右下调试 HUD 背衬：覆盖「目标 / combo-b2b-G / 相位参数」三行文本（z=50，文本 z=51）
+    if let Ok((_, mut sp, mut tr)) = vq.get_mut(views.dbg_right_bg) {
+        sp.custom_size = Some(Vec2::new(460.0, 86.0));
+        tr.translation = Vec3::new(half_w - 236.0, -half_h + 68.0, 50.0);
     }
 }
 
@@ -1955,20 +2112,21 @@ fn sync(
     {
         let hud_x = half_w - 14.0;
         let spots = [
-            (views.hud[0], hud_x, 300.0), // 存活/相位
-            (views.hud[1], hud_x, 270.0), // 徽章/KO/块
-            (views.hud[2], hud_x, 240.0), // 消行/送出/APM
-            (views.hud[5], hud_x, 368.0), // 名次
+            (views.hud[0], hud_x, 300.0, 0.0), // 存活/相位
+            (views.hud[1], hud_x, 270.0, 0.0), // 徽章/KO/块
+            (views.hud[2], hud_x, 240.0, 0.0), // 消行/送出/APM
+            (views.hud[5], hud_x, 368.0, 0.0), // 名次
             // 倒计时：主棋盘正上方水平居中（不与 judge/judge_sub/标题重叠）
-            (views.hud[6], 0.0, 342.0),
+            (views.hud[6], 0.0, 342.0, 0.0),
             // 调试堆：目标 / combo-b2b-G / 相位参数 → 右下角（BottomRight 锚定）
-            (views.hud[3], hud_x, -half_h + 40.0),
-            (views.hud[4], hud_x, -half_h + 64.0),
-            (views.hud[7], hud_x, -half_h + 86.0),
+            // z=51：压在 dbg_right_bg（z=50）之上
+            (views.hud[3], hud_x, -half_h + 40.0, 51.0),
+            (views.hud[4], hud_x, -half_h + 64.0, 51.0),
+            (views.hud[7], hud_x, -half_h + 86.0, 51.0),
         ];
-        for (e, x, y) in spots {
+        for (e, x, y, z) in spots {
             if let Ok(mut tr) = dbg_tr.0.get_mut(e) {
-                tr.translation = Vec3::new(x, y, 0.0);
+                tr.translation = Vec3::new(x, y, z);
             }
         }
     }
@@ -2156,7 +2314,8 @@ fn sync(
     }
     // —— 攻击光点：每 tick 的 recent_attacks 生成 0.3s 飞行淡出光点；按 tick 号去重，
     // 池化复用（不 spawn/despawn），无事件时槽位保持隐藏。——
-    {
+    // SHOW_ATTACK_DOTS=false 时只隐藏、不采样（代码保留，改常量即可恢复）。
+    if SHOW_ATTACK_DOTS {
         let now = Instant::now();
         let evs: Vec<AttackEvent> =
             session.with_engine(|e, _| e.recent_attacks().to_vec()).unwrap_or_default();
@@ -2215,6 +2374,9 @@ fn sync(
                 tr.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
             }
         }
+    } else {
+        thumbs.slots.iter_mut().for_each(|slot| *slot = None);
+        hide(&mut vq, &thumbs.atk_dots);
     }
 }
 
@@ -2656,8 +2818,13 @@ fn main() {
         .insert_resource(timing)
         .insert_resource(display)
         .insert_resource(keymap)
+        .init_resource::<DebugHud>()
+        .init_resource::<SpectateInput>()
         .add_systems(Startup, (load_ui_font, setup).chain())
-        .add_systems(Update, (sync_tick_rate, poll_input, sync).chain())
+        .add_systems(
+            Update,
+            (sync_tick_rate, poll_input, observer_spectate_input, toggle_debug_hud, sync).chain(),
+        )
         .add_systems(FixedUpdate, tick)
         .run();
 }

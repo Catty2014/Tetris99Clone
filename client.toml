@@ -42,6 +42,7 @@ hold = ["C", "<L-S>"]
 attack = "<TAB>"
 manual = "arrow"            # arrow / wasd; only affects manual target selection
 attack_fallback = "random"  # ko / random / badge / attacker
+debug_hud = "\\"            # 调试 HUD 显隐开关（反斜杠）
 
 [display]
 # Competitive default: uncapped for lowest input latency. 2D rendering is cheap;
