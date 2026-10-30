@@ -64,8 +64,19 @@ pub struct ClearView {
     pub spin: u8,
     pub all_clear: bool,
     pub b2b: bool,
+    /// 经过加算、徽章乘算与 cap 后的最终攻击力
+    pub attack: u32,
     /// 判定发生的帧号（客户端按 <1s 显示窗口过滤）
     pub frame: u64,
+}
+
+/// 待进垃圾批次视图（客户端分组显示用）
+#[derive(Clone, Debug)]
+pub struct GarbView {
+    pub sender: usize,
+    pub rows: u32,
+    /// 0=灰(排队) 1=黄(计时) 2=红(即将)
+    pub state: u8,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -104,6 +115,8 @@ pub struct Snapshot {
     pub garbage_red: u32,
     pub garbage_yellow: u32,
     pub garbage_gray: u32,
+    /// 按待进顺序排列的垃圾批次（跳过空批次）
+    pub garbage_batches: Vec<GarbView>,
     /// 消行延迟中正在闪烁的行（可见区行号）
     pub clearing: Vec<usize>,
     pub badges: u32,
@@ -386,6 +399,8 @@ pub struct Match {
     last_death_frame: Option<u64>,
     /// 对局倒计时剩余（tick），归零按排序键终局
     match_ticks_left: Ticks,
+    /// 本局总时长（tick），用于受击递增计算
+    pub match_total_ticks: Ticks,
     /// 参考局：强制所有玩家随机锁敌，忽略目标键
     pub force_random_target: bool,
     /// 强制目标策略（优先级高于 force_random_target 与一切目标键）
@@ -468,6 +483,7 @@ impl Match {
             phase_ticks: 0,
             last_death_frame: None,
             match_ticks_left,
+            match_total_ticks: match_ticks_left,
             force_random_target: false,
             force_policy: None,
         };
@@ -1639,6 +1655,9 @@ impl Match {
         let tb = self.cfg.ruleset.target_bonus[attackers.min(6)];
         let ac = if allclear { 4 } else { 0 };
         let subtotal = base + b2b_bonus + cb + tb + ac;
+        let tier = self.badge_tier(pid);
+        let cap = self.cfg.ruleset.send_cap_rows;
+        let total = ((subtotal * (100 + 25 * tier)) / 100).min(cap);
         if n > 0 {
             let p = &mut self.players[pid];
             p.last_clear = Some(ClearView {
@@ -1646,12 +1665,10 @@ impl Match {
                 spin: spin as u8,
                 all_clear: allclear,
                 b2b: b2b_bonus > 0,
+                attack: total,
                 frame: self.frame_n,
             });
         }
-        let tier = self.badge_tier(pid);
-        let cap = self.cfg.ruleset.send_cap_rows;
-        let total = ((subtotal * (100 + 25 * tier)) / 100).min(cap);
         // T99 阻挡规则（wiki：有暂缓垃圾行时，攻击全部用于阻挡；只有没有暂缓垃圾时才能发送）：
         // 攻击值（含 B2B/连击/徽章倍率）先抵扣暂缓队列，队列清空后的剩余攻击才发给别人。
         let pending_rows: u32 = self.players[pid].pending.iter().map(|g| g.rows).sum();
@@ -1679,6 +1696,8 @@ impl Match {
                 overflow += sent_rows;
             }
             for (rid, rows) in recv {
+                // 受击递增只影响实际收到的垃圾，不影响阻挡/抵消
+                let rows = rows.saturating_add(self.garbage_bonus());
                 let have: u32 = self.players[rid].pending.iter().map(|g| g.rows).sum();
                 let room = self.cfg.ruleset.pending_cap_rows.saturating_sub(have);
                 let accepted = rows.min(room);
@@ -1914,6 +1933,18 @@ impl Match {
         self.alive_count
     }
 
+    /// 从预定时间 66.66% 起，每 3.33% 所有玩家受到的垃圾行 +1。
+    pub fn garbage_bonus(&self) -> u32 {
+        let total = self.match_total_ticks.max(1);
+        let elapsed = (self.match_total_ticks - self.match_ticks_left).max(0);
+        let start = total * 2 / 3;
+        if elapsed < start {
+            return 0;
+        }
+        let step = (total / 30).max(1);
+        1 + ((elapsed - start) / step) as u32
+    }
+
     pub fn snapshot(&self, pid: usize) -> Snapshot {
         let p = &self.players[pid];
         let pid_field = pid;
@@ -1940,6 +1971,12 @@ impl Match {
                 (GarbState::Gray, _) => garbage_gray += g.rows,
             }
         }
+        let garbage_batches: Vec<GarbView> = p
+            .pending
+            .iter()
+            .filter(|g| g.rows > 0)
+            .map(|g| GarbView { sender: g.sender, rows: g.rows, state: g.state.tag() })
+            .collect();
         Snapshot {
             n: self.frame_n,
             board,
@@ -1953,6 +1990,7 @@ impl Match {
             garbage_red,
             garbage_yellow,
             garbage_gray,
+            garbage_batches,
             clearing: p.clearing_rows.iter().map(|&r| r as isize - HIDDEN as isize).filter(|&r| r >= 0).map(|r| r as usize).collect(),
             badges: self.badge_tier(pid),
             badge_units: p.badges,
@@ -2735,6 +2773,46 @@ mod tests {
         assert_eq!(a.0, b.0);
         assert_eq!(a.1.map(|r| (r.frame, r.places)), b.1.map(|r| (r.frame, r.places)));
         assert_ne!(a.0, c.0);
+    }
+
+    #[test]
+    fn garbage_bonus_ramps_after_two_thirds() {
+        let total = 900 * 1000 * TMS;
+        let mut m = Match::new(MatchConfig {
+            players: 2,
+            seed: 9,
+            ruleset: Ruleset { match_ticks: total, ..Default::default() },
+        });
+        assert_eq!(m.match_total_ticks, total);
+        let mut at = |secs: i64| {
+            m.match_ticks_left = total - secs * 1000 * TMS;
+            m.garbage_bonus()
+        };
+        assert_eq!(at(599), 0, "600s 前无加成");
+        assert_eq!(at(600), 1);
+        assert_eq!(at(630), 2);
+        assert_eq!(at(720), 5);
+        assert_eq!(at(900), 11);
+    }
+
+    #[test]
+    fn snapshot_garbage_batches_follow_pending_order() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 9, ruleset: Ruleset::default() });
+        {
+            let p = &mut m.players[0];
+            p.pending.push(Garb { rows: 2, sender: 1, state: GarbState::Gray });
+            p.pending.push(Garb { rows: 0, sender: 2, state: GarbState::Yellow(1200 * TMS) });
+            p.pending.push(Garb { rows: 3, sender: 2, state: GarbState::Yellow(1200 * TMS) });
+            p.pending.push(Garb { rows: 4, sender: 1, state: GarbState::Red(0) });
+        }
+        let s = m.snapshot(0);
+        let got: Vec<(usize, u32, u8)> =
+            s.garbage_batches.iter().map(|g| (g.sender, g.rows, g.state)).collect();
+        assert_eq!(got, vec![(1, 2, 0), (2, 3, 1), (1, 4, 2)]);
+        // 总数统计保持原语义（队首 Gray 计入黄）
+        assert_eq!(s.garbage_yellow, 5);
+        assert_eq!(s.garbage_red, 4);
+        assert_eq!(s.garbage_gray, 0);
     }
 
     #[test]

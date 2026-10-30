@@ -204,7 +204,14 @@ struct Views {
     diamond: [Entity; 4],
     diamond_center: Entity,
     judge: Entity,
+    /// 判定种类文字后的白色最终攻击力（Text2d 根 + 子 span 着色）
+    judge_num: Entity,
     judge_sub: Entity,
+    /// COMBO 行的白色连击数（子 span）
+    judge_sub_num: Entity,
+    /// 中央棋盘死亡蒙版（与缩略图同款灰蒙，只盖棋盘本体）
+    death_mask: Entity,
+    death_rank: Entity,
     /// 调试 HUD：左上一行（玩家/对局码），左下一行（连接状态行）。bg = 深色背衬条（文字底）
     dbg_top: Entity,
     dbg_top_bg: Entity,
@@ -325,8 +332,9 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     ));
     let hold = spawn_grid(&mut cmd, Vec2::new(-226.0, 240.0), 20.0, 4, 2, 0.0);
     let next = spawn_grid(&mut cmd, Vec2::new(190.0, 119.0), 16.0, 4, 18, 0.0);
-    // 垃圾条单列堆叠：红(即将进场)在下，黄(计时)其上，灰(排队)顶层
-    let meter = spawn_grid(&mut cmd, Vec2::new(-159.0, -4.0), 20.0, 1, H, 0.0);
+    // 垃圾条单列堆叠：红(即将进场)在下，黄(计时)其上，灰(排队)顶层。
+    // 预铺 72 格：sync 按 garbage_batches 分组摆位（批间 3 倍行距），超高时压缩行距。
+    let meter = spawn_grid(&mut cmd, Vec2::new(-159.0, -4.0), 20.0, 1, 72, 0.0);
 
     // 分区框与标题（界定区域 + 辅助文字）。
     // 对齐：保存/对战盘/预览上沿取齐（+270）；垃圾下沿与对战盘下沿取齐（-270）；
@@ -363,8 +371,8 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         e
     });
     hud.push({
-        let e = text(&mut cmd, &font, "", 24.0, Color::srgb(0.65, 0.7, 0.8), Vec2::new(345.0, 370.0));
-        cmd.entity(e).insert(bevy::sprite::Anchor::CenterRight);
+        // 对局倒计时：主棋盘正上方水平居中（sync 逐帧摆位），默认 Center 锚
+        let e = text(&mut cmd, &font, "", 24.0, Color::srgb(0.65, 0.7, 0.8), Vec2::new(0.0, 342.0));
         e
     });
     hud.push({
@@ -392,9 +400,39 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     ];
     let diamond_center = text(&mut cmd, &font, "◆", 20.0, dm, Vec2::new(0.0, -344.0));
     let _ = ds;
-    // 判定弹出文字（消行判定 + COMBO）
+    // 判定弹出文字（消行判定 + COMBO）：种类后跟白色最终攻击力 / 白色连击数。
+    // 根 span 颜色照旧，子 span（数字）固定白色；Text2d 根 + TextSpan 子节点。
     let judge = text(&mut cmd, &font, "", 26.0, Color::srgb(0.98, 0.85, 0.35), Vec2::new(0.0, 300.0));
+    let judge_num = cmd
+        .spawn((
+            TextSpan::new(""),
+            TextFont { font: font.clone(), font_size: 26.0, ..default() },
+            TextColor(Color::WHITE),
+        ))
+        .id();
+    cmd.entity(judge).add_children(&[judge_num]);
     let judge_sub = text(&mut cmd, &font, "", 16.0, Color::srgb(0.95, 0.6, 0.3), Vec2::new(0.0, 268.0));
+    let judge_sub_num = cmd
+        .spawn((
+            TextSpan::new(""),
+            TextFont { font: font.clone(), font_size: 16.0, ..default() },
+            TextColor(Color::WHITE),
+        ))
+        .id();
+    cmd.entity(judge_sub).add_children(&[judge_sub_num]);
+    // 中央棋盘死亡蒙版：与缩略图同款灰蒙，只盖棋盘本体（不盖垃圾条/Next/目标面板/调试 HUD）
+    let death_mask = cmd
+        .spawn((
+            Sprite::from_color(
+                Color::srgba(0.45, 0.45, 0.5, 0.65),
+                Vec2::new(W as f32 * CELL + 10.0, H as f32 * CELL + 10.0),
+            ),
+            Transform::from_xyz(0.0, 0.0, 2.5),
+            Visibility::Hidden,
+        ))
+        .id();
+    // 名次 #N 显示在蒙版中央（z=3 压在蒙版 z=2.5 之上）
+    let death_rank = text(&mut cmd, &font, "", 44.0, Color::srgb(0.92, 0.92, 0.95), Vec2::new(0.0, 0.0));
     // 调试 HUD：左上一行（玩家/对局码）+ 左下一行（连接状态），深色半透明背衬条压条
     // 文本 z=51、背衬 z=50，压在 99p 小窗网格（z≤3）之上；不折行，紧贴窗口边角
     let strip_bg = |cmd: &mut Commands| {
@@ -441,7 +479,8 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         .id();
     cmd.entity(dbg_bot).add_children(&[dbg_bot_status, dbg_bot_rest]);
     cmd.insert_resource(Views {
-        cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge, judge_sub,
+        cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge,
+        judge_num, judge_sub, judge_sub_num, death_mask, death_rank,
         dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_bot_rest, dbg_bot_bg,
     });
     cmd.insert_resource(Thumbs::default());
@@ -1444,19 +1483,65 @@ fn sync(
             (s.n as i64 * 16666 / 1000) % cycle < stage_ms
         })
         .unwrap_or(true);
-    show_grid(&mut vq, &views.meter, 1, &|r, _| {
-        let idx = (H - 1 - r) as u32;
-        if idx < s.garbage_red {
-            // 红闪方块始终存在：亮红/暗红交替，不再整格隐藏
-            Some(if red_on { 5 } else { 9 })
-        } else if idx < s.garbage_red + s.garbage_yellow {
-            Some(2)
-        } else if idx < s.garbage_red + s.garbage_yellow + s.garbage_gray {
-            Some(8)
-        } else {
-            None
+    // 垃圾条按批次分组摆位：同一 sender 的连续条目相邻（普通行距），
+    // 不同批之间的空档 = 3 倍行距；队首（红，即将进场）贴棋盘在下，灰(排队)在顶。
+    // 批次总高超出列框时整体等比压缩行距（方块随之缩小），全部保持可见。
+    {
+        let batches = &s.garbage_batches;
+        let rows_total: u32 = batches.iter().map(|g| g.rows).sum();
+        let gaps = batches
+            .iter()
+            .zip(batches.iter().skip(1))
+            .filter(|(a, b)| a.sender != b.sender)
+            .count();
+        let base = 20.0; // 普通行距（与方块间距一致）
+        // 行距数量：批内每格 1 个，批界因 3 倍空档多出 2 个；列框内可用 398px（y∈[-198, 200]）
+        let need_units = (rows_total.max(1) as f32 - 1.0) + 2.0 * gaps as f32;
+        let scale = ((398.0 / base) / need_units.max(1.0)).min(1.0);
+        let pitch = base * scale;
+        let cell_size = (base * scale - 1.0).max(5.0);
+        let mut y = -198.0;
+        let mut prev_sender: Option<usize> = None;
+        let mut used = 0usize;
+        for g in batches.iter() {
+            if let Some(ps) = prev_sender {
+                if ps != g.sender {
+                    // 批界：总步距 3 × 行距（比普通相邻多 2 个行距）
+                    y += 2.0 * pitch;
+                }
+            }
+            prev_sender = Some(g.sender);
+            let col = match g.state {
+                2 => {
+                    // 红闪：与旧 red/yellow 相同的亮暗交替
+                    if red_on {
+                        5
+                    } else {
+                        9
+                    }
+                }
+                1 => 2,
+                _ => 8,
+            };
+            for _ in 0..g.rows {
+                if used >= views.meter.len() {
+                    break;
+                }
+                if let Ok((mut v, mut sp, mut tr)) = vq.get_mut(views.meter[used]) {
+                    *v = Visibility::Visible;
+                    sp.color = kind_color(col);
+                    sp.custom_size = Some(Vec2::splat(cell_size));
+                    tr.translation = Vec3::new(-159.0, y, 0.0);
+                }
+                used += 1;
+                y += pitch;
+            }
+            if used >= views.meter.len() {
+                break;
+            }
         }
-    });
+        hide(&mut vq, &views.meter[used..]);
+    }
     // —— HUD ——
     set_text(&mut text_q, views.hud[0], format!("存活 {}/{} 相位{}", s.alive.len(), session.with_engine(|e, _| e.players.len()).unwrap_or(0), session.with_engine(|e, _| e.phase_idx + 1).unwrap_or(1)));
     set_text(&mut text_q, views.hud[1], format!("徽章{} KO{} 块{}", s.badge_units, s.ko, s.pieces));
@@ -1506,6 +1591,19 @@ fn sync(
         String::new()
     };
     set_text(&mut text_q, views.hud[5], place_str);
+    // 中央棋盘死亡蒙版 + 名次（蒙版只盖棋盘本体；垃圾条/Next/目标面板/调试 HUD 均在外）
+    if let Ok((mut v, _, _)) = vq.get_mut(views.death_mask) {
+        *v = if s.alive_self { Visibility::Hidden } else { Visibility::Visible };
+    }
+    set_text(
+        &mut text_q,
+        views.death_rank,
+        if s.alive_self {
+            String::new()
+        } else {
+            s.place.map(|p| format!("#{p}")).unwrap_or_default()
+        },
+    );
     // 对局倒计时（0 杀加速时显示倍率并变红）
     let cd = if s.burn_x10 > 10 {
         format!("{}:{:02} ×{:.1}", s.match_secs_left / 60, s.match_secs_left % 60, s.burn_x10 as f32 / 10.0)
@@ -1534,35 +1632,45 @@ fn sync(
         })
         .unwrap_or_default();
     set_text(&mut text_q, views.hud[7], params);
-    // 判定弹出：最近消行 1s 内显示，COMBO 在下方；新判定直接替换。
-    // 普通消 1（无旋转/全消/B2B 且无连击）不弹。
+    // 判定弹出：最近消行 1s 内显示（按 last_clear.frame 过滤），COMBO 在下方；新判定直接替换。
+    // 普通消 1（无旋转/全消/B2B 且无连击）不弹。种类后的数字 = 最终攻击力（已加算/徽章/cap20）。
     let mut judge_txt = String::new();
+    let mut judge_num_txt = String::new();
     let mut combo_txt = String::new();
+    let mut combo_num_txt = String::new();
     if let Some(lc) = &s.last_clear {
         if s.n.saturating_sub(lc.frame) < 60 {
             let plain_single = lc.spin == 0 && lc.lines == 1 && !lc.all_clear && !lc.b2b && s.combo < 1;
             if !plain_single {
                 let name = match (lc.spin, lc.lines) {
-                    (2, 1) => "T-Spin Single".to_string(),
-                    (2, 2) => "T-Spin Double".to_string(),
-                    (2, 3) => "T-Spin Triple".to_string(),
-                    (2, _) => "T-Spin".to_string(),
-                    (1, 1) => "T-Spin Mini Single".to_string(),
-                    (1, 2) => "T-Spin Mini Double".to_string(),
-                    (1, _) => "T-Spin Mini".to_string(),
-                    (_, 4) => "Tetris".to_string(),
+                    (2, 1) => "T-SPIN SINGLE".to_string(),
+                    (2, 2) => "T-SPIN DOUBLE".to_string(),
+                    (2, 3) => "T-SPIN TRIPLE".to_string(),
+                    (2, _) => "T-SPIN".to_string(),
+                    (1, 1) => "MINI SINGLE".to_string(),
+                    (1, 2) => "MINI DOUBLE".to_string(),
+                    (1, _) => "MINI".to_string(),
+                    (_, 1) => "SINGLE".to_string(),
+                    (_, 2) => "DOUBLE".to_string(),
+                    (_, 3) => "TRIPLE".to_string(),
+                    (_, 4) => "TETRIS".to_string(),
                     (_, k) => format!("消{k}"),
                 };
-                let name = if lc.all_clear { "Clear".to_string() } else { name };
-                judge_txt = if lc.b2b { format!("B2B {name}") } else { name };
+                let name = if lc.all_clear { "PERFECT CLEAR".to_string() } else { name };
+                // 尾缀空格：白色攻击力数字以子 span 接在种类后
+                judge_txt = if lc.b2b { format!("B2B {name} ") } else { format!("{name} ") };
+                judge_num_txt = lc.attack.to_string();
                 if s.combo >= 1 {
-                    combo_txt = format!("{} COMBO", s.combo);
+                    combo_txt = "COMBO ".to_string();
+                    combo_num_txt = s.combo.to_string();
                 }
             }
         }
     }
     set_text(&mut text_q, views.judge, judge_txt);
+    set_span(&mut span_q, views.judge_num, judge_num_txt);
     set_text(&mut text_q, views.judge_sub, combo_txt);
+    set_span(&mut span_q, views.judge_sub_num, combo_num_txt);
     // HUD 列：贴窗口右缘（窗口自适应）；调试堆移右下角
     {
         let hud_x = half_w - 14.0;
@@ -1571,7 +1679,8 @@ fn sync(
             (views.hud[1], hud_x, 270.0), // 徽章/KO/块
             (views.hud[2], hud_x, 240.0), // 消行/送出/APM
             (views.hud[5], hud_x, 368.0), // 名次
-            (views.hud[6], hud_x, 336.0), // 倒计时
+            // 倒计时：主棋盘正上方水平居中（不与 judge/judge_sub/标题重叠）
+            (views.hud[6], 0.0, 342.0),
             // 调试堆：目标 / combo-b2b-G / 相位参数 → 右下角（BottomRight 锚定）
             (views.hud[3], hud_x, -half_h + 40.0),
             (views.hud[4], hud_x, -half_h + 64.0),
