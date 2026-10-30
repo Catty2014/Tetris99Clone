@@ -20,6 +20,10 @@ pub const MILLI: i64 = 1000;
 /// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况不受此限。
 pub const TARGET_DWELL_FRAMES: u64 = 30;
 
+/// 服务端 ARRCheck 要求同方向横向移动的最小间隔（帧），对应 ruleset 的 `arr_ticks`
+/// （默认 2，见 t99-core `Ruleset::arr_ticks`）。左右共用一个计时，反向也多等一帧。
+pub const ARR_FRAMES: u64 = 2;
+
 /// 服务器 hello.protocol
 pub const PROTOCOL_MIN: u32 = 5;
 pub const PROTOCOL_MAX: u32 = 8;
@@ -1130,6 +1134,8 @@ pub struct Brain {
     soft_held: bool,
     last_mode: Option<Ev>,
     frames: u64,
+    /// 上次发出横向移动（LeftDown/RightDown）所在帧，ARR 节流用
+    last_move_frame: u64,
     /// 上次目标切换（或首次评估）所在帧
     last_switch: u64,
     pub t_spins: u32,
@@ -1218,6 +1224,7 @@ impl Brain {
             soft_held: false,
             last_mode: None,
             frames: 0,
+            last_move_frame: 0,
             last_switch: 0,
             t_spins: 0,
             blocked: vec![],
@@ -1394,16 +1401,19 @@ impl Brain {
         let first = path[0];
         let reaches_goal = path.len() == 1 && hard_on_goal;
         match first {
-            Mv::L => {
-                let mut evs = vec![(0, Ev::LeftDown), (700, Ev::LeftUp)];
-                if reaches_goal {
-                    evs.push((2000, Ev::Hard));
-                    self.plan = None;
+            Mv::L | Mv::R => {
+                // ARR 节流：同向（按简化口径，任意方向）移动间隔不足时本帧不发移动。
+                // 不丢 plan、不碰 soft_hold 状态，下帧继续走同一步。
+                if self.frames.saturating_sub(self.last_move_frame) < ARR_FRAMES {
+                    return Act { evs: vec![], soft_hold: self.soft_held };
                 }
-                Act { evs, soft_hold: false }
-            }
-            Mv::R => {
-                let mut evs = vec![(0, Ev::RightDown), (700, Ev::RightUp)];
+                self.last_move_frame = self.frames;
+                let (down, up) = if first == Mv::L {
+                    (Ev::LeftDown, Ev::LeftUp)
+                } else {
+                    (Ev::RightDown, Ev::RightUp)
+                };
+                let mut evs = vec![(0, down), (700, up)];
                 if reaches_goal {
                     evs.push((2000, Ev::Hard));
                     self.plan = None;

@@ -248,6 +248,21 @@ pub fn desired_target(_s: &Snapshot) -> Key {
 /// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况与 Random 目标不受此限。
 pub const TARGET_DWELL_FRAMES: u64 = 30;
 
+/// 服务端 ARRCheck 要求同方向横向移动的最小间隔（帧），对应 ruleset 的 `arr_ticks`
+/// （默认 2，见 t99-core `Ruleset::arr_ticks`）。左右共用一个计时：反向也多等一帧，
+/// 比按方向各记一份更简单且同样不会触发违规。
+const ARR_FRAMES: u64 = 2;
+
+/// 横向移动节流：距上次移动不足 `ARR_FRAMES` 帧则本帧不发移动。
+/// 返回 true 表示放行并已把本帧记为「上次移动帧」。
+fn allow_move(frames: u64, last: &mut u64) -> bool {
+    if frames.saturating_sub(*last) < ARR_FRAMES {
+        return false;
+    }
+    *last = frames;
+    true
+}
+
 /// 是否允许本帧重新评估目标切换。`has_mode` = 已有既定目标；`urgent` = 受威胁且待进垃圾 ≥3。
 pub fn switch_due(frames: u64, last_switch: u64, has_mode: bool, urgent: bool) -> bool {
     urgent || !has_mode || frames.saturating_sub(last_switch) >= TARGET_DWELL_FRAMES
@@ -286,6 +301,7 @@ trait PlanBot {
     fn search(&mut self, s: &Snapshot) -> Option<(u8, i32)>;
     fn plan_mut(&mut self) -> &mut Option<Plan>;
     fn frames_mut(&mut self) -> &mut u64;
+    fn last_move_frame_mut(&mut self) -> &mut u64;
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key>;
 
     fn decide(&mut self, s: &Snapshot) -> Vec<TimedKey> {
@@ -347,9 +363,17 @@ trait PlanBot {
             return vec![ev(0, Key::RotCw)];
         }
         if a.x < plan.col {
+            let frames = *self.frames_mut();
+            if !allow_move(frames, self.last_move_frame_mut()) {
+                return vec![];
+            }
             return vec![ev(0, Key::RightDown), ev(4000, Key::RightUp)];
         }
         if a.x > plan.col {
+            let frames = *self.frames_mut();
+            if !allow_move(frames, self.last_move_frame_mut()) {
+                return vec![];
+            }
             return vec![ev(0, Key::LeftDown), ev(4000, Key::LeftUp)];
         }
         vec![ev(0, Key::HardDrop)]
@@ -389,11 +413,12 @@ fn best_dellach(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32, Grid, 
 pub struct BasicBot {
     plan: Option<Plan>,
     frames: u64,
+    last_move_frame: u64,
 }
 
 impl BasicBot {
     pub fn new() -> Self {
-        BasicBot { plan: None, frames: 0 }
+        BasicBot { plan: None, frames: 0, last_move_frame: 0 }
     }
 }
 
@@ -448,9 +473,15 @@ impl Bot for BasicBot {
             return vec![ev(0, Key::RotCw)];
         }
         if a.x < plan.col {
+            if !allow_move(self.frames, &mut self.last_move_frame) {
+                return vec![];
+            }
             return vec![ev(0, Key::RightDown), ev(4000, Key::RightUp)];
         }
         if a.x > plan.col {
+            if !allow_move(self.frames, &mut self.last_move_frame) {
+                return vec![];
+            }
             return vec![ev(0, Key::LeftDown), ev(4000, Key::LeftUp)];
         }
         vec![ev(0, Key::HardDrop)]
@@ -464,11 +495,12 @@ pub struct AdvancedBot {
     frames: u64,
     last_mode: Option<Key>,
     last_switch: u64,
+    last_move_frame: u64,
 }
 
 impl AdvancedBot {
     pub fn new() -> Self {
-        AdvancedBot { plan: None, frames: 0, last_mode: None, last_switch: 0 }
+        AdvancedBot { plan: None, frames: 0, last_mode: None, last_switch: 0, last_move_frame: 0 }
     }
 }
 
@@ -511,6 +543,9 @@ impl PlanBot for AdvancedBot {
     fn frames_mut(&mut self) -> &mut u64 {
         &mut self.frames
     }
+    fn last_move_frame_mut(&mut self) -> &mut u64 {
+        &mut self.last_move_frame
+    }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
         let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
         let urgent = !s.targeted_by.is_empty() && pending >= 3;
@@ -544,11 +579,12 @@ pub struct ExpertBot {
     frames: u64,
     last_mode: Option<Key>,
     last_switch: u64,
+    last_move_frame: u64,
 }
 
 impl ExpertBot {
     pub fn new() -> Self {
-        ExpertBot { plan: None, frames: 0, last_mode: None, last_switch: 0 }
+        ExpertBot { plan: None, frames: 0, last_mode: None, last_switch: 0, last_move_frame: 0 }
     }
 }
 
@@ -632,6 +668,9 @@ impl PlanBot for ExpertBot {
     }
     fn frames_mut(&mut self) -> &mut u64 {
         &mut self.frames
+    }
+    fn last_move_frame_mut(&mut self) -> &mut u64 {
+        &mut self.last_move_frame
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
         let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
