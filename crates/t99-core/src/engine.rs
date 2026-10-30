@@ -694,7 +694,14 @@ impl Match {
                             .last_target
                             .filter(|&t| t < n && self.players[t].alive)
                             .map(|t| self.players[t].badges);
-                        if locked_b.map(|b| max_b > b).unwrap_or(true) {
+                        // 锁定的徽章目标已经饱和时改锁仍有待进空间的目标，
+                        // 避免整发攻击打进 12 行上限被吞掉（徽章数不变）。
+                        let locked_sat = self.players[pid]
+                            .last_target
+                            .filter(|&t| t < n && self.players[t].alive)
+                            .map(|t| self.target_saturated(t))
+                            .unwrap_or(false);
+                        if locked_sat || locked_b.map(|b| max_b > b).unwrap_or(true) {
                             self.players[pid].last_target =
                                 self.pick_target_ordered(pid, &others, TargetMode::Badges);
                         }
@@ -1162,6 +1169,15 @@ impl Match {
         self.players[pid].last_target = self.pick_target_ordered(pid, &others, mode);
     }
 
+    /// 目标待进队列是否已经吃满（≥cap）：继续打它只会被丢弃
+    fn target_saturated(&self, t: usize) -> bool {
+        let cap = self.cfg.ruleset.pending_cap_rows;
+        self.players
+            .get(t)
+            .map(|p| p.pending.iter().map(|g| g.rows).sum::<u32>() >= cap)
+            .unwrap_or(false)
+    }
+
     fn pick_target_ordered(&mut self, pid: usize, others: &[usize], mode: TargetMode) -> Option<usize> {
         if others.is_empty() {
             return None;
@@ -1453,7 +1469,11 @@ impl Match {
                             .max()
                             .unwrap_or(0);
                         let locked_b = locked.map(|t| self.players[t].badges);
-                        if locked_b.map(|b| max_b > b).unwrap_or(true) {
+                        // 饱和 fallback：锁定的徽章目标已满 12 行时改打仍有空间的目标，
+                        // 避免整发攻击被丢弃；徽章锁定语义在目标腾出空间后自动恢复。
+                        if locked.map(|t| self.target_saturated(t)).unwrap_or(false)
+                            || locked_b.map(|b| max_b > b).unwrap_or(true)
+                        {
                             let picked = self.pick_target_ordered(pid, &others, m);
                             self.players[pid].last_target = picked;
                             picked
@@ -2654,6 +2674,28 @@ mod tests {
         // 重新选择徽章模式 -> 锁定当前最高
         m.apply_key(0, Key::TargetBadges);
         assert_eq!(m.players[0].last_target, Some(2));
+    }
+
+    #[test]
+    fn badge_lock_falls_back_when_target_saturated() {
+        let mut m = Match::new(MatchConfig { players: 4, seed: 17, ruleset: Ruleset::default() });
+        let cap = m.cfg.ruleset.pending_cap_rows;
+        m.players[1].badges = 5;
+        m.players[2].badges = 4;
+        m.apply_key(0, Key::TargetBadges);
+        assert_eq!(m.players[0].last_target, Some(1));
+        // 最高徽章目标吃满待进：攻击改打仍有空间的目标，而不是被上限吞掉
+        m.players[1].pending.push(Garb {
+            rows: cap,
+            sender: 2,
+            state: GarbState::Yellow(1200 * TMS),
+        });
+        assert_eq!(m.resolve_receivers(0, 3), vec![(2, 3)]);
+        assert_eq!(m.players[0].last_target, Some(2), "饱和时应改锁仍有空间的目标");
+        // 目标腾出空间后恢复原徽章锁定（最高徽章数重新领先）
+        m.players[1].pending.clear();
+        assert_eq!(m.resolve_receivers(0, 3), vec![(1, 3)]);
+        assert_eq!(m.players[0].last_target, Some(1));
     }
 
     #[test]
