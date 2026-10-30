@@ -46,6 +46,14 @@ cat > crates/t99-client/web/index.html <<'HTML'
 <body>
 <script type="module">
   import init from './t99-client.js';
+  // ?config=<url> / ?ruleset=<url>：在启动前把配置取回并交给 Rust（避免在 wasm 里做异步 IO）
+  const q = new URLSearchParams(location.search);
+  try {
+    if (q.get('config')) window.__t99_config = await (await fetch(q.get('config'))).text();
+    if (q.get('ruleset')) window.__t99_ruleset = await (await fetch(q.get('ruleset'))).text();
+  } catch (e) {
+    console.warn('[t99] 配置预取失败，使用内嵌配置:', e);
+  }
   init().catch((e) => {
     document.body.innerHTML = '<pre style="color:#f66;padding:16px">' + e + '</pre>';
     throw e;

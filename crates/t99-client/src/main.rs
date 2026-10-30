@@ -21,6 +21,26 @@ use t99_core::engine::{ActiveView, AttackEvent};
 use t99_core::{Cell, Key, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
 use t99_proto::{PlayerAdapter, PROTOCOL};
 
+#[cfg(target_arch = "wasm32")]
+mod wasm_net;
+
+/// 读取 JS 侧在 init() 之前写入的全局字符串（?config= / ?ruleset=）
+#[cfg(target_arch = "wasm32")]
+fn wasm_global_string(name: &str) -> Option<String> {
+    let g = js_sys::global();
+    let v = js_sys::Reflect::get(&g, &wasm_bindgen::JsValue::from_str(name)).ok()?;
+    v.as_string()
+}
+
+/// 读取页面 URL 查询参数（?server= ?key= ?id= ?spectate= ?observer）
+#[cfg(target_arch = "wasm32")]
+fn wasm_query_param(name: &str) -> Option<String> {
+    let win = web_sys::window()?;
+    let search = win.location().search().ok()?;
+    let params = web_sys::UrlSearchParams::new_with_str(&search).ok()?;
+    params.get(name)
+}
+
 const CELL: f32 = 26.0;
 const MINI: f32 = 4.0;
 const FRAME_US: u64 = 16_666;
@@ -99,6 +119,22 @@ pub enum NetCmd {
     /// n = 服务器私有 frame 的帧号；服务器按同帧号匹配 input
     Input { n: u64, evs: Vec<TimedKey> },
     Restart,
+}
+
+/// NetCmd → 协议 JSON；native 与 wasm 传输共用
+fn net_cmd_json(cmd: &NetCmd) -> String {
+    let msg = match cmd {
+        NetCmd::Input { n, evs } => serde_json::json!({
+            "type": "input",
+            "n": n,
+            "events": evs.iter().map(|t| match t.key {
+                Key::TargetPlayer(v) => serde_json::json!([t.t_us, t.key.name(), v]),
+                _ => serde_json::json!([t.t_us, t.key.name()]),
+            }).collect::<Vec<_>>()
+        }),
+        NetCmd::Restart => serde_json::json!({"type": "restart"}),
+    };
+    msg.to_string()
 }
 
 /// 网络镜像：本地确定性重演权威事件流；座位以服务器 hello 为准
@@ -2411,9 +2447,164 @@ fn nail_pos(thumbs: &Thumbs, seat: usize, pid: usize) -> Option<Vec2> {
 }
 
 /// 网络线程：连接服务器，维护本地镜像（事件流重演），转发输入/重启
-#[cfg(not(target_arch = "wasm32"))]
 fn version_ok(protocol: u64, ruleset: &str) -> bool {
     protocol == PROTOCOL as u64 && ruleset == t99_core::RULESET_ID
+}
+
+fn epoch_ms() -> u64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        js_sys::Date::now() as u64
+    }
+}
+
+/// 处理一条服务器消息。与传输无关：原生走 tungstenite，wasm 可直接复用。
+fn handle_server_msg(
+    t: &str,
+    mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>,
+    status: &std::sync::Arc<std::sync::Mutex<String>>,
+    stats: &std::sync::Arc<std::sync::Mutex<NetStats>>,
+    base_ruleset: &Ruleset,
+    spectate: usize,
+    expected: &mut Option<u64>,
+) -> bool {
+    let v: serde_json::Value = match serde_json::from_str(&t) { Ok(v) => v, Err(_) => return true };
+    match v["type"].as_str().unwrap_or("") {
+        "hello" => {
+            *expected = None;
+            {
+                let mut st = stats.lock().unwrap();
+                st.match_id = v["match_id"].as_u64().unwrap_or(0);
+                st.connected = true;
+                st.server_tps = 0.0;
+                st.last_tick_n = 0;
+                st.last_tick_at = None;
+            }
+            let players = v["players"].as_u64().unwrap_or(2) as usize;
+            let seed = v["seed"].as_u64().unwrap_or(0);
+            let seat = v["seat"].as_i64().unwrap_or(-1);
+            // 规则参数随 hello 下发，镜像与权威引擎必然一致
+            let mut ruleset = base_ruleset.clone();
+            let tick_hz = v["tick_hz"]
+                .as_u64()
+                .or_else(|| v["frame_hz"].as_u64())
+                .unwrap_or(DEFAULT_TICK_HZ as u64) as u32;
+            // tick 速率以服务器 hello 为准，镜像引擎的帧长必须跟着服务器
+            ruleset.tick_hz = tick_hz.max(1);
+            let tl = v["time_limit_secs"].as_u64().unwrap_or(0);
+            if tl > 0 {
+                ruleset.match_ticks = (tl as i64) * 1000 * TMS;
+            }
+            ruleset.stall_accel = v["stall_accel"].as_bool().unwrap_or(true);
+            let mut g = mirror.lock().unwrap();
+            g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
+            g.my_seat = if seat >= 0 { seat as usize } else { spectate };
+            g.tick_hz = tick_hz;
+            g.pending_frame_n = 0;
+            g.last_input_n = 0;
+            drop(g);
+            *status.lock().unwrap() = format!("对局 #{} 进行中", v["match"].as_u64().unwrap_or(0));
+        }
+        "frame" => {
+            // 私有帧只用于输入时序：镜像仍按 tick 推进，n 原样回填到 input
+            if let Some(n) = v["n"].as_u64() {
+                mirror.lock().unwrap().pending_frame_n = n;
+            }
+        }
+        "tick" => {
+            // 服务器 tick 速率：按 tick 序号差 / 到达时间差做 EMA
+            let tn = v["n"].as_u64();
+            if let Some(tn) = tn {
+                let now = Instant::now();
+                let mut st = stats.lock().unwrap();
+                if st.last_tick_n > 0 && tn > st.last_tick_n {
+                    if let Some(prev) = st.last_tick_at {
+                        let dt = now.duration_since(prev).as_secs_f32();
+                        if dt > 0.0 {
+                            let inst = (tn - st.last_tick_n) as f32 / dt;
+                            st.server_tps = if st.server_tps <= 0.0 {
+                                inst
+                            } else {
+                                st.server_tps * 0.8 + inst * 0.2
+                            };
+                        }
+                    }
+                }
+                st.last_tick_n = tn;
+                st.last_tick_at = Some(now);
+            }
+            // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
+            if let (Some(tn), Some(exp)) = (tn, *expected) {
+                if tn != exp {
+                    eprintln!("[mirror] 失步: 收到 tick n={tn} 期望 {exp}（本地镜像将重建）");
+                    *status.lock().unwrap() = "镜像失步，重连补史…".into();
+                    return false;
+                }
+            }
+            let mut g = mirror.lock().unwrap();
+            if let Some(e) = g.engine.as_mut() {
+                let n = e.players.len();
+                let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; n];
+                if let Some(arr) = v["in"].as_array() {
+                    for pair in arr {
+                        let pid = pair[0].as_u64().unwrap_or(0) as usize;
+                        if pid >= n { continue; }
+                        if let Some(evs) = pair[1].as_array() {
+                            inputs[pid] = evs.iter().filter_map(|e| {
+                                let t = e.get(0)?.as_u64()? as u32;
+                                let k = e.get(1)?.as_str()?;
+                                let key = if k == "target_player" {
+                                    Key::TargetPlayer(e.get(2)?.as_u64()? as u16)
+                                } else {
+                                    Key::from_name(k)?
+                                };
+                                Some(TimedKey { t_us: t, key })
+                            }).collect();
+                        }
+                    }
+                }
+                e.frame(&inputs);
+            }
+            *expected = Some(tn.unwrap_or(0) + 1);
+        }
+        "warn" => {
+            let code = v["code"].as_str().unwrap_or("?");
+            let dropped = v["dropped"].as_u64().unwrap_or(0);
+            eprintln!("[warn] {code} dropped={dropped}");
+        }
+        "result" => {
+            let reason = v["reason"].as_str().unwrap_or("?");
+            let mut st = format!("对局结束[{reason}]：");
+            if let Some(arr) = v["places"].as_array() {
+                st.push_str(&arr.iter().map(|p| format!("#{}→{}", p[0], p[1])).collect::<Vec<_>>().join(" "));
+            }
+            st.push_str("（按 R 重开）");
+            *status.lock().unwrap() = st;
+        }
+        "pong" => {
+            let t = v["t"].as_u64().unwrap_or(0);
+            let now = epoch_ms();
+            let mut st = stats.lock().unwrap();
+            if now >= t && t > 0 {
+                st.rtt_ms = (now - t) as u32;
+            }
+            st.pongs += 1;
+            st.loss_pct = if st.pings == 0 { 0 } else { (st.pings - st.pongs) * 100 / st.pings };
+            st.connected = true;
+        }
+        "error" => {
+            *status.lock().unwrap() = format!("服务器错误: {}", v["code"].as_str().unwrap_or("?"));
+        }
+        _ => {}
+    }
+    true
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2457,150 +2648,12 @@ fn net_thread(
         // 独立写线程替掉这里的读超时轮询。服务端已经没有这个轮询。
         let _ = tcp.set_read_timeout(Some(std::time::Duration::from_millis(2)));
     }
-    let handle_msg = |t: &str, mirror: &std::sync::Arc<std::sync::Mutex<MirrorState>>, status: &std::sync::Arc<std::sync::Mutex<String>>, expected: &mut Option<u64>| -> bool {
-        let v: serde_json::Value = match serde_json::from_str(&t) { Ok(v) => v, Err(_) => return true };
-        match v["type"].as_str().unwrap_or("") {
-            "hello" => {
-                *expected = None;
-                {
-                    let mut st = stats.lock().unwrap();
-                    st.match_id = v["match_id"].as_u64().unwrap_or(0);
-                    st.connected = true;
-                    st.server_tps = 0.0;
-                    st.last_tick_n = 0;
-                    st.last_tick_at = None;
-                }
-                let players = v["players"].as_u64().unwrap_or(2) as usize;
-                let seed = v["seed"].as_u64().unwrap_or(0);
-                let seat = v["seat"].as_i64().unwrap_or(-1);
-                // 规则参数随 hello 下发，镜像与权威引擎必然一致
-                let mut ruleset = base_ruleset.clone();
-                let tick_hz = v["tick_hz"]
-                    .as_u64()
-                    .or_else(|| v["frame_hz"].as_u64())
-                    .unwrap_or(DEFAULT_TICK_HZ as u64) as u32;
-                // tick 速率以服务器 hello 为准，镜像引擎的帧长必须跟着服务器
-                ruleset.tick_hz = tick_hz.max(1);
-                let tl = v["time_limit_secs"].as_u64().unwrap_or(0);
-                if tl > 0 {
-                    ruleset.match_ticks = (tl as i64) * 1000 * TMS;
-                }
-                ruleset.stall_accel = v["stall_accel"].as_bool().unwrap_or(true);
-                let mut g = mirror.lock().unwrap();
-                g.engine = Some(Match::new(MatchConfig { players, seed, ruleset }));
-                g.my_seat = if seat >= 0 { seat as usize } else { spectate };
-                g.tick_hz = tick_hz;
-                g.pending_frame_n = 0;
-                g.last_input_n = 0;
-                drop(g);
-                *status.lock().unwrap() = format!("对局 #{} 进行中", v["match"].as_u64().unwrap_or(0));
-            }
-            "frame" => {
-                // 私有帧只用于输入时序：镜像仍按 tick 推进，n 原样回填到 input
-                if let Some(n) = v["n"].as_u64() {
-                    mirror.lock().unwrap().pending_frame_n = n;
-                }
-            }
-            "tick" => {
-                // 服务器 tick 速率：按 tick 序号差 / 到达时间差做 EMA
-                let tn = v["n"].as_u64();
-                if let Some(tn) = tn {
-                    let now = Instant::now();
-                    let mut st = stats.lock().unwrap();
-                    if st.last_tick_n > 0 && tn > st.last_tick_n {
-                        if let Some(prev) = st.last_tick_at {
-                            let dt = now.duration_since(prev).as_secs_f32();
-                            if dt > 0.0 {
-                                let inst = (tn - st.last_tick_n) as f32 / dt;
-                                st.server_tps = if st.server_tps <= 0.0 {
-                                    inst
-                                } else {
-                                    st.server_tps * 0.8 + inst * 0.2
-                                };
-                            }
-                        }
-                    }
-                    st.last_tick_n = tn;
-                    st.last_tick_at = Some(now);
-                }
-                // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
-                if let (Some(tn), Some(exp)) = (tn, *expected) {
-                    if tn != exp {
-                        eprintln!("[mirror] 失步: 收到 tick n={tn} 期望 {exp}（本地镜像将重建）");
-                        *status.lock().unwrap() = "镜像失步，重连补史…".into();
-                        return false;
-                    }
-                }
-                let mut g = mirror.lock().unwrap();
-                if let Some(e) = g.engine.as_mut() {
-                    let n = e.players.len();
-                    let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; n];
-                    if let Some(arr) = v["in"].as_array() {
-                        for pair in arr {
-                            let pid = pair[0].as_u64().unwrap_or(0) as usize;
-                            if pid >= n { continue; }
-                            if let Some(evs) = pair[1].as_array() {
-                                inputs[pid] = evs.iter().filter_map(|e| {
-                                    let t = e.get(0)?.as_u64()? as u32;
-                                    let k = e.get(1)?.as_str()?;
-                                    let key = if k == "target_player" {
-                                        Key::TargetPlayer(e.get(2)?.as_u64()? as u16)
-                                    } else {
-                                        Key::from_name(k)?
-                                    };
-                                    Some(TimedKey { t_us: t, key })
-                                }).collect();
-                            }
-                        }
-                    }
-                    e.frame(&inputs);
-                }
-                *expected = Some(tn.unwrap_or(0) + 1);
-            }
-            "warn" => {
-                let code = v["code"].as_str().unwrap_or("?");
-                let dropped = v["dropped"].as_u64().unwrap_or(0);
-                eprintln!("[warn] {code} dropped={dropped}");
-            }
-            "result" => {
-                let reason = v["reason"].as_str().unwrap_or("?");
-                let mut st = format!("对局结束[{reason}]：");
-                if let Some(arr) = v["places"].as_array() {
-                    st.push_str(&arr.iter().map(|p| format!("#{}→{}", p[0], p[1])).collect::<Vec<_>>().join(" "));
-                }
-                st.push_str("（按 R 重开）");
-                *status.lock().unwrap() = st;
-            }
-            "pong" => {
-                let t = v["t"].as_u64().unwrap_or(0);
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let mut st = stats.lock().unwrap();
-                if now >= t && t > 0 {
-                    st.rtt_ms = (now - t) as u32;
-                }
-                st.pongs += 1;
-                st.loss_pct = if st.pings == 0 { 0 } else { (st.pings - st.pongs) * 100 / st.pings };
-                st.connected = true;
-            }
-            "error" => {
-                *status.lock().unwrap() = format!("服务器错误: {}", v["code"].as_str().unwrap_or("?"));
-            }
-            _ => {}
-        }
-        true
-    };
     let mut expected: Option<u64> = None;
     let mut last_ping = Instant::now();
     'conn: loop {
         if last_ping.elapsed().as_millis() >= 1000 {
             last_ping = Instant::now();
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
+            let t = epoch_ms();
             stats.lock().unwrap().pings += 1;
             let _ = ws.send(Message::Text(serde_json::json!({"type": "ping", "t": t}).to_string().into()));
         }
@@ -2635,7 +2688,7 @@ fn net_thread(
                         }
                     }
                 }
-                if !handle_msg(&text, &mirror, &status, &mut expected) {
+                if !handle_server_msg(&text, &mirror, &status, &stats, &base_ruleset, spectate, &mut expected) {
                     break 'conn; // 失步 → 触发重连
                 }
             }
@@ -2650,18 +2703,8 @@ fn net_thread(
             }
         }
         while let Ok(cmd) = rx.try_recv() {
-            let msg = match cmd {
-                NetCmd::Input { n, evs } => serde_json::json!({
-                    "type": "input",
-                    "n": n,
-                    "events": evs.iter().map(|t| match t.key {
-                        Key::TargetPlayer(v) => serde_json::json!([t.t_us, t.key.name(), v]),
-                        _ => serde_json::json!([t.t_us, t.key.name()]),
-                    }).collect::<Vec<_>>()
-                }),
-                NetCmd::Restart => serde_json::json!({"type": "restart"}),
-            };
-            if ws.send(Message::Text(msg.to_string().into())).is_err() {
+            let msg = net_cmd_json(&cmd);
+            if ws.send(Message::Text(msg.into())).is_err() {
                 *status.lock().unwrap() = "发送失败，连接断开".into();
                 break 'conn;
             }
@@ -2730,13 +2773,20 @@ fn main() {
             eprintln!("[config] {e}");
             std::process::exit(2);
         });
-    // wasm 没有文件系统、环境变量与 CLI：把仓库里的 client.toml 编译期嵌入，
-    // 让浏览器版与 native 默认配置一致（键位、显示、observer/spectate 等）。
+    // wasm 没有文件系统、环境变量与 CLI：默认用编译期嵌入的 client.toml，
+    // 若页面通过 ?config=<url> 预取到文本（index.html 里 fetch），则覆盖它。
     #[cfg(target_arch = "wasm32")]
     let cfg = {
         let _ = &config_path;
-        t99_config::ClientConfig::from_toml(include_str!("../../../client.toml"))
-            .unwrap_or_else(|e| panic!("内嵌 client.toml 解析失败: {e}"))
+        let mut cfg = t99_config::ClientConfig::from_toml(include_str!("../../../client.toml"))
+            .unwrap_or_else(|e| panic!("内嵌 client.toml 解析失败: {e}"));
+        if let Some(text) = wasm_global_string("__t99_config") {
+            match t99_config::ClientConfig::from_toml(&text) {
+                Ok(c) => cfg = c,
+                Err(e) => eprintln!("[config] ?config 解析失败，沿用内嵌配置: {e}"),
+            }
+        }
+        cfg
     };
     if !observer_explicit {
         observer = cfg.client.observer;
@@ -2748,6 +2798,29 @@ fn main() {
         server = None;
     } else if server.is_none() && !cfg.client.server.is_empty() {
         server = Some(cfg.client.server.clone());
+    }
+    // wasm：URL 查询参数覆盖（?server= ?key= ?id= ?spectate= ?observer）
+    #[cfg(target_arch = "wasm32")]
+    {
+        if !local {
+            if let Some(v) = wasm_query_param("server") {
+                server = Some(v);
+            }
+        }
+        if let Some(v) = wasm_query_param("key") {
+            my_key = v;
+        }
+        if let Some(v) = wasm_query_param("id") {
+            my_id = v;
+        }
+        if let Some(v) = wasm_query_param("spectate") {
+            if let Ok(n) = v.parse() {
+                spectate = n;
+            }
+        }
+        if wasm_query_param("observer").is_some() {
+            observer = true;
+        }
     }
     if cfg.display.framerate > 0 {
         eprintln!(
@@ -2761,12 +2834,20 @@ fn main() {
             eprintln!("[ruleset] {e}");
             std::process::exit(2);
         });
-    // wasm 同样嵌入 ruleset.toml：否则浏览器版本地局会静默退回默认规则。
+    // wasm 同样嵌入 ruleset.toml：否则浏览器版本地局会静默退回默认规则；
+    // 页面可用 ?ruleset=<url> 预取覆盖。
     #[cfg(target_arch = "wasm32")]
     let rc = {
         let _ = &cfg.ruleset_file;
-        t99_config::RulesetConfig::from_toml(include_str!("../../../ruleset.toml"))
-            .unwrap_or_else(|e| panic!("内嵌 ruleset.toml 解析失败: {e}"))
+        let mut rc = t99_config::RulesetConfig::from_toml(include_str!("../../../ruleset.toml"))
+            .unwrap_or_else(|e| panic!("内嵌 ruleset.toml 解析失败: {e}"));
+        if let Some(text) = wasm_global_string("__t99_ruleset") {
+            match t99_config::RulesetConfig::from_toml(&text) {
+                Ok(c) => rc = c,
+                Err(e) => eprintln!("[ruleset] ?ruleset 解析失败，沿用内嵌配置: {e}"),
+            }
+        }
+        rc
     };
     if rc.ruleset.id != t99_core::RULESET_ID {
         eprintln!(
@@ -2816,12 +2897,27 @@ fn main() {
         }
         #[cfg(target_arch = "wasm32")]
         {
-            let _ = (my_id, my_key, observer, spectate);
-            eprintln!("wasm 构建暂不支持 --server（本地模式）");
-            let n_bots = n_bots.clamp(1, 98);
-            let mut bots: Vec<Option<BotAdapter>> = vec![None];
-            for _ in 0..n_bots { bots.push(Some(BotAdapter::new(&tier))); }
-            Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: base_ruleset.clone() }), bots }
+            // 浏览器端：WebSocket 回调 + 每帧 pump，复用 handle_server_msg 与镜像重演
+            let mirror: std::sync::Arc<std::sync::Mutex<MirrorState>> = Default::default();
+            let status: std::sync::Arc<std::sync::Mutex<String>> =
+                std::sync::Arc::new(std::sync::Mutex::new("连接中…".into()));
+            let stats: std::sync::Arc<std::sync::Mutex<NetStats>> = Default::default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let role = if observer { "observer" } else { "player" };
+            let ctx = std::rc::Rc::new(wasm_net::Ctx {
+                ws: std::cell::RefCell::new(None),
+                mirror: mirror.clone(),
+                status: status.clone(),
+                stats: stats.clone(),
+                base_ruleset: base_ruleset.clone(),
+                spectate,
+                observer,
+                url: format!("{url}/ws?id={my_id}&key={my_key}&role={role}&spectate={spectate}"),
+                expected: std::cell::RefCell::new(None),
+                reconnect: std::cell::Cell::new(false),
+            });
+            wasm_net::start(ctx, rx);
+            Session::Net { mirror, tx, observer, status, stats }
         }
     } else {
         let n_bots = n_bots.clamp(1, 98);
@@ -2844,8 +2940,8 @@ fn main() {
             PresentMode::Immediate
         };
     }
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(window),
             ..default()
         }))
@@ -2864,6 +2960,14 @@ fn main() {
             Update,
             (sync_tick_rate, poll_input, observer_spectate_input, toggle_debug_hud, sync).chain(),
         )
-        .add_systems(FixedUpdate, tick)
-        .run();
+        .add_systems(FixedUpdate, tick);
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, wasm_net_pump);
+    app.run();
+}
+
+/// 浏览器端每帧驱动 WebSocket：发输入、ping、重连
+#[cfg(target_arch = "wasm32")]
+fn wasm_net_pump() {
+    wasm_net::pump_frame();
 }
