@@ -176,7 +176,12 @@ pub fn pump_frame() {
 
         if p.last_ping.elapsed().as_millis() >= 1000 {
             p.last_ping = crate::Instant::now();
-            p.ctx.stats.lock().unwrap().pings += 1;
+            {
+                let mut st = p.ctx.stats.lock().unwrap();
+                st.pings += 1;
+                st.ping_sent_at = Some(crate::Instant::now());
+                st.refresh_loss();
+            }
             let msg = serde_json::json!({"type": "ping", "t": epoch_ms()}).to_string();
             if let Some(ws) = p.ctx.ws.borrow().as_ref() {
                 let _ = ws.send_with_str(&msg);

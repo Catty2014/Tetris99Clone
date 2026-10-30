@@ -166,6 +166,24 @@ struct NetStats {
     /// 内部：已发 ping 数 / 收到 pong 数
     pings: u32,
     pongs: u32,
+    /// 内部：最近一次 ping 的发出时刻；在途 ping 不算丢包
+    ping_sent_at: Option<Instant>,
+}
+
+impl NetStats {
+    /// 丢包率：只统计「已超时仍未回」的 ping。
+    /// 旧公式 (pings - pongs)/pings 会把刚发出、还在途的那一个算成丢失，
+    /// 1s 一次 ping 时恒定显示约 100/pings（例如 7%），与真实丢包无关。
+    fn refresh_loss(&mut self) {
+        let inflight = self
+            .ping_sent_at
+            .map_or(false, |t| t.elapsed() < std::time::Duration::from_millis(2000));
+        let lost = self
+            .pings
+            .saturating_sub(self.pongs)
+            .saturating_sub(u32::from(inflight));
+        self.loss_pct = if self.pings == 0 { 0 } else { (lost * 100 / self.pings).min(100) };
+    }
 }
 
 #[derive(Resource)]
@@ -486,10 +504,28 @@ fn load_ui_font(mut cmd: Commands, mut fonts: ResMut<Assets<Font>>) {
     cmd.insert_resource(UiFont(fonts.add(font)));
 }
 
+/// UI 设计基准：所有面板按固定像素坐标布局，窗口小于该基准时整体等比缩小
+const DESIGN_W: f32 = 1200.0;
+const DESIGN_H: f32 = 880.0;
+
+/// 固定坐标布局的自适应：窗口比设计基准小时放大正交相机 scale，让整块 UI 完整落在可视区。
+fn fit_camera(windows: Query<&Window>, mut cams: Query<&mut Projection, With<Camera2d>>) {
+    let Ok(w) = windows.single() else { return };
+    let k = (DESIGN_W / w.width().max(1.0))
+        .max(DESIGN_H / w.height().max(1.0))
+        .max(1.0);
+    for mut p in &mut cams {
+        if let Projection::Orthographic(o) = &mut *p {
+            if (o.scale - k).abs() > 0.001 {
+                o.scale = k;
+            }
+        }
+    }
+}
+
 fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>) {
     let font: Handle<Font> = ui_font.0.clone();
-    cmd.spawn(Camera2d);
-    cmd.spawn((
+    cmd.spawn(Camera2d);    cmd.spawn((
         Sprite::from_color(Color::srgb(0.06, 0.07, 0.10), Vec2::new(W as f32 * CELL + 8.0, H as f32 * CELL + 8.0)),
         Transform::from_xyz(0.0, 0.0, -1.0),
     ));
@@ -1273,6 +1309,21 @@ fn advance_dir(
 mod repeat_tests {
     use super::*;
     use t99_core::Kind;
+
+    #[test]
+    fn loss_excludes_inflight_ping() {
+        let mut st = NetStats::default();
+        st.pings = 14;
+        st.pongs = 13;
+        // 刚发出、尚未回包的 ping 不能算丢包；旧公式此时会显示 7%
+        st.ping_sent_at = Some(Instant::now());
+        st.refresh_loss();
+        assert_eq!(st.loss_pct, 0);
+        // 超时（模拟 2s 后仍未回）才计入
+        st.ping_sent_at = None;
+        st.refresh_loss();
+        assert_eq!(st.loss_pct, 7);
+    }
 
     #[test]
     fn embedded_cjk_font_parses() {
@@ -2486,6 +2537,11 @@ fn handle_server_msg(
                 st.server_tps = 0.0;
                 st.last_tick_n = 0;
                 st.last_tick_at = None;
+                // 新连接重新统计，避免上一条连接的在途 ping 被算作丢包
+                st.pings = 0;
+                st.pongs = 0;
+                st.ping_sent_at = None;
+                st.loss_pct = 0;
             }
             let players = v["players"].as_u64().unwrap_or(2) as usize;
             let seed = v["seed"].as_u64().unwrap_or(0);
@@ -2527,8 +2583,10 @@ fn handle_server_msg(
                 if st.last_tick_n > 0 && tn > st.last_tick_n {
                     if let Some(prev) = st.last_tick_at {
                         let dt = now.duration_since(prev).as_secs_f32();
-                        if dt > 0.0 {
-                            let inst = (tn - st.last_tick_n) as f32 / dt;
+                        // 回填补史会在极短时间内重放大量 tick，dt≈0 会把瞬时 TPS 推到上万；
+                        // 只统计接近真实 60Hz 的间隔（≥10ms），并给瞬时值封顶。
+                        if dt >= 0.01 {
+                            let inst = ((tn - st.last_tick_n) as f32 / dt).min(1000.0);
                             st.server_tps = if st.server_tps <= 0.0 {
                                 inst
                             } else {
@@ -2596,7 +2654,8 @@ fn handle_server_msg(
                 st.rtt_ms = (now - t) as u32;
             }
             st.pongs += 1;
-            st.loss_pct = if st.pings == 0 { 0 } else { (st.pings - st.pongs) * 100 / st.pings };
+            st.ping_sent_at = None;
+            st.refresh_loss();
             st.connected = true;
         }
         "error" => {
@@ -2654,7 +2713,12 @@ fn net_thread(
         if last_ping.elapsed().as_millis() >= 1000 {
             last_ping = Instant::now();
             let t = epoch_ms();
-            stats.lock().unwrap().pings += 1;
+            {
+                let mut st = stats.lock().unwrap();
+                st.pings += 1;
+                st.ping_sent_at = Some(Instant::now());
+                st.refresh_loss();
+            }
             let _ = ws.send(Message::Text(serde_json::json!({"type": "ping", "t": t}).to_string().into()));
         }
         match ws.read() {
@@ -2927,9 +2991,23 @@ fn main() {
         }
         Session::Local { engine: Match::new(MatchConfig { players: 1 + n_bots, seed, ruleset: base_ruleset.clone() }), bots }
     };
+    // 浏览器：画布必须按页面实际尺寸创建。固定 1600×900 会溢出视口，
+    // 表现为右侧面板被裁掉、底部攻击框看不见。
+    #[cfg(target_arch = "wasm32")]
+    let (win_w, win_h) = {
+        let w = web_sys::window();
+        let dim = |v: Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue>| -> f32 {
+            v.ok().and_then(|v| v.as_f64()).unwrap_or(0.0) as f32
+        };
+        let ww = w.as_ref().map(|w| dim(w.inner_width())).unwrap_or(0.0);
+        let wh = w.as_ref().map(|w| dim(w.inner_height())).unwrap_or(0.0);
+        (if ww >= 320.0 { ww } else { 1600.0 }, if wh >= 240.0 { wh } else { 900.0 })
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let (win_w, win_h) = (1600.0, 900.0);
     let mut window = Window {
         title: "t99 · Arena Tetris".into(),
-        resolution: (1600.0, 900.0).into(),
+        resolution: (win_w, win_h).into(),
         ..default()
     };
     if !cfg!(target_arch = "wasm32") {
@@ -2958,7 +3036,7 @@ fn main() {
         .add_systems(Startup, (load_ui_font, setup).chain())
         .add_systems(
             Update,
-            (sync_tick_rate, poll_input, observer_spectate_input, toggle_debug_hud, sync).chain(),
+            (fit_camera, sync_tick_rate, poll_input, observer_spectate_input, toggle_debug_hud, sync).chain(),
         )
         .add_systems(FixedUpdate, tick);
     #[cfg(target_arch = "wasm32")]
