@@ -274,6 +274,9 @@ pub struct Player {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    /// T-Spin 次数（Full + Mini，含无消行）与其中 Full 的次数
+    pub t_spins: u32,
+    pub t_spin_full: u32,
     /// 输入 sanitize 去重/拒绝的事件数
     pub dup_dropped: u32,
     /// 上次被接受的左/右移动帧（-1 = 从未）
@@ -388,6 +391,8 @@ pub struct TableRow {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    pub t_spins: u32,
+    pub t_spin_full: u32,
     pub dup_dropped: u32,
     pub arr_violations: u32,
     pub dropped: u32,
@@ -461,6 +466,8 @@ impl Match {
                 badges: 0,
                 lines: 0,
                 sent: 0,
+                t_spins: 0,
+                t_spin_full: 0,
                 dup_dropped: 0,
                 last_move_frame: [-1, -1],
                 arr_violations: 0,
@@ -1676,6 +1683,13 @@ impl Match {
         } else {
             SpinKind::None
         };
+        if spin != SpinKind::None {
+            let p = &mut self.players[pid];
+            p.t_spins += 1;
+            if spin == SpinKind::Full {
+                p.t_spin_full += 1;
+            }
+        }
         // 消行
         let mut full_rows: Vec<usize> = Vec::new();
         {
@@ -1941,6 +1955,8 @@ impl Match {
                 badges: p.badges,
                 lines: p.lines,
                 sent: p.sent,
+                t_spins: p.t_spins,
+                t_spin_full: p.t_spin_full,
                 dup_dropped: p.dup_dropped,
                 arr_violations: p.arr_violations,
                 dropped: p.dropped,
@@ -2763,6 +2779,8 @@ mod tests {
         let p0 = &m.players[0];
         assert_eq!(p0.lines, 2);
         assert_eq!(p0.sent, 4);
+        assert_eq!(p0.t_spins, 1);
+        assert_eq!(p0.t_spin_full, 1);
         // 对手立即入队 4 行（黄/灰计时中）
         let rows: u32 = m.players[1].pending.iter().map(|g| g.rows).sum();
         assert_eq!(rows, 4);
