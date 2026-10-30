@@ -1180,7 +1180,8 @@ fn rotate_at(g: &Grid, kind: char, x: i32, rot: u8, to: u8, y: i64) -> Option<(i
 fn bfs_path(g: &Grid, kind: char, y: i64, from: (i32, u8), to: (i32, u8), spin_last: bool) -> Option<Vec<Mv>> {
     use std::collections::VecDeque;
     if from == to {
-        return Some(vec![]);
+        // 自旋要求末次操作是旋转；已经在终点时无法再补一次旋转
+        return if spin_last { None } else { Some(vec![]) };
     }
     let coll_at = |x: i32, rot: u8| collides(g, kind, rot, x, y);
     #[derive(Clone)]
@@ -1464,6 +1465,21 @@ impl Brain {
         if !self.plan.as_ref().unwrap().cand.floor_rot {
             // 直落计划：BFS 到目标态（自旋候选要求末步为旋转）
             let path = if cur == goal {
+                if is_spin {
+                    // 已经在自旋终点：必须补一次原地旋转，下一帧再 BFS 转回终点。
+                    let cw = rotate_at(g, a.t, cur.0, cur.1, (cur.1 + 1) % 4, y);
+                    if cw.is_some() {
+                        return Act { evs: vec![(0, Ev::Cw)], soft_hold: false };
+                    }
+                    let ccw = rotate_at(g, a.t, cur.0, cur.1, (cur.1 + 3) % 4, y);
+                    if ccw.is_some() {
+                        return Act { evs: vec![(0, Ev::Ccw)], soft_hold: false };
+                    }
+                    // 无法旋转：这次自旋不成立，撤销计数后直接硬降
+                    self.t_spins = self.t_spins.saturating_sub(1);
+                    self.plan = None;
+                    return Act { evs: vec![(0, Ev::Hard)], soft_hold: false };
+                }
                 Some(vec![])
             } else {
                 bfs_path(g, a.t, y, cur, goal, is_spin)
@@ -1701,6 +1717,15 @@ mod tests {
 
     fn empty() -> Grid {
         [[0u8; W]; ROWS]
+    }
+
+    #[test]
+    fn spin_path_requires_final_rotation() {
+        let g = empty();
+        // 已经在终点：自旋路径不能是空路径（否则会直接硬降，last_rot_kick 为空）
+        assert!(bfs_path(&g, 'T', 0, (3, 0), (3, 0), true).is_none());
+        let p = bfs_path(&g, 'T', 0, (3, 0), (3, 0), false);
+        assert!(matches!(p, Some(ref v) if v.is_empty()));
     }
 
     fn fr_of(g: &Grid) -> FrameIn {
