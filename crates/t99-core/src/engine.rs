@@ -249,6 +249,10 @@ pub struct Player {
     pub sent: u32,
     /// 输入 sanitize 去重/拒绝的事件数
     pub dup_dropped: u32,
+    /// 上次被接受的左/右移动帧（-1 = 从未）
+    last_move_frame: [i64; 2],
+    /// ARRCheck 丢弃的移动次数
+    pub arr_violations: u32,
     /// 因对方待进上限或无人可送而丢弃的行
     pub dropped: u32,
     /// 自己消行时抵消掉的待进垃圾行
@@ -358,6 +362,7 @@ pub struct TableRow {
     pub lines: u32,
     pub sent: u32,
     pub dup_dropped: u32,
+    pub arr_violations: u32,
     pub dropped: u32,
     pub canceled: u32,
     pub inserted: u32,
@@ -426,6 +431,8 @@ impl Match {
                 lines: 0,
                 sent: 0,
                 dup_dropped: 0,
+                last_move_frame: [-1, -1],
+                arr_violations: 0,
                 dropped: 0,
                 canceled: 0,
                 inserted: 0,
@@ -623,6 +630,17 @@ impl Match {
                 if !self.players[pid].alive || self.over.is_some() {
                     stop = true;
                     break;
+                }
+                // ARRCheck：左右移动同方向最小间隔 arr_ticks 帧
+                if matches!(ev.key, Key::LeftDown | Key::RightDown) {
+                    let dir = if matches!(ev.key, Key::LeftDown) { 0 } else { 1 };
+                    let cur = self.frame_n as i64;
+                    let last = self.players[pid].last_move_frame[dir];
+                    if last >= 0 && cur - last < self.cfg.ruleset.arr_ticks as i64 {
+                        self.players[pid].arr_violations += 1;
+                        continue;
+                    }
+                    self.players[pid].last_move_frame[dir] = cur;
                 }
                 self.apply_key(pid, ev.key);
                 if !self.players[pid].alive || self.over.is_some() {
@@ -1780,6 +1798,7 @@ impl Match {
                 lines: p.lines,
                 sent: p.sent,
                 dup_dropped: p.dup_dropped,
+                arr_violations: p.arr_violations,
                 dropped: p.dropped,
                 canceled: p.canceled,
                 inserted: p.inserted,
@@ -2125,6 +2144,31 @@ mod tests {
     }
 
     #[test]
+    fn arr_interval_enforced_for_same_direction() {
+        let mut m = Match::new(MatchConfig { players: 1, seed: 7, ruleset: Ruleset::default() });
+        let x0 = m.players[0].active.expect("spawned piece").x;
+        // frame 0：接受
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::LeftDown }]]);
+        let x1 = m.players[0].active.expect("piece alive").x;
+        assert_eq!(x1, x0 - 1);
+        // frame 1：同方向间隔不足，丢弃
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::LeftDown }]]);
+        assert_eq!(m.players[0].active.expect("piece alive").x, x1);
+        assert_eq!(m.players[0].arr_violations, 1);
+        // frame 2：满 2 帧，接受
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::LeftDown }]]);
+        assert_eq!(m.players[0].active.expect("piece alive").x, x1 - 1);
+        // 反向使用自己的计时，立即接受
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::RightDown }]]);
+        assert_eq!(m.players[0].active.expect("piece alive").x, x1);
+        // 旋转不受 ARR 限制
+        let before = m.players[0].arr_violations;
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::RotCw }]]);
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::RotCcw }]]);
+        assert_eq!(m.players[0].arr_violations, before);
+    }
+
+    #[test]
     fn ranking_normal_and_same_frame_ties() {
         let cfg = MatchConfig { players: 4, seed: 1, ruleset: Ruleset::default() };
         let mut m = Match::new(cfg);
@@ -2221,7 +2265,10 @@ mod tests {
 
     #[test]
     fn discrete_direction_events_move_one_cell_each() {
-        let mut m = solo();
+        // 本用例只验证帧内去重，把 ARR 设为 1 允许连续帧移动
+        let mut r = Ruleset::default();
+        r.arr_ticks = 1;
+        let mut m = Match::new(MatchConfig { players: 1, seed: 42, ruleset: r });
         let x0 = m.players[0].active.expect("spawned piece").x;
         // 一帧内两个同方向 down 只响应第一个
         m.frame(&[vec![

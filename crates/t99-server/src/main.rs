@@ -457,6 +457,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let mut last_dup = vec![0u32; players];
         let mut dup_acc = vec![0u32; players];
         let mut last_warn: Vec<Option<Instant>> = vec![None; players];
+        // ARRCheck 告警
+        let mut last_arr = vec![0u32; players];
+        let mut arr_acc = vec![0u32; players];
+        let mut last_arr_warn: Vec<Option<Instant>> = vec![None; players];
         // 当前局的全部 tick（供中途加入的观战端回放）
         let mut history: Vec<String> = Vec::new();
         let mut in_match = true;
@@ -588,6 +592,29 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                         let _ = c.tx.send(warn);
                     }
                 }
+                // ARRCheck：同方向移动间隔不足
+                let arr_total = engine.players[pid].arr_violations;
+                if arr_total > last_arr[pid] {
+                    arr_acc[pid] += arr_total - last_arr[pid];
+                    last_arr[pid] = arr_total;
+                }
+                let arr_due = last_arr_warn[pid]
+                    .map(|t: Instant| t.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if arr_due && arr_acc[pid] > 0 {
+                    let dropped = arr_acc[pid];
+                    arr_acc[pid] = 0;
+                    last_arr_warn[pid] = Some(Instant::now());
+                    eprintln!("[arr] seat={pid} dropped={dropped} total={arr_total}");
+                    let warn = serde_json::json!({
+                        "type": "warn", "code": "arr_violation", "dropped": dropped,
+                    })
+                    .to_string();
+                    let h = hall.lock().unwrap();
+                    if let Some(c) = h.clients.iter().flatten().find(|c| c.seat == Some(pid)) {
+                        let _ = c.tx.send(warn);
+                    }
+                }
             }
             let tick = serde_json::json!({
                 "type": "tick", "n": engine.frame_n,
@@ -637,6 +664,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 "lines": r.lines,
                 "sent": r.sent,
                 "input_dropped": r.dup_dropped,
+                "arr_violations": r.arr_violations,
                 "dropped": r.dropped,
                 "canceled": r.canceled,
                 "inserted": r.inserted,

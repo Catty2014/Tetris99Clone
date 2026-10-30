@@ -418,6 +418,8 @@ impl Default for RulesetConfig {
 pub struct RulesetSection {
     pub id: String,
     pub tick_hz: u32,
+    /// 横向移动最小间隔（帧）；必须 >= 1
+    pub arr_ticks: u32,
     pub board_width: usize,
     pub board_height: usize,
     pub hidden_rows: usize,
@@ -450,6 +452,7 @@ impl Default for RulesetSection {
         Self {
             id: "9f3c1a7e".into(),
             tick_hz: 60,
+            arr_ticks: 2,
             board_width: 10,
             board_height: 20,
             hidden_rows: 4,
@@ -596,6 +599,9 @@ impl RulesetConfig {
                 t99_core::TPS
             )));
         }
+        if r.arr_ticks == 0 {
+            return Err(ConfigError::Rules("arr_ticks must be >= 1".into()));
+        }
         let tick = |n: u32| n as t99_core::Ticks * (t99_core::TPS / r.tick_hz as t99_core::Ticks);
         let phases: Vec<t99_core::PhaseSpec> = r
             .stage
@@ -616,6 +622,7 @@ impl RulesetConfig {
         Ok(t99_core::Ruleset {
             preview: r.preview,
             tick_hz: r.tick_hz,
+            arr_ticks: r.arr_ticks,
             irs: r.irs,
             ihs: r.ihs,
             initial_trigger: trigger,

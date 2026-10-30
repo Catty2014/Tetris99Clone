@@ -12,6 +12,7 @@
 id = "9f3c1a7e"             # 占位；正式值由 canonical ruleset 派生，DAS/ARR 移到 client 后需重新派生
 
 tick_hz = 60                # 60 或 120；必须整除引擎时基
+arr_ticks = 2               # 横向移动同方向最小间隔（帧）
 board_width = 10
 board_height = 20
 hidden_rows = 4             # 允许 2..20

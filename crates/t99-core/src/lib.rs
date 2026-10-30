@@ -411,6 +411,8 @@ pub struct Ruleset {
     pub preview: usize,
     /// 逻辑 tick 速率；规则时长仍是绝对时间，120Hz 只改变每帧步长
     pub tick_hz: u32,
+    /// 横向移动同一方向的最小间隔（帧）；ARRCheck 用，必须 >= 1
+    pub arr_ticks: u32,
     pub irs: bool,
     pub ihs: bool,
     pub initial_trigger: InitialTrigger,
@@ -454,6 +456,7 @@ impl Default for Ruleset {
         Ruleset {
             preview: 6,
             tick_hz: 60,
+            arr_ticks: 2,
             irs: true,
             ihs: true,
             initial_trigger: InitialTrigger::Either,
