@@ -129,16 +129,41 @@ fn parse_args() -> Args {
             std::process::exit(2);
         })
     });
+    let time_limit_secs = get("--time-limit-secs")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seat_count = players.max(bots.len());
+    let tick_hz = ruleset.tick_hz.max(1) as u64;
+    // 帧数上限必须跟着实际对局时长走；旧的固定 54000 会在 1200s 局里提前 5 分钟结束。
+    let max_frames = get("--max-frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            let secs = if time_limit_secs > 0 {
+                time_limit_secs
+            } else {
+                let ticks = if ruleset.match_ticks > 0 {
+                    ruleset.match_ticks
+                } else {
+                    t99_core::match_ticks_for(seat_count)
+                };
+                (ticks / (1000 * TMS)).max(0) as u64
+            };
+            if secs > 0 {
+                secs * tick_hz + tick_hz
+            } else {
+                54_000
+            }
+        });
     Args {
         address: get("--address").unwrap_or(cfg.server.address),
         port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(cfg.server.port),
         key: get("--key").unwrap_or_else(|| "t99".into()),
         // Bot 数即席位下限：bot 覆盖全部席位时为纯 Bot 局（人类 0 席）
-        players: players.max(bots.len()),
+        players: seat_count,
         bots,
         seed,
-        max_frames: get("--max-frames").and_then(|s| s.parse().ok()).unwrap_or(54_000),
-        time_limit_secs: get("--time-limit-secs").and_then(|s| s.parse().ok()).unwrap_or(0),
+        max_frames,
+        time_limit_secs,
         ruleset,
         stall_accel: get("--stall-accel")
             .map(|s| s != "0" && s != "false")
@@ -770,7 +795,7 @@ fn main() {
     let args = parse_args();
     let human_seats = args.players - args.bots.len();
     eprintln!(
-        "t99-server: {}:{} loglevel={} debug={} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 0杀加速 {} restart_timeout={}s{}",
+        "t99-server: {}:{} loglevel={} debug={} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 上限 {} 帧 0杀加速 {} restart_timeout={}s{}",
         args.address,
         args.port,
         args.loglevel,
@@ -781,6 +806,7 @@ fn main() {
         args.bots.len(),
         args.seed,
         if args.time_limit_secs > 0 { format!("{}s", args.time_limit_secs) } else { "auto".into() },
+        args.max_frames,
         if args.stall_accel { "开" } else { "关" },
         args.restart_timeout.as_secs(),
         if args.lobby { " [lobby]" } else { "" },
