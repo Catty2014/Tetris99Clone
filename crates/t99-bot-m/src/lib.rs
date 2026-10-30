@@ -1321,9 +1321,8 @@ impl Brain {
     }
 
     fn target_mode(&self, _fr: &FrameIn) -> Option<Ev> {
-        // 99 人基准实测：均匀随机（引擎只在待进未满的目标里抽）优于反攻/围猎。
-        // 集中火力会撞上 12 行待进上限并被消行抵消，实际进场更少。
-        Some(Ev::TargetRandom)
+        // 99 人实测：反击显著提高进场与淘汰；无人瞄准时引擎退化为随机。
+        Some(Ev::TargetAttackers)
     }
 
     fn grid(&self, fr: &FrameIn) -> Grid {

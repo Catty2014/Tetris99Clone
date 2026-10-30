@@ -241,7 +241,9 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 99 人基准实测：在“待进未满”的目标里均匀随机，优于 Kos/Badges/Spread 等集中策略。
 /// 集中攻击会撞上 12 行待进上限，并被目标的消行抵消，实际进场反而更少。
 pub fn desired_target(_s: &Snapshot) -> Key {
-    Key::TargetRandom
+    // 99 人实测：反击（完整攻击打给每个攻击者，最多 10 人）显著提高进场与淘汰。
+    // 无人瞄准时引擎会退化为随机，所以始终选择反击即可。
+    Key::TargetAttackers
 }
 // 注：反攻条件加 pending≥3（真正受威胁才反打），否则坚持围猎，避免「永远反攻」僵局。
 
@@ -438,7 +440,7 @@ impl Bot for BasicBot {
         }
         if self.frames == 0 {
             self.frames += 1;
-            return vec![ev(0, Key::TargetRandom)];
+            return vec![ev(0, Key::TargetAttackers)];
         }
         self.frames += 1;
         let Some(a) = s.active else { return vec![] };
