@@ -244,6 +244,10 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 被瞄且待进 ≥3 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
 /// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
 pub fn desired_target(s: &Snapshot) -> Key {
+    // 被 6 人以上瞄准：无论待进多少，优先全线反击。
+    if s.targeted_by.len() >= 6 {
+        return Key::TargetAttackers;
+    }
     let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
     if !s.targeted_by.is_empty() && pending >= 3 {
         // 待进已满的瞄准者会把攻击丢弃，优先反打仍有余量者；全员饱和才退回原逻辑

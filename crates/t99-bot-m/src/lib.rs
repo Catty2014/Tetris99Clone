@@ -1321,6 +1321,10 @@ impl Brain {
     }
 
     fn target_mode(&self, fr: &FrameIn) -> Option<Ev> {
+        // 被 6 人以上瞄准：无论待进多少，优先全线反击。
+        if fr.targeted_by.len() >= 6 {
+            return Some(Ev::TargetAttackers);
+        }
         let dbg = std::env::var("T99_BOT_TARGET").is_ok();
         let trace = |m: &str| if dbg { eprintln!("[target:{} f{}] {}", self.profile.name, fr.n, m); };
         // 攻防策略（徽章转移感知）：
