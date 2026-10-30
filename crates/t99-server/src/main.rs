@@ -453,6 +453,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         }
 
         let mut next_inputs: HashMap<usize, Vec<TimedKey>> = HashMap::new();
+        // 输入去重告警：每席位累计、限频输出
+        let mut last_dup = vec![0u32; players];
+        let mut dup_acc = vec![0u32; players];
+        let mut last_warn: Vec<Option<Instant>> = vec![None; players];
         // 当前局的全部 tick（供中途加入的观战端回放）
         let mut history: Vec<String> = Vec::new();
         let mut in_match = true;
@@ -560,6 +564,31 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 }
             }
             engine.frame(&inputs);
+            // 重复动作被 sanitize 丢弃时警告该席位（每席位最多 1 秒一次）
+            for pid in 0..players {
+                let total = engine.players[pid].dup_dropped;
+                if total > last_dup[pid] {
+                    dup_acc[pid] += total - last_dup[pid];
+                    last_dup[pid] = total;
+                }
+                let due = last_warn[pid]
+                    .map(|t: Instant| t.elapsed() >= Duration::from_secs(1))
+                    .unwrap_or(true);
+                if due && dup_acc[pid] > 0 {
+                    let dropped = dup_acc[pid];
+                    dup_acc[pid] = 0;
+                    last_warn[pid] = Some(Instant::now());
+                    eprintln!("[input] seat={pid} duplicate_actions dropped={dropped} total={total}");
+                    let warn = serde_json::json!({
+                        "type": "warn", "code": "duplicate_action", "dropped": dropped,
+                    })
+                    .to_string();
+                    let h = hall.lock().unwrap();
+                    if let Some(c) = h.clients.iter().flatten().find(|c| c.seat == Some(pid)) {
+                        let _ = c.tx.send(warn);
+                    }
+                }
+            }
             let tick = serde_json::json!({
                 "type": "tick", "n": engine.frame_n,
                 "in": inputs.iter().enumerate()
@@ -607,6 +636,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 "ko": r.ko,
                 "lines": r.lines,
                 "sent": r.sent,
+                "input_dropped": r.dup_dropped,
                 "dropped": r.dropped,
                 "canceled": r.canceled,
                 "inserted": r.inserted,

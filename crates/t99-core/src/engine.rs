@@ -247,6 +247,8 @@ pub struct Player {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    /// 输入 sanitize 去重/拒绝的事件数
+    pub dup_dropped: u32,
     /// 因对方待进上限或无人可送而丢弃的行
     pub dropped: u32,
     /// 自己消行时抵消掉的待进垃圾行
@@ -355,6 +357,7 @@ pub struct TableRow {
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
+    pub dup_dropped: u32,
     pub dropped: u32,
     pub canceled: u32,
     pub inserted: u32,
@@ -422,6 +425,7 @@ impl Match {
                 badges: 0,
                 lines: 0,
                 sent: 0,
+                dup_dropped: 0,
                 dropped: 0,
                 canceled: 0,
                 inserted: 0,
@@ -589,9 +593,20 @@ impl Match {
         }
         let frame_ticks = self.cfg.ruleset.frame_ticks();
         let n = self.players.len();
-        let mut per: Vec<Vec<TimedKey>> = (0..n)
-            .map(|i| inputs.get(i).and_then(|v| sanitize_events(v)).unwrap_or_default())
-            .collect();
+        let mut per: Vec<Vec<TimedKey>> = Vec::with_capacity(n);
+        let mut dropped = vec![0u32; n];
+        for i in 0..n {
+            match inputs.get(i).and_then(|v| sanitize_events(v)) {
+                Some(s) => {
+                    per.push(s.events);
+                    dropped[i] = s.dropped;
+                }
+                None => per.push(Vec::new()),
+            }
+        }
+        for (pid, d) in dropped.into_iter().enumerate() {
+            self.players[pid].dup_dropped += d;
+        }
         for pid in 0..n {
             if !self.players[pid].alive {
                 continue;
@@ -1764,6 +1779,7 @@ impl Match {
                 badges: p.badges,
                 lines: p.lines,
                 sent: p.sent,
+                dup_dropped: p.dup_dropped,
                 dropped: p.dropped,
                 canceled: p.canceled,
                 inserted: p.inserted,
@@ -2037,7 +2053,7 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_bad() {
+    fn sanitize_dedupes_repeated_actions() {
         use crate::sanitize_events;
         assert!(sanitize_events(&[TimedKey { t_us: 0, key: Key::HardDrop }]).is_some());
         // t 必须严格递增
@@ -2045,30 +2061,67 @@ mod tests {
             TimedKey { t_us: 5, key: Key::HardDrop },
             TimedKey { t_us: 5, key: Key::RotCw }
         ]).is_none());
-        // 同帧重复方向键合法（离散移动）；其他动作仍拒绝
-        assert!(sanitize_events(&[
+        // 同帧同方向移动两次：第一次生效，第二次丢弃
+        let s = sanitize_events(&[
             TimedKey { t_us: 0, key: Key::LeftDown },
-            TimedKey { t_us: 100, key: Key::LeftDown }
-        ]).is_some());
-        assert!(sanitize_events(&[
+            TimedKey { t_us: 100, key: Key::LeftDown },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 1);
+        assert_eq!(s.dropped, 1);
+        // 同向旋转重复：第一次生效
+        let s = sanitize_events(&[
             TimedKey { t_us: 0, key: Key::RotCw },
-            TimedKey { t_us: 100, key: Key::RotCw }
-        ]).is_none());
-        // 目标选择同帧可重复，按顺序后者生效
-        assert!(sanitize_events(&[
+            TimedKey { t_us: 100, key: Key::RotCw },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 1);
+        assert_eq!(s.dropped, 1);
+        // CW + CCW：不同动作，按顺序都保留（CW 可能失败，CCW 仍生效）
+        let s = sanitize_events(&[
+            TimedKey { t_us: 0, key: Key::RotCw },
+            TimedKey { t_us: 100, key: Key::RotCcw },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 2);
+        assert_eq!(s.dropped, 0);
+        assert!(matches!(s.events[0].key, Key::RotCw));
+        assert!(matches!(s.events[1].key, Key::RotCcw));
+        // 软降重复无收益，保留
+        let s = sanitize_events(&[
+            TimedKey { t_us: 0, key: Key::SoftDown },
+            TimedKey { t_us: 100, key: Key::SoftDown },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 2);
+        // 目标选择按顺序生效
+        let s = sanitize_events(&[
             TimedKey { t_us: 0, key: Key::TargetPlayer(1) },
-            TimedKey { t_us: 100, key: Key::TargetPlayer(2) }
-        ]).is_some());
+            TimedKey { t_us: 100, key: Key::TargetPlayer(2) },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 2);
+        // 180 未实现，丢弃
+        let s = sanitize_events(&[TimedKey { t_us: 0, key: Key::Rot180 }]).unwrap();
+        assert_eq!(s.events.len(), 0);
+        assert_eq!(s.dropped, 1);
         // 越界 t
         assert!(sanitize_events(&[TimedKey { t_us: 16667, key: Key::HardDrop }]).is_none());
         // >16
         let many: Vec<TimedKey> = (0..17).map(|i| TimedKey { t_us: i * 900, key: Key::Noop }).collect();
         assert!(sanitize_events(&many).is_none());
         // 帧内 press+release 合法
-        assert!(sanitize_events(&[
+        let s = sanitize_events(&[
             TimedKey { t_us: 0, key: Key::LeftDown },
-            TimedKey { t_us: 1000, key: Key::LeftUp }
-        ]).is_some());
+            TimedKey { t_us: 1000, key: Key::LeftUp },
+        ]).unwrap();
+        assert_eq!(s.events.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_action_is_counted() {
+        let mut m = Match::new(MatchConfig { players: 1, seed: 3, ruleset: Ruleset::default() });
+        let before = m.players[0].dup_dropped;
+        m.frame(&[vec![
+            TimedKey { t_us: 0, key: Key::RotCw },
+            TimedKey { t_us: 100, key: Key::RotCw },
+        ]]);
+        assert_eq!(m.players[0].dup_dropped, before + 1);
     }
 
     #[test]
@@ -2170,14 +2223,18 @@ mod tests {
     fn discrete_direction_events_move_one_cell_each() {
         let mut m = solo();
         let x0 = m.players[0].active.expect("spawned piece").x;
-        let evs = vec![
+        // 一帧内两个同方向 down 只响应第一个
+        m.frame(&[vec![
             TimedKey { t_us: 0, key: Key::LeftDown },
             TimedKey { t_us: 1000, key: Key::LeftDown },
             TimedKey { t_us: 2000, key: Key::LeftUp },
-        ];
-        m.frame(&[evs]);
+        ]]);
         let x1 = m.players[0].active.expect("piece alive").x;
-        assert_eq!(x1, x0 - 2, "each left_down must move exactly one cell");
+        assert_eq!(x1, x0 - 1, "only the first left_down in a frame is honored");
+        // 分两帧各一次，移动两格
+        m.frame(&[vec![TimedKey { t_us: 0, key: Key::LeftDown }]]);
+        let x2 = m.players[0].active.expect("piece alive").x;
+        assert_eq!(x2, x1 - 1, "one left_down per frame moves one cell");
     }
 
     #[test]

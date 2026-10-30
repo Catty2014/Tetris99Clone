@@ -304,38 +304,58 @@ pub struct TimedKey {
     pub key: Key,
 }
 
-/// 事件帧内校验：≤16 个、t 严格递增且 ≤ 16666µs、同帧不得重复同键。
-/// 非法整帧作废（返回 None → 空帧）。
-pub fn sanitize_events(raw: &[TimedKey]) -> Option<Vec<TimedKey>> {
+/// 已净化的帧输入：`events` 为实际执行的事件，`dropped` 为被去重/拒绝的数量。
+pub struct Sanitized {
+    pub events: Vec<TimedKey>,
+    pub dropped: u32,
+}
+
+/// 事件帧内校验与去重：≤16 个、t 严格递增且 ≤ 16666µs。
+/// 同一动作（同 `Key::kind`）一帧只响应第一次，后续重复丢弃并计数；
+/// 软降重复无收益，保留；目标选择按顺序生效；180 旋转未实现，直接丢弃。
+pub fn sanitize_events(raw: &[TimedKey]) -> Option<Sanitized> {
     if raw.len() > 16 {
         return None;
     }
     let mut prev_t: i64 = -1;
-    for (i, e) in raw.iter().enumerate() {
+    for e in raw {
         if e.t_us > MAX_T_US || (e.t_us as i64) <= prev_t {
             return None;
         }
         prev_t = e.t_us as i64;
-        // 横向移动是离散事件：同一帧可以连续发多个 left_down/right_down；
-        // DAS/ARR 由有头客户端折算，不再由引擎按住自动重复。
-        // 方向移动、目标选择允许同帧重复；后者按顺序生效。
-        let repeatable = matches!(
+    }
+    let mut seen = [false; 24];
+    let mut events = Vec::with_capacity(raw.len());
+    let mut dropped = 0u32;
+    for e in raw {
+        // 未实现的 180 旋转不允许出现在输入里
+        if matches!(e.key, Key::Rot180) {
+            dropped += 1;
+            continue;
+        }
+        // 软降重复无收益；目标选择按顺序生效；Noop 无副作用
+        let exempt = matches!(
             e.key,
-            Key::LeftDown
-                | Key::LeftUp
-                | Key::RightDown
-                | Key::RightUp
+            Key::SoftDown
+                | Key::SoftUp
                 | Key::TargetBadges
                 | Key::TargetKos
                 | Key::TargetAttackers
                 | Key::TargetRandom
                 | Key::TargetPlayer(_)
+                | Key::Noop
         );
-        if !repeatable && raw[..i].iter().any(|p| p.key.kind() == e.key.kind()) {
-            return None;
+        let kind = e.key.kind() as usize;
+        if !exempt && seen.get(kind).copied().unwrap_or(false) {
+            dropped += 1;
+            continue;
         }
+        if let Some(s) = seen.get_mut(kind) {
+            *s = true;
+        }
+        events.push(*e);
     }
-    Some(raw.to_vec())
+    Some(Sanitized { events, dropped })
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]

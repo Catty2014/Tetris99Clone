@@ -1870,6 +1870,11 @@ fn net_thread(
                 }
                 *expected = Some(tn.unwrap_or(0) + 1);
             }
+            "warn" => {
+                let code = v["code"].as_str().unwrap_or("?");
+                let dropped = v["dropped"].as_u64().unwrap_or(0);
+                eprintln!("[warn] {code} dropped={dropped}");
+            }
             "result" => {
                 let reason = v["reason"].as_str().unwrap_or("?");
                 let mut st = format!("对局结束[{reason}]：");
