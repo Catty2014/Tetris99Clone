@@ -1319,13 +1319,10 @@ impl Match {
                     let idx = self.players[pid].rng_misc.below(pool.len() as u64) as usize;
                     vec![(pool[idx], rows)]
                 } else {
+                    // T99：反击把完整攻击分别打给每个攻击者，不均分；最多 10 人。
                     atk.sort_unstable();
-                    let base = rows / atk.len() as u32;
-                    let rem = rows % atk.len() as u32;
-                    atk.iter()
-                        .enumerate()
-                        .map(|(i, &r)| (r, base + if (i as u32) < rem { 1 } else { 0 }))
-                        .collect()
+                    atk.truncate(10);
+                    atk.into_iter().map(|r| (r, rows)).collect()
                 }
             }
             m => {
@@ -1652,11 +1649,16 @@ impl Match {
         if n > 0 && sent_rows > 0 {
             let recv = self.resolve_receivers(pid, sent_rows);
             let mut delivered = 0u32;
+            let mut overflow = 0u32;
+            if recv.is_empty() {
+                overflow += sent_rows;
+            }
             for (rid, rows) in recv {
                 let have: u32 = self.players[rid].pending.iter().map(|g| g.rows).sum();
                 let room = self.cfg.ruleset.pending_cap_rows.saturating_sub(have);
-                let rows = rows.min(room);
-                if rows > 0 {
+                let accepted = rows.min(room);
+                overflow += rows - accepted;
+                if accepted > 0 {
                     // 队列为空立即开始计时（黄），否则灰排队
                     let state = if self.players[rid].pending.is_empty() {
                         GarbState::Yellow(self.cfg.ruleset.garbage_stage(self.phase_idx))
@@ -1664,19 +1666,19 @@ impl Match {
                         GarbState::Gray
                     };
                     let p = &mut self.players[rid];
-                    p.pending.push(Garb { rows, sender: pid, state });
+                    p.pending.push(Garb { rows: accepted, sender: pid, state });
                     let now: u32 = p.pending.iter().map(|g| g.rows).sum();
                     p.peak_pending = p.peak_pending.max(now);
-                    delivered += rows;
+                    delivered += accepted;
                     // 实际交付按接收方记账（send_cap/待进上限截断后的量）
                     let sender = &mut self.players[pid];
                     if let Some(slot) = sender.sent_to.get_mut(rid) {
-                        *slot += rows;
+                        *slot += accepted;
                     }
                 }
             }
             self.players[pid].sent += delivered;
-            self.players[pid].dropped += sent_rows - delivered;
+            self.players[pid].dropped += overflow;
         }
     }
 
@@ -2445,6 +2447,26 @@ mod tests {
         let recv = m.resolve_receivers(0, 4);
         assert_eq!(recv.len(), 1);
         assert_eq!(recv[0].0, 1); // 退化为存活他人
+    }
+
+    #[test]
+    fn attackers_get_full_damage_and_cap_ten() {
+        // 3p：反击把完整 5 行分别打给两个攻击者，不均分
+        let mut m = Match::new(MatchConfig { players: 3, seed: 9, ruleset: Ruleset::default() });
+        m.players[0].target_mode = TargetMode::Attackers;
+        m.players[1].last_target = Some(0);
+        m.players[2].last_target = Some(0);
+        assert_eq!(m.resolve_receivers(0, 5), vec![(1, 5), (2, 5)]);
+
+        // 12p：最多反给 10 个攻击者
+        let mut m = Match::new(MatchConfig { players: 12, seed: 9, ruleset: Ruleset::default() });
+        m.players[0].target_mode = TargetMode::Attackers;
+        for i in 1..12 {
+            m.players[i].last_target = Some(0);
+        }
+        let recv = m.resolve_receivers(0, 3);
+        assert_eq!(recv.len(), 10);
+        assert!(recv.iter().all(|&(_, r)| r == 3));
     }
 
     #[test]

@@ -1374,7 +1374,7 @@ fn sync(
         place_debug_hud(&views, &mut vq, &mut dbg_tr.0, &dbg_tr.1, half_w, half_h);
         return;
     };
-    // 反攻模式：被本方瞄准的是全部攻击者（引擎发送时均分给所有攻击者）
+    // 反攻模式：被本方瞄准的是全部攻击者（引擎把完整攻击分别打给每个攻击者，最多 10 人）
     let attackers_mode = s.target_mode == TargetMode::Attackers;
     // —— 己方棋盘 ——
     show_grid(&mut vq, &views.cells, W, &|r, c| if s.board[r][c] != 0 { Some(s.board[r][c]) } else { None });
