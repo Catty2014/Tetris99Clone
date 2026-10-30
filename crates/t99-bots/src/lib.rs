@@ -243,7 +243,7 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 攻防目标策略（徽章转移感知）：
 /// 被瞄且待进 ≥3 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
 /// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
-pub fn desired_target(s: &Snapshot) -> Key {
+pub fn advanced_target(s: &Snapshot) -> Key {
     // 被 6 人以上瞄准：无论待进多少，优先全线反击。
     if s.targeted_by.len() >= 6 {
         return Key::TargetAttackers;
@@ -303,6 +303,43 @@ fn allow_move(frames: u64, last: &mut u64) -> bool {
 /// 是否允许本帧重新评估目标切换。`has_mode` = 已有既定目标；`urgent` = 受威胁且待进垃圾 ≥3。
 pub fn switch_due(frames: u64, last_switch: u64, has_mode: bool, urgent: bool) -> bool {
     urgent || !has_mode || frames.saturating_sub(last_switch) >= TARGET_DWELL_FRAMES
+}
+
+/// expert 的加权目标：Random 100；Badges (max-own)/max*100；KOs (max_stack-10)*10；Attackers min(aim,12)/6*100。
+fn weighted_target(s: &Snapshot, rng: &mut u64) -> Key {
+    let own = s.badge_units as f64;
+    let max_b = s
+        .alive
+        .iter()
+        .filter(|&&p| p != s.pid)
+        .map(|&p| s.badges_all.get(p).copied().unwrap_or(0))
+        .max()
+        .unwrap_or(0) as f64;
+    let w_badges = if max_b > 0.0 {
+        ((max_b - own).max(0.0) / max_b) * 100.0
+    } else {
+        0.0
+    };
+    let w_kos = ((s.max_stack as f64 - 10.0) * 10.0).max(0.0);
+    let w_att = s.targeted_by.len().min(12) as f64 / 6.0 * 100.0;
+    let weights = [
+        (Key::TargetRandom, 100.0),
+        (Key::TargetBadges, w_badges),
+        (Key::TargetKos, w_kos),
+        (Key::TargetAttackers, w_att),
+    ];
+    let sum: f64 = weights.iter().map(|(_, w)| *w).sum();
+    *rng = rng
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let mut roll = ((*rng >> 11) as f64 / (1u64 << 53) as f64) * sum;
+    for (k, w) in weights {
+        if roll < w {
+            return k;
+        }
+        roll -= w;
+    }
+    Key::TargetRandom
 }
 
 // ———— NullBot ————
@@ -585,8 +622,8 @@ impl PlanBot for AdvancedBot {
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
         let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
-        let urgent = !s.targeted_by.is_empty() && pending >= 3;
-        let want = desired_target(s);
+        let urgent = (!s.targeted_by.is_empty() && pending >= 3) || s.targeted_by.len() >= 6;
+        let want = advanced_target(s);
         // Random 目标不做驻留限制（仅 BasicBot 开局用，Advanced 预留）
         if !switch_due(self.frames, self.last_switch, self.last_mode.is_some(), urgent) && want != Key::TargetRandom {
             return None;
@@ -617,11 +654,23 @@ pub struct ExpertBot {
     last_mode: Option<Key>,
     last_switch: u64,
     last_move_frame: u64,
+    last_sent: u32,
+    weighted_mode: Option<Key>,
+    rng: u64,
 }
 
 impl ExpertBot {
     pub fn new() -> Self {
-        ExpertBot { plan: None, frames: 0, last_mode: None, last_switch: 0, last_move_frame: 0 }
+        ExpertBot {
+            plan: None,
+            frames: 0,
+            last_mode: None,
+            last_switch: 0,
+            last_move_frame: 0,
+            last_sent: 0,
+            weighted_mode: None,
+            rng: 0,
+        }
     }
 }
 
@@ -710,12 +759,17 @@ impl PlanBot for ExpertBot {
         &mut self.last_move_frame
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
-        let urgent = !s.targeted_by.is_empty() && pending >= 3;
-        let want = desired_target(s);
-        if !switch_due(self.frames, self.last_switch, self.last_mode.is_some(), urgent) && want != Key::TargetRandom {
-            return None;
+        if self.rng == 0 {
+            self.rng = 0x9E37_79B9_7F4A_7C15 ^ (s.pid as u64 + 1);
         }
+        if s.sent != self.last_sent || self.weighted_mode.is_none() {
+            self.last_sent = s.sent;
+            self.weighted_mode = Some(weighted_target(s, &mut self.rng));
+        }
+        let want = match self.weighted_mode {
+            Some(k) => k,
+            None => Key::TargetRandom,
+        };
         if Some(want) != self.last_mode {
             self.last_mode = Some(want);
             self.last_switch = self.frames;

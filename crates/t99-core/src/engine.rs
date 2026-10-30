@@ -155,6 +155,8 @@ pub struct Snapshot {
     pub badges_all: Vec<u32>,
     /// 全员待进垃圾行数（index=pid）
     pub pending_all: Vec<u32>,
+    /// 场上存活他人最高可见堆（KOs 权重用）
+    pub max_stack: u16,
     /// 待进队列上限（行）
     pub garbage_cap: u32,
     /// 最近一次消行判定（1s 显示窗口由客户端按帧龄过滤）
@@ -2119,6 +2121,13 @@ impl Match {
             burn_x10: ((self.burn_ticks() as u128 * 10 / self.cfg.ruleset.frame_ticks().max(1) as u128) as u16).max(1),
             pid: pid_field,
             badges_all: self.players.iter().map(|p| p.badges).collect(),
+            max_stack: self
+                .players
+                .iter()
+                .filter(|p| p.alive && p.id != pid)
+                .map(|p| stack_height(p) as u16)
+                .max()
+                .unwrap_or(0),
             pending_all: self
                 .players
                 .iter()

@@ -79,6 +79,15 @@ pub struct FrameIn {
     /// v7：全员徽章数组（index=pid；徽章随 KO 转移）
     #[serde(default)]
     pub badges_all: Vec<u32>,
+    /// 自己的徽章单位数（与 badges 的档位区分）
+    #[serde(default)]
+    pub badge_units: u32,
+    /// 存活玩家 pid 列表
+    #[serde(default)]
+    pub alive: Vec<usize>,
+    /// 场上存活他人最高可见堆（KOs 权重用）
+    #[serde(default)]
+    pub max_stack: u16,
     /// 全员待进垃圾行数（index=pid）；缺席时为空 → 不做饱和过滤
     #[serde(default)]
     pub pending_all: Vec<u32>,
@@ -1138,6 +1147,10 @@ pub struct Brain {
     last_move_frame: u64,
     /// 上次目标切换（或首次评估）所在帧
     last_switch: u64,
+    /// master 加权策略的当前模式 / 上次送出计数 / 随机源
+    weighted_mode: Option<Ev>,
+    last_sent: u32,
+    rng: u64,
     pub t_spins: u32,
     /// 本块内已证不可达的候选（fin_rot, fin_x）——BFS 失败后拉黑并重规划
     blocked: Vec<(u8, i32)>,
@@ -1216,6 +1229,43 @@ fn bfs_path(g: &Grid, kind: char, y: i64, from: (i32, u8), to: (i32, u8), spin_l
     None
 }
 
+/// master 的加权目标：Random 100；Badges (max-own)/max*100；KOs (max_stack-10)*10；Attackers min(aim,12)/6*100。
+fn pick_weighted_mode(fr: &FrameIn, rng: &mut u64) -> Ev {
+    let own = fr.badge_units as f64;
+    let max_b = fr
+        .alive
+        .iter()
+        .filter(|&&p| p != fr.seat)
+        .map(|&p| fr.badges_all.get(p).copied().unwrap_or(0))
+        .max()
+        .unwrap_or(0) as f64;
+    let w_badges = if max_b > 0.0 {
+        ((max_b - own).max(0.0) / max_b) * 100.0
+    } else {
+        0.0
+    };
+    let w_kos = ((fr.max_stack as f64 - 10.0) * 10.0).max(0.0);
+    let w_att = fr.targeted_by.len().min(12) as f64 / 6.0 * 100.0;
+    let weights = [
+        (Ev::TargetRandom, 100.0),
+        (Ev::TargetBadges, w_badges),
+        (Ev::TargetKos, w_kos),
+        (Ev::TargetAttackers, w_att),
+    ];
+    let sum: f64 = weights.iter().map(|(_, w)| *w).sum();
+    *rng = rng
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let mut roll = ((*rng >> 11) as f64 / (1u64 << 53) as f64) * sum;
+    for (k, w) in weights {
+        if roll < w {
+            return k;
+        }
+        roll -= w;
+    }
+    Ev::TargetRandom
+}
+
 impl Brain {
     pub fn new(profile: Profile) -> Self {
         Brain {
@@ -1226,6 +1276,9 @@ impl Brain {
             frames: 0,
             last_move_frame: 0,
             last_switch: 0,
+            weighted_mode: None,
+            last_sent: 0,
+            rng: 0,
             t_spins: 0,
             blocked: vec![],
             blocked_sig: (0, '-', 0, false),
@@ -1236,7 +1289,15 @@ impl Brain {
         self.frames += 1;
         // 目标策略：最小驻留 30 帧；被瞄且待进垃圾 ≥3 时紧急豁免；首次评估立即执行
         let urgent = !fr.targeted_by.is_empty() && fr.pending() >= 3;
-        if urgent || self.last_mode.is_none() || self.frames.saturating_sub(self.last_switch) >= TARGET_DWELL_FRAMES {
+        let sent_changed = self.profile.name == "master" && fr.sent != self.last_sent;
+        let gm_six = (self.profile.name == "gm" || self.profile.name.starts_with("berserk"))
+            && fr.targeted_by.len() >= 6;
+        if urgent
+            || self.last_mode.is_none()
+            || self.frames.saturating_sub(self.last_switch) >= TARGET_DWELL_FRAMES
+            || sent_changed
+            || gm_six
+        {
             let want = self.target_mode(fr);
             if self.last_mode != want {
                 self.last_mode = want;
@@ -1320,8 +1381,19 @@ impl Brain {
         self.exec(fr, a, &g)
     }
 
-    fn target_mode(&self, fr: &FrameIn) -> Option<Ev> {
-        // 被 6 人以上瞄准：无论待进多少，优先全线反击。
+    fn target_mode(&mut self, fr: &FrameIn) -> Option<Ev> {
+        // master：按奖励函数权重，每次成功送出后重抽目标模式。
+        if self.profile.name == "master" {
+            if self.rng == 0 {
+                self.rng = 0x9E37_79B9_7F4A_7C15 ^ (fr.seat as u64 + 1);
+            }
+            if fr.sent != self.last_sent || self.weighted_mode.is_none() {
+                self.last_sent = fr.sent;
+                self.weighted_mode = Some(pick_weighted_mode(fr, &mut self.rng));
+            }
+            return self.weighted_mode;
+        }
+        // GM：被 6 人以上瞄准时无论待进多少，优先全线反击。
         if fr.targeted_by.len() >= 6 {
             return Some(Ev::TargetAttackers);
         }

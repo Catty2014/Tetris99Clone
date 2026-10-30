@@ -110,6 +110,9 @@ pub struct FrameMsg {
     /// 全员待进垃圾行数（index=pid，含已死者）
     #[serde(default)]
     pub pending_all: Vec<u32>,
+    /// 场上存活他人最高可见堆（KOs 权重用）
+    #[serde(default)]
+    pub max_stack: u16,
     /// 待进队列上限（行）；pending_all[p] ≥ 该值的玩家会丢弃攻击
     #[serde(default)]
     pub garbage_cap: u32,
@@ -214,6 +217,7 @@ impl FrameMsg {
             targeted_by: s.targeted_by.clone(),
             badges_all: s.badges_all.clone(),
             pending_all: s.pending_all.clone(),
+            max_stack: s.max_stack,
             garbage_cap: s.garbage_cap,
             time_secs_left: s.match_secs_left,
             burn_x10: s.burn_x10,
