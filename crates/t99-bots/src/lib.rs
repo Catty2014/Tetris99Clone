@@ -243,44 +243,29 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 攻防目标策略（徽章转移感知）：
 /// 被瞄且待进 ≥3 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
 /// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
-pub fn advanced_target(s: &Snapshot) -> Key {
-    // 被 6 人以上瞄准：无论待进多少，优先全线反击。
-    if s.targeted_by.len() >= 6 {
-        return Key::TargetAttackers;
-    }
-    let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
-    if !s.targeted_by.is_empty() && pending >= 3 {
-        // 待进已满的瞄准者会把攻击丢弃，优先反打仍有余量者；全员饱和才退回原逻辑
-        let roomy: Vec<usize> = s
-            .targeted_by
-            .iter()
-            .copied()
-            .filter(|&p| {
-                s.garbage_cap == 0 || s.pending_all.get(p).copied().unwrap_or(0) < s.garbage_cap
-            })
-            .collect();
-        let pool: &[usize] = if roomy.is_empty() { &s.targeted_by } else { &roomy };
-        let fattest = pool
-            .iter()
-            .copied()
-            .max_by_key(|&p| s.badges_all.get(p).copied().unwrap_or(0))
-            .unwrap_or(0);
-        Key::TargetPlayer(fattest as u16)
-    } else {
-        let leader = s
-            .badges_all
-            .iter()
-            .enumerate()
-            .filter(|&(p, _)| p != s.pid)
-            .max_by_key(|&(_, &b)| b)
-            .map(|(p, &b)| (p, b));
-        match leader {
-            Some((_, b)) if b >= 3 => Key::TargetBadges,
-            _ => Key::TargetKos,
+/// advanced 的加权目标：Random / KOs / Badges 各 1；反击 `min(9, 被瞄) / 3`。
+/// 每次成功送出后重抽。
+fn advanced_weighted(s: &Snapshot, rng: &mut u64) -> Key {
+    let w_att = s.targeted_by.len().min(9) as f64 / 3.0;
+    let weights = [
+        (Key::TargetRandom, 1.0),
+        (Key::TargetKos, 1.0),
+        (Key::TargetBadges, 1.0),
+        (Key::TargetAttackers, w_att),
+    ];
+    let sum: f64 = weights.iter().map(|(_, w)| *w).sum();
+    *rng = rng
+        .wrapping_mul(6_364_136_223_846_793_005)
+        .wrapping_add(1_442_695_040_888_963_407);
+    let mut roll = ((*rng >> 11) as f64 / (1u64 << 53) as f64) * sum;
+    for (k, w) in weights {
+        if roll < w {
+            return k;
         }
+        roll -= w;
     }
+    Key::TargetRandom
 }
-// 注：反攻条件加 pending≥3（真正受威胁才反打），否则坚持围猎，避免「永远反攻」僵局。
 
 /// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况与 Random 目标不受此限。
 pub const TARGET_DWELL_FRAMES: u64 = 30;
@@ -570,11 +555,23 @@ pub struct AdvancedBot {
     last_mode: Option<Key>,
     last_switch: u64,
     last_move_frame: u64,
+    last_sent: u32,
+    weighted_mode: Option<Key>,
+    rng: u64,
 }
 
 impl AdvancedBot {
     pub fn new() -> Self {
-        AdvancedBot { plan: None, frames: 0, last_mode: None, last_switch: 0, last_move_frame: 0 }
+        AdvancedBot {
+            plan: None,
+            frames: 0,
+            last_mode: None,
+            last_switch: 0,
+            last_move_frame: 0,
+            last_sent: 0,
+            weighted_mode: None,
+            rng: 0,
+        }
     }
 }
 
@@ -621,13 +618,17 @@ impl PlanBot for AdvancedBot {
         &mut self.last_move_frame
     }
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
-        let urgent = (!s.targeted_by.is_empty() && pending >= 3) || s.targeted_by.len() >= 6;
-        let want = advanced_target(s);
-        // Random 目标不做驻留限制（仅 BasicBot 开局用，Advanced 预留）
-        if !switch_due(self.frames, self.last_switch, self.last_mode.is_some(), urgent) && want != Key::TargetRandom {
-            return None;
+        if self.rng == 0 {
+            self.rng = 0x9E37_79B9_7F4A_7C15 ^ (s.pid as u64 + 1);
         }
+        if s.sent != self.last_sent || self.weighted_mode.is_none() {
+            self.last_sent = s.sent;
+            self.weighted_mode = Some(advanced_weighted(s, &mut self.rng));
+        }
+        let want = match self.weighted_mode {
+            Some(k) => k,
+            None => Key::TargetRandom,
+        };
         if Some(want) != self.last_mode {
             self.last_mode = Some(want);
             self.last_switch = self.frames;
