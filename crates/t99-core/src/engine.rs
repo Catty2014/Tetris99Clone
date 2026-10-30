@@ -24,6 +24,8 @@ pub enum TargetPolicy {
     SpreadWeak,
     /// 在堆最高的前 5 个有余量目标里均匀随机（避免单点饱和）
     RandomTop,
+    /// 只打正在瞄准我的人（T99 反击）；无攻击者时随机
+    Attackers,
 }
 
 #[derive(Clone, Debug)]
@@ -489,8 +491,14 @@ impl Match {
     /// 评测：所有玩家按指定策略锁敌，并忽略后续一切目标键。
     pub fn force_target_policy(&mut self, p: TargetPolicy) {
         self.force_policy = Some(p);
+        // Attackers 需要走 TargetMode 的完整反击分发（多收件人），其余策略由 force_policy 接管，
+        // target_mode 只作为不会被用到的占位。
+        let mode = match p {
+            TargetPolicy::Attackers => TargetMode::Attackers,
+            _ => TargetMode::Random,
+        };
         for player in &mut self.players {
-            player.target_mode = TargetMode::Random;
+            player.target_mode = mode;
         }
     }
 
@@ -1272,6 +1280,14 @@ impl Match {
                 v.truncate(5);
                 let idx = self.players[pid].rng_misc.below(v.len() as u64) as usize;
                 Some(v[idx])
+            }
+            TargetPolicy::Attackers => {
+                // 强制 Attackers 下实际走 TargetMode::Attackers 的反击分发；这里仅为穷尽性。
+                let atk = pool
+                    .iter()
+                    .copied()
+                    .find(|&i| self.players[i].last_target == Some(pid));
+                Some(atk.unwrap_or(pool[0]))
             }
         }
     }

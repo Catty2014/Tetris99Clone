@@ -18,6 +18,7 @@ fn parse_policy(s: &str) -> Option<TargetPolicy> {
         "spreadsafe" => Some(TargetPolicy::SpreadSafe),
         "spreadweak" => Some(TargetPolicy::SpreadWeak),
         "randomtop" => Some(TargetPolicy::RandomTop),
+        "attackers" => Some(TargetPolicy::Attackers),
         _ => None,
     }
 }
@@ -33,6 +34,7 @@ fn policy_name(p: TargetPolicy) -> &'static str {
         TargetPolicy::SpreadSafe => "spreadsafe",
         TargetPolicy::SpreadWeak => "spreadweak",
         TargetPolicy::RandomTop => "randomtop",
+        TargetPolicy::Attackers => "attackers",
     }
 }
 
@@ -85,7 +87,7 @@ fn main() {
                 let v = args.next().unwrap_or_default();
                 policy = parse_policy(&v).unwrap_or_else(|| {
                     eprintln!(
-                        "[policy] 未知策略 `{v}`；可选 random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|spreadweak|randomtop"
+                        "[policy] 未知策略 `{v}`；可选 random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|spreadweak|randomtop|attackers"
                     );
                     std::process::exit(2);
                 });

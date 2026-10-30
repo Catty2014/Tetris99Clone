@@ -124,7 +124,7 @@ fn parse_args() -> Args {
     let force_target = get("--force-target").map(|s| {
         parse_target_policy(&s).unwrap_or_else(|| {
             eprintln!(
-                "[force-target] 未知策略 `{s}`；可选 random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|spreadweak|randomtop"
+                "[force-target] 未知策略 `{s}`；可选 random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|spreadweak|randomtop|attackers"
             );
             std::process::exit(2);
         })
@@ -170,6 +170,7 @@ fn parse_target_policy(s: &str) -> Option<TargetPolicy> {
         "spreadsafe" => Some(TargetPolicy::SpreadSafe),
         "spreadweak" => Some(TargetPolicy::SpreadWeak),
         "randomtop" => Some(TargetPolicy::RandomTop),
+        "attackers" => Some(TargetPolicy::Attackers),
         _ => None,
     }
 }
