@@ -32,7 +32,7 @@ struct Args {
     players: usize,
     bots: Vec<String>,
     seed: u64,
-    max_frames: u64,
+    max_frames: Option<u64>,
     /// 对局预算秒（0 = 按人数自动：4p 5min → 99p 15min）
     time_limit_secs: u64,
     /// 只读规则集；CLI 的 time-limit/stall-accel 仍可覆盖
@@ -133,27 +133,8 @@ fn parse_args() -> Args {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let seat_count = players.max(bots.len());
-    let tick_hz = ruleset.tick_hz.max(1) as u64;
-    // 帧数上限必须跟着实际对局时长走；旧的固定 54000 会在 1200s 局里提前 5 分钟结束。
-    let max_frames = get("--max-frames")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or_else(|| {
-            let secs = if time_limit_secs > 0 {
-                time_limit_secs
-            } else {
-                let ticks = if ruleset.match_ticks > 0 {
-                    ruleset.match_ticks
-                } else {
-                    t99_core::match_ticks_for(seat_count)
-                };
-                (ticks / (1000 * TMS)).max(0) as u64
-            };
-            if secs > 0 {
-                secs * tick_hz + tick_hz
-            } else {
-                54_000
-            }
-        });
+    // 默认不设帧数上限：对局由引擎倒计时/最后存活结束；--max-frames 仅作可选保险。
+    let max_frames = get("--max-frames").and_then(|s| s.parse().ok());
     Args {
         address: get("--address").unwrap_or(cfg.server.address),
         port: get("--port").and_then(|s| s.parse().ok()).unwrap_or(cfg.server.port),
@@ -653,7 +634,11 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             history.push(tick_str.clone());
             hall.lock().unwrap().broadcast(&tick_str);
 
-            if engine.over.is_some() || engine.frame_n >= args.max_frames {
+            if engine.over.is_some()
+                || args
+                    .max_frames
+                    .map_or(false, |m| engine.frame_n >= m)
+            {
                 in_match = false;
             }
             frame_idx += 1;
@@ -795,7 +780,7 @@ fn main() {
     let args = parse_args();
     let human_seats = args.players - args.bots.len();
     eprintln!(
-        "t99-server: {}:{} loglevel={} debug={} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 上限 {} 帧 0杀加速 {} restart_timeout={}s{}",
+        "t99-server: {}:{} loglevel={} debug={} key={} 席位 {}（人类 {} + Bot {}）种子 {} 预算 {} 上限 {} 0杀加速 {} restart_timeout={}s{}",
         args.address,
         args.port,
         args.loglevel,
@@ -806,7 +791,7 @@ fn main() {
         args.bots.len(),
         args.seed,
         if args.time_limit_secs > 0 { format!("{}s", args.time_limit_secs) } else { "auto".into() },
-        args.max_frames,
+        args.max_frames.map_or("auto".to_string(), |m| format!("{m} 帧")),
         if args.stall_accel { "开" } else { "关" },
         args.restart_timeout.as_secs(),
         if args.lobby { " [lobby]" } else { "" },
