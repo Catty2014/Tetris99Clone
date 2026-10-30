@@ -1991,19 +1991,21 @@ fn sync(
         String::new()
     };
     set_text(&mut text_q, views.hud[5], place_str);
-    // 被瞄警示框：与棋盘框同几何的红色描边；被瞄（本方存活）时慢脉冲亮起，一眼可见危险信号
-    if s.alive_self && !s.targeted_by.is_empty() {
-        let pulse = 0.55 + 0.25 * ((s.n as f32 * 0.08).sin() * 0.5 + 0.5);
-        for &e in &views.board_alert {
-            if let Ok((mut v, mut sp, _)) = vq.get_mut(e) {
-                *v = Visibility::Visible;
-                sp.color = Color::srgba(0.95, 0.30, 0.30, pulse);
-            }
-        }
+    // 本方危险度边框：与缩略图背景同一套 danger_color；低危险不显示
+    let self_h = stack_height(&s);
+    let self_alert = if s.alive_self && self_h >= 8 {
+        Some(danger_color(self_h, false))
     } else {
-        for &e in &views.board_alert {
-            if let Ok((mut v, _, _)) = vq.get_mut(e) {
-                *v = Visibility::Hidden;
+        None
+    };
+    for &e in &views.board_alert {
+        if let Ok((mut v, mut sp, _)) = vq.get_mut(e) {
+            match self_alert {
+                Some(c) => {
+                    *v = Visibility::Visible;
+                    sp.color = c.with_alpha(0.65);
+                }
+                None => *v = Visibility::Hidden,
             }
         }
     }
@@ -2275,15 +2277,20 @@ fn sync(
     if s.alive_self {
         let dia = Vec2::new(0.0, -344.0);
         let mut segs: Vec<(Vec2, Vec2, Color)> = Vec::new();
+        let yellow = Color::srgba(1.0, 0.85, 0.25, 0.30);
+        let blue = Color::srgba(0.35, 0.60, 1.0, 0.30);
+        // 互瞄：同一条线画紫，避免黄蓝重叠
+        let purple = Color::srgba(0.72, 0.42, 1.0, 0.34);
         for &pid in &s.targeted_by {
             if let Some(p) = nail_pos(&thumbs, seat, pid) {
-                segs.push((p, dia, Color::srgba(1.0, 0.85, 0.25, 0.30)));
+                let c = if s.target == Some(pid) { purple } else { yellow };
+                segs.push((p, dia, c));
             }
         }
         if let Some(t) = s.target {
-            if t != seat {
+            if t != seat && !s.targeted_by.contains(&t) {
                 if let Some(p) = nail_pos(&thumbs, seat, t) {
-                    segs.push((dia, p, Color::srgba(0.35, 0.60, 1.0, 0.30)));
+                    segs.push((dia, p, blue));
                 }
             }
         }
