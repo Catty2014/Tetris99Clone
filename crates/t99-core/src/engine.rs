@@ -656,6 +656,43 @@ impl Match {
             if !self.players[pid].alive {
                 continue;
             }
+            // KOs：每 tick 重新锁定当前最高堆；徽章：仅当出现更高徽章数时切换。
+            if !self.force_random_target && self.force_policy.is_none() {
+                match self.players[pid].target_mode {
+                    TargetMode::Kos => {
+                        let others: Vec<usize> = self
+                            .players
+                            .iter()
+                            .filter(|p| p.alive && p.id != pid)
+                            .map(|p| p.id)
+                            .collect();
+                        self.players[pid].last_target =
+                            self.pick_target_ordered(pid, &others, TargetMode::Kos);
+                    }
+                    TargetMode::Badges => {
+                        let others: Vec<usize> = self
+                            .players
+                            .iter()
+                            .filter(|p| p.alive && p.id != pid)
+                            .map(|p| p.id)
+                            .collect();
+                        let max_b = others
+                            .iter()
+                            .map(|&i| self.players[i].badges)
+                            .max()
+                            .unwrap_or(0);
+                        let locked_b = self.players[pid]
+                            .last_target
+                            .filter(|&t| t < n && self.players[t].alive)
+                            .map(|t| self.players[t].badges);
+                        if locked_b.map(|b| max_b > b).unwrap_or(true) {
+                            self.players[pid].last_target =
+                                self.pick_target_ordered(pid, &others, TargetMode::Badges);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             let events = std::mem::take(&mut per[pid]);
             let mut cursor: Ticks = 0;
             let mut stop = false;
@@ -1135,22 +1172,21 @@ impl Match {
         }
         match mode {
             TargetMode::Badges => {
-                // 按徽章数（而非档位）排序：档位阈值稀疏（2/6/14/30），多数持有者挤在同档，
-                // 同档按 pid 排序会把集火退化成「打最低 pid」，级联断链。
-                let mut v = pool.to_vec();
-                v.sort_by(|&a, &b| {
-                    self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b))
-                });
-                Some(v[0])
+                // 徽章最高者中随机选一个并锁定；再次选择徽章模式时重新随机。
+                let max_b = pool.iter().map(|&i| self.players[i].badges).max()?;
+                let cands: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.players[i].badges == max_b)
+                    .collect();
+                let idx = self.players[pid].rng_misc.below(cands.len() as u64) as usize;
+                Some(cands[idx])
             }
             TargetMode::Kos => {
-                // 「最接近死亡」= 堆高 + 待进垃圾（T99 的临近击倒语义：濒死含即将进场的垃圾）
-                let near_death = |i: usize| -> i64 {
-                    stack_height(&self.players[i]) as i64
-                        + self.players[i].pending.iter().map(|g| g.rows as i64).sum::<i64>()
-                };
+                // KOs：堆最高的一个，自动锁定；再次选择时重新选当前最高。
+                let h = |i: usize| stack_height(&self.players[i]) as i64;
                 let mut v = pool.to_vec();
-                v.sort_by(|&a, &b| near_death(b).cmp(&near_death(a)).then(a.cmp(&b)));
+                v.sort_by(|&a, &b| h(b).cmp(&h(a)).then(a.cmp(&b)));
                 Some(v[0])
             }
             TargetMode::Random => {
@@ -1196,20 +1232,21 @@ impl Match {
             TargetPolicy::Kos => {
                 let mut v = pool.to_vec();
                 v.sort_by(|&a, &b| {
-                    let na = stack_height(&self.players[a]) as i64
-                        + self.players[a].pending.iter().map(|g| g.rows as i64).sum::<i64>();
-                    let nb = stack_height(&self.players[b]) as i64
-                        + self.players[b].pending.iter().map(|g| g.rows as i64).sum::<i64>();
-                    nb.cmp(&na).then(a.cmp(&b))
+                    stack_height(&self.players[b])
+                        .cmp(&stack_height(&self.players[a]))
+                        .then(a.cmp(&b))
                 });
                 Some(v[0])
             }
             TargetPolicy::Badges => {
-                let mut v = pool.to_vec();
-                v.sort_by(|&a, &b| {
-                    self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b))
-                });
-                Some(v[0])
+                let max_b = pool.iter().map(|&i| self.players[i].badges).max()?;
+                let cands: Vec<usize> = pool
+                    .iter()
+                    .copied()
+                    .filter(|&i| self.players[i].badges == max_b)
+                    .collect();
+                let idx = self.players[pid].rng_misc.below(cands.len() as u64) as usize;
+                Some(cands[idx])
             }
             TargetPolicy::Spread => {
                 let weights: Vec<u64> = pool
@@ -1380,8 +1417,47 @@ impl Match {
                     atk.into_iter().map(|r| (r, rows)).collect()
                 }
             }
-            m => {
-                let t = self.pick_target_ordered(pid, &others, m);
+            TargetMode::Random => {
+                // 随机：每成功发送一次换一个目标；再次选择随机模式时也重新随机。
+                match self.pick_target_ordered(pid, &others, TargetMode::Random) {
+                    Some(t) => vec![(t, rows)],
+                    None => vec![],
+                }
+            }
+            m @ (TargetMode::Random | TargetMode::Kos) => {
+                // 随机：每发送成功一次换一个；KOs：每 tick 重新锁定当前最高堆。
+                match self.pick_target_ordered(pid, &others, m) {
+                    Some(t) => vec![(t, rows)],
+                    None => vec![],
+                }
+            }
+            m @ (TargetMode::Badges | TargetMode::Manual(_)) => {
+                // 徽章：锁定，除非出现更高徽章数；手动：锁定直到目标失效。
+                let locked = self.players[pid]
+                    .last_target
+                    .filter(|&t| t < self.players.len() && t != pid && self.players[t].alive);
+                let t = match m {
+                    TargetMode::Badges => {
+                        let max_b = others
+                            .iter()
+                            .map(|&i| self.players[i].badges)
+                            .max()
+                            .unwrap_or(0);
+                        let locked_b = locked.map(|t| self.players[t].badges);
+                        if locked_b.map(|b| max_b > b).unwrap_or(true) {
+                            let picked = self.pick_target_ordered(pid, &others, m);
+                            self.players[pid].last_target = picked;
+                            picked
+                        } else {
+                            locked
+                        }
+                    }
+                    _ => locked.or_else(|| {
+                        let picked = self.pick_target_ordered(pid, &others, m);
+                        self.players[pid].last_target = picked;
+                        picked
+                    }),
+                };
                 match t {
                     Some(t) => vec![(t, rows)],
                     None => vec![],
@@ -2535,6 +2611,49 @@ mod tests {
         let recv = m.resolve_receivers(0, 4);
         assert_eq!(recv.len(), 1);
         assert_eq!(recv[0].0, 1); // 退化为存活他人
+    }
+
+    #[test]
+    fn badge_target_locks_until_surpassed() {
+        let mut m = Match::new(MatchConfig { players: 4, seed: 13, ruleset: Ruleset::default() });
+        m.players[1].badges = 2;
+        m.players[2].badges = 1;
+        m.apply_key(0, Key::TargetBadges);
+        assert_eq!(m.players[0].last_target, Some(1));
+        // 并列不换
+        m.players[2].badges = 2;
+        assert_eq!(m.resolve_receivers(0, 3), vec![(1, 3)]);
+        // 被更高徽章数超越 -> 自动切到新候选
+        m.players[2].badges = 5;
+        assert_eq!(m.resolve_receivers(0, 3), vec![(2, 3)]);
+        // 重新选择徽章模式 -> 锁定当前最高
+        m.apply_key(0, Key::TargetBadges);
+        assert_eq!(m.players[0].last_target, Some(2));
+    }
+
+    #[test]
+    fn kos_follows_current_highest() {
+        let mut m = Match::new(MatchConfig { players: 4, seed: 14, ruleset: Ruleset::default() });
+        for r in 10..ROWS {
+            for c in 0..W {
+                m.players[1].board[r * W + c] = 1;
+            }
+        }
+        for r in 18..ROWS {
+            for c in 0..W {
+                m.players[2].board[r * W + c] = 1;
+            }
+        }
+        m.apply_key(0, Key::TargetKos);
+        assert_eq!(m.players[0].last_target, Some(1));
+        // 另一个玩家堆更高后，下一次攻击跟随当前最高
+        for r in 8..ROWS {
+            for c in 0..W {
+                m.players[2].board[r * W + c] = 1;
+            }
+        }
+        assert_eq!(m.resolve_receivers(0, 3), vec![(2, 3)]);
+        assert_eq!(m.players[0].last_target, Some(2));
     }
 
     #[test]
