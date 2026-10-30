@@ -70,6 +70,16 @@ pub struct ClearView {
     pub frame: u64,
 }
 
+/// 单次攻击事件（客户端画光点/连线用）
+#[derive(Clone, Debug)]
+pub struct AttackEvent {
+    pub from: usize,
+    pub to: usize,
+    /// 最终攻击力（加算/徽章/cap20 后，不含受击递增）
+    pub rows: u32,
+    pub frame: u64,
+}
+
 /// 待进垃圾批次视图（客户端分组显示用）
 #[derive(Clone, Debug)]
 pub struct GarbView {
@@ -405,6 +415,8 @@ pub struct Match {
     pub force_random_target: bool,
     /// 强制目标策略（优先级高于 force_random_target 与一切目标键）
     pub force_policy: Option<TargetPolicy>,
+    /// 最近一帧的攻击事件（客户端画光点/连线）
+    pub recent_attacks: Vec<AttackEvent>,
 }
 
 impl Match {
@@ -486,6 +498,7 @@ impl Match {
             match_total_ticks: match_ticks_left,
             force_random_target: false,
             force_policy: None,
+            recent_attacks: Vec::new(),
         };
         for pid in 0..m.players.len() {
             m.spawn(pid, None, false);
@@ -616,6 +629,7 @@ impl Match {
 
     /// 帧推进：sanitize 后按事件时刻精确积分。
     pub fn frame(&mut self, inputs: &[Vec<TimedKey>]) {
+        self.recent_attacks.clear();
         if self.over.is_some() {
             return;
         }
@@ -1696,6 +1710,12 @@ impl Match {
                 overflow += sent_rows;
             }
             for (rid, rows) in recv {
+                self.recent_attacks.push(AttackEvent {
+                    from: pid,
+                    to: rid,
+                    rows: total,
+                    frame: self.frame_n,
+                });
                 // 受击递增只影响实际收到的垃圾，不影响阻挡/抵消
                 let rows = rows.saturating_add(self.garbage_bonus());
                 let have: u32 = self.players[rid].pending.iter().map(|g| g.rows).sum();
@@ -1931,6 +1951,11 @@ impl Match {
 
     pub fn alive_count(&self) -> usize {
         self.alive_count
+    }
+
+    /// 最近一帧的攻击事件（客户端画光点/连线）
+    pub fn recent_attacks(&self) -> &[AttackEvent] {
+        &self.recent_attacks
     }
 
     /// 从预定时间 66.66% 起，每 3.33% 所有玩家受到的垃圾行 +1。

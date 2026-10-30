@@ -17,7 +17,7 @@ use web_time::Instant;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 use t99_bots::BotAdapter;
-use t99_core::engine::ActiveView;
+use t99_core::engine::{ActiveView, AttackEvent};
 use t99_core::{Cell, Key, Match, MatchConfig, PlayerPhase, Ruleset, Snapshot, TargetMode, TimedKey, TMS, W, H};
 use t99_proto::{PlayerAdapter, PROTOCOL};
 
@@ -63,7 +63,8 @@ fn danger_color(h: usize, dead: bool) -> Color {
         return Color::srgb(0.35, 0.35, 0.38);
     }
     match h {
-        0..=7 => Color::srgb(0.9, 0.9, 0.9),
+        // 低危险度底色压暗一档：提亮方块本身的可读性（底色越亮，方块越糊）
+        0..=7 => Color::srgb(0.66, 0.70, 0.78),
         8..=11 => Color::srgb(0.72, 0.62, 0.18),
         12..=14 => Color::srgb(0.92, 0.5, 0.12),
         _ => Color::srgb(0.92, 0.18, 0.18),
@@ -302,6 +303,10 @@ struct Views {
     dbg_tps: Entity,
     dbg_fps: Entity,
     dbg_bot_bg: Entity,
+    /// Next6 下方信息面板：徽章/击杀/档位/攻击加成/存活（逐帧 set_text）
+    info: [Entity; 5],
+    /// 被瞄警示框：与棋盘框同几何的红色描边，targeted_by 非空时亮起
+    board_alert: Vec<Entity>,
 }
 
 struct ThumbView {
@@ -320,6 +325,19 @@ struct ThumbView {
     rank: Entity,
 }
 
+/// 攻击光点动画状态：来自最近一个引擎 tick 的 recent_attacks。
+/// 槽位与光点池一一对应，None = 空闲；无事件时全部隐藏，每帧只复用实体。
+struct DotFx {
+    from: Vec2,
+    to: Vec2,
+    born: Instant,
+    rows: u32,
+    /// 颜色随方向（来袭红 / 自发金 / 旁观灰），透明度勿再推算
+    color: Color,
+    /// 基础亮度：旁观事件明显更暗（~0.15）
+    base: f32,
+}
+
 #[derive(Resource, Default)]
 struct Thumbs {
     n: usize,
@@ -328,6 +346,14 @@ struct Thumbs {
     last_refresh: Option<Instant>,
     /// 上一帧的局内帧号（倒退 = 新局，网格等级重置）
     last_frame: u64,
+    /// 攻击连线池（被瞄黄/瞄准蓝）：z=6 缩略图之上、调试 HUD 之下
+    atk_lines: Vec<Entity>,
+    /// 攻击光点池：z=5，每 tick 的 recent_attacks 生成 0.3s 飞行淡出光点
+    atk_dots: Vec<Entity>,
+    /// 光点动画槽位（与 atk_dots 一一对应，None = 空闲）
+    slots: Vec<Option<DotFx>>,
+    /// 已消费的引擎 tick 号：同一 tick 在多个渲染帧间只采一次事件
+    last_tick: u64,
 }
 
 #[derive(Resource)]
@@ -408,11 +434,14 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     let cells = spawn_grid(&mut cmd, Vec2::ZERO, CELL, W, H, 0.0);
     let active = spawn_grid(&mut cmd, Vec2::ZERO, CELL, 1, 4, 2.0);
     let ghost = spawn_grid(&mut cmd, Vec2::ZERO, CELL, 1, 4, 1.0);
+    // 保存（Hold）框：整体右移，右缘与下方垃圾列(-174..-144)对齐组成左侧紧凑列；
+    // 距棋盘框（-142..-140）4px，不与任何框重叠。棋盘/Next/HUD 不动。
+    let hold_x = -196.0;
     cmd.spawn((
         Sprite::from_color(Color::srgb(0.08, 0.09, 0.13), Vec2::new(4.0 * 20.0 + 8.0, 2.0 * 20.0 + 8.0)),
-        Transform::from_xyz(-226.0, 240.0, -0.5),
+        Transform::from_xyz(hold_x, 240.0, -0.5),
     ));
-    let hold = spawn_grid(&mut cmd, Vec2::new(-226.0, 240.0), 20.0, 4, 2, 0.0);
+    let hold = spawn_grid(&mut cmd, Vec2::new(hold_x, 240.0), 20.0, 4, 2, 0.0);
     let next = spawn_grid(&mut cmd, Vec2::new(190.0, 119.0), 16.0, 4, 18, 0.0);
     // 垃圾条单列堆叠：红(即将进场)在下，黄(计时)其上，灰(排队)顶层。
     // 预铺 72 格：sync 按 garbage_batches 分组摆位（批间 3 倍行距），超高时压缩行距。
@@ -420,19 +449,65 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
 
     // 分区框与标题（界定区域 + 辅助文字）。
     // 对齐：保存/对战盘/预览上沿取齐（+270）；垃圾下沿与对战盘下沿取齐（-270）；
-    // 攻击盘位于对战盘下方，留 16px 空隙。保存框右缘不与棋盘框（-140）重叠。
+    // 攻击盘位于对战盘下方，留 16px 空隙。保存框右缘距棋盘框 4px。
     let fc = Color::srgb(0.30, 0.34, 0.42);
     let lc = Color::srgb(0.45, 0.50, 0.60);
+    // 分区底衬：Next 列 / 垃圾列 / 攻击盘 / 信息面板统一加一层略深的背衬，
+    // 与棋盘/保存的深底一致，分区和 99 缩略图拉开明暗层次。
+    let panel_c = Color::srgb(0.07, 0.08, 0.12);
     frame_rect(&mut cmd, Vec2::new(0.0, 0.0), W as f32 * CELL + 20.0, H as f32 * CELL + 20.0, fc, -0.7);
-    frame_rect(&mut cmd, Vec2::new(-226.0, 240.0), 96.0, 60.0, fc, -0.7);
+    frame_rect(&mut cmd, Vec2::new(hold_x, 240.0), 96.0, 60.0, fc, -0.7);
     frame_rect(&mut cmd, Vec2::new(190.0, 119.0), 74.0, 302.0, fc, -0.7);
     frame_rect(&mut cmd, Vec2::new(-159.0, -4.0), 30.0, H as f32 * 20.0 + 12.0, fc, -0.7);
     frame_rect(&mut cmd, Vec2::new(0.0, -344.0), 176.0, 116.0, fc, -0.7);
+    for (pos, size) in [
+        (Vec2::new(190.0, 119.0), Vec2::new(70.0, 298.0)),
+        (Vec2::new(-159.0, -4.0), Vec2::new(26.0, H as f32 * 20.0 + 8.0)),
+        (Vec2::new(0.0, -344.0), Vec2::new(172.0, 112.0)),
+    ] {
+        cmd.spawn((Sprite::from_color(panel_c, size), Transform::from_xyz(pos.x, pos.y, -0.6)));
+    }
+    // 被瞄警示框：与棋盘框同几何，红色描边（z= -0.65 压在灰框 -0.7 之上）；
+    // 平时隐藏，targeted_by 非空时亮起并慢脉冲。
+    let bw = W as f32 * CELL + 20.0;
+    let bh = H as f32 * CELL + 20.0;
+    let mut board_alert = Vec::new();
+    for (pos, size) in [
+        (Vec2::new(0.0, bh / 2.0 - 1.0), Vec2::new(bw, 2.0)),
+        (Vec2::new(0.0, -bh / 2.0 + 1.0), Vec2::new(bw, 2.0)),
+        (Vec2::new(-bw / 2.0 + 1.0, 0.0), Vec2::new(2.0, bh)),
+        (Vec2::new(bw / 2.0 - 1.0, 0.0), Vec2::new(2.0, bh)),
+    ] {
+        board_alert.push(
+            cmd.spawn((
+                Sprite::from_color(Color::srgba(0.95, 0.30, 0.30, 0.0), size),
+                Transform::from_xyz(pos.x, pos.y, -0.65),
+                Visibility::Hidden,
+            ))
+            .id(),
+        );
+    }
     text(&mut cmd, &font, "对战盘", 13.0, lc, Vec2::new(-95.0, 283.0));
-    text(&mut cmd, &font, "保存", 13.0, lc, Vec2::new(-226.0, 282.0));
+    text(&mut cmd, &font, "保存", 13.0, lc, Vec2::new(hold_x, 282.0));
     text(&mut cmd, &font, "预览", 13.0, lc, Vec2::new(190.0, 282.0));
     text(&mut cmd, &font, "垃圾", 13.0, lc, Vec2::new(-159.0, -282.0));
     text(&mut cmd, &font, "攻击", 13.0, lc, Vec2::new(0.0, -414.0));
+    // —— Next6 下方信息面板（x≈190，y -48…-172）：徽章/击杀/档位/攻击加成/存活。
+    // 74px 宽与 Next 列框同宽对齐；上距 Next 框 16px；距 99p 右侧网格内缘(243) ≥16px；
+    // 距窗口右下调试 HUD（y < -400）远，不重叠。
+    frame_rect(&mut cmd, Vec2::new(190.0, -110.0), 74.0, 124.0, fc, -0.7);
+    cmd.spawn((
+        Sprite::from_color(panel_c, Vec2::new(70.0, 120.0)),
+        Transform::from_xyz(190.0, -110.0, -0.6),
+    ));
+    text(&mut cmd, &font, "状态", 13.0, lc, Vec2::new(190.0, -70.0));
+    let info = [
+        text(&mut cmd, &font, "", 12.0, Color::srgb(0.85, 0.88, 0.95), Vec2::new(190.0, -92.0)),
+        text(&mut cmd, &font, "", 12.0, Color::srgb(0.85, 0.88, 0.95), Vec2::new(190.0, -110.0)),
+        text(&mut cmd, &font, "", 12.0, Color::srgb(0.85, 0.88, 0.95), Vec2::new(190.0, -128.0)),
+        text(&mut cmd, &font, "", 12.0, Color::srgb(0.85, 0.88, 0.95), Vec2::new(190.0, -146.0)),
+        text(&mut cmd, &font, "", 12.0, Color::srgb(0.85, 0.88, 0.95), Vec2::new(190.0, -164.0)),
+    ];
 
     let mut hud = Vec::new();
     let stats: [(&str, f32); 5] = [
@@ -566,12 +641,41 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     let dbg_fps = dbg_span(&mut cmd, "");
     cmd.entity(dbg_bot)
         .add_children(&[dbg_bot_status, dbg_lat, dbg_loss, dbg_tps, dbg_fps]);
+    // 攻击连线池（14 条够覆盖 targeted_by≤10+瞄准 1，留余量）与光点池（多批多点同 tick）
+    let mut atk_lines = Vec::new();
+    for _ in 0..14 {
+        atk_lines.push(
+            cmd.spawn((
+                Sprite::from_color(Color::WHITE, Vec2::new(1.0, 2.6)),
+                Transform::from_xyz(0.0, 0.0, 6.0),
+                Visibility::Hidden,
+            ))
+            .id(),
+        );
+    }
+    let mut atk_dots = Vec::new();
+    for _ in 0..24 {
+        atk_dots.push(
+            cmd.spawn((
+                Sprite::from_color(Color::WHITE, Vec2::splat(10.0)),
+                Transform::from_xyz(0.0, 0.0, 5.0),
+                Visibility::Hidden,
+            ))
+            .id(),
+        );
+    }
     cmd.insert_resource(Views {
         cells, active, ghost, ghost_enabled: display.ghost, hold, next, meter, hud, diamond, diamond_center, judge,
         judge_num, judge_sub, judge_sub_num, death_mask, death_rank,
         dbg_top, dbg_top_bg, dbg_bot, dbg_bot_status, dbg_lat, dbg_loss, dbg_tps, dbg_fps, dbg_bot_bg,
+        info, board_alert,
     });
-    cmd.insert_resource(Thumbs::default());
+    cmd.insert_resource(Thumbs {
+        atk_lines,
+        slots: atk_dots.iter().map(|_| None).collect(),
+        atk_dots,
+        ..Default::default()
+    });
     cmd.insert_resource(PrevPiece { pieces: 0, y_milli: 0 });
 }
 
@@ -1551,6 +1655,8 @@ fn sync(
     }
     // 反攻模式：被本方瞄准的是全部攻击者（引擎把完整攻击分别打给每个攻击者，最多 10 人）
     let attackers_mode = s.target_mode == TargetMode::Attackers;
+    // 本方座位：连线/光点端点用它区分菱形与缩略图
+    let seat = session.with_engine(|_, st| st).unwrap_or(0);
     // —— 己方棋盘 ——
     show_grid(&mut vq, &views.cells, W, &|r, c| if s.board[r][c] != 0 { Some(s.board[r][c]) } else { None });
     // 消行闪烁：Clear 相位中被消的行以白色脉冲覆盖
@@ -1642,8 +1748,9 @@ fn sync(
         for g in batches.iter() {
             if let Some(ps) = prev_sender {
                 if ps != g.sender {
-                    // 批界：总步距 3 × 行距（比普通相邻多 2 个行距）
-                    y += 2.0 * pitch;
+                    // 批界：多出 2 个“方块间隙”，总间距 = 3 × 普通行间隙（不是 3 × 方块宽）
+                    let gap = (pitch - cell_size).max(0.0);
+                    y += 2.0 * gap;
                 }
             }
             prev_sender = Some(g.sender);
@@ -1727,6 +1834,22 @@ fn sync(
         String::new()
     };
     set_text(&mut text_q, views.hud[5], place_str);
+    // 被瞄警示框：与棋盘框同几何的红色描边；被瞄（本方存活）时慢脉冲亮起，一眼可见危险信号
+    if s.alive_self && !s.targeted_by.is_empty() {
+        let pulse = 0.55 + 0.25 * ((s.n as f32 * 0.08).sin() * 0.5 + 0.5);
+        for &e in &views.board_alert {
+            if let Ok((mut v, mut sp, _)) = vq.get_mut(e) {
+                *v = Visibility::Visible;
+                sp.color = Color::srgba(0.95, 0.30, 0.30, pulse);
+            }
+        }
+    } else {
+        for &e in &views.board_alert {
+            if let Ok((mut v, _, _)) = vq.get_mut(e) {
+                *v = Visibility::Hidden;
+            }
+        }
+    }
     // 中央棋盘死亡蒙版 + 名次（蒙版只盖棋盘本体；垃圾条/Next/目标面板/调试 HUD 均在外）
     if let Ok((mut v, _, _)) = vq.get_mut(views.death_mask) {
         *v = if s.alive_self { Visibility::Hidden } else { Visibility::Visible };
@@ -1750,6 +1873,27 @@ fn sync(
     let mut color_q_state = color_q;
     if let Ok(mut tc) = color_q_state.get_mut(views.hud[6]) {
         tc.0 = if s.burn_x10 > 10 { Color::srgb(0.95, 0.35, 0.35) } else { Color::srgb(0.65, 0.7, 0.8) };
+    }
+    // —— Next6 下方信息面板：徽章单元/击杀/档位 Lv/攻击加成(+25%×档)/剩余人数 ——
+    {
+        let rows = [
+            format!("徽章 {}", s.badge_units),
+            format!("击杀 {}", s.ko),
+            format!("档位 Lv.{}", s.badges.clamp(0, 4)),
+            format!("攻击 +{}%", s.badges * 25),
+            format!("存活 {}", s.alive.len()),
+        ];
+        for (i, r) in rows.iter().enumerate() {
+            set_text(&mut text_q, views.info[i], r.clone());
+        }
+        // 有加成时攻击行点亮金色，与菱形选中色一致
+        if let Ok(mut tc) = color_q_state.get_mut(views.info[3]) {
+            tc.0 = if s.badges > 0 {
+                Color::srgb(0.98, 0.8, 0.25)
+            } else {
+                Color::srgb(0.85, 0.88, 0.95)
+            };
+        }
     }
     // 当前模式参数（相位规格 + 垃圾延迟）
     let params = session
@@ -1966,6 +2110,120 @@ fn sync(
                 };
             }
         }
+    }
+    // —— 攻击连线：被瞄(targeted_by → 菱形 黄) + 本方瞄准(菱形 → target 蓝) ——
+    // z=6：99p 缩略图（z≤3）之上、调试 HUD（z=50）之下；池化复用，多余槽隐藏。
+    // 本方已出局时菱形被攻击盘蒙灰接管，不再画线。
+    if s.alive_self {
+        let dia = Vec2::new(0.0, -344.0);
+        let mut segs: Vec<(Vec2, Vec2, Color)> = Vec::new();
+        for &pid in &s.targeted_by {
+            if let Some(p) = nail_pos(&thumbs, seat, pid) {
+                segs.push((p, dia, Color::srgba(1.0, 0.85, 0.25, 0.30)));
+            }
+        }
+        if let Some(t) = s.target {
+            if t != seat {
+                if let Some(p) = nail_pos(&thumbs, seat, t) {
+                    segs.push((dia, p, Color::srgba(0.35, 0.60, 1.0, 0.30)));
+                }
+            }
+        }
+        segs.truncate(thumbs.atk_lines.len());
+        for (i, &e) in thumbs.atk_lines.iter().enumerate() {
+            let Some(&(p0, p1, c)) = segs.get(i) else {
+                if let Ok((mut v, _, _)) = vq.get_mut(e) {
+                    *v = Visibility::Hidden;
+                }
+                continue;
+            };
+            let d = p1 - p0;
+            let len = d.length();
+            if len < 8.0 {
+                if let Ok((mut v, _, _)) = vq.get_mut(e) {
+                    *v = Visibility::Hidden;
+                }
+                continue;
+            }
+            if let Ok((mut v, mut sp, mut tr)) = vq.get_mut(e) {
+                *v = Visibility::Visible;
+                sp.custom_size = Some(Vec2::new(len, 2.6));
+                sp.color = c;
+                tr.translation = Vec3::new((p0.x + p1.x) / 2.0, (p0.y + p1.y) / 2.0, 6.0);
+                tr.rotation = Quat::from_rotation_z(d.y.atan2(d.x));
+            }
+        }
+    }
+    // —— 攻击光点：每 tick 的 recent_attacks 生成 0.3s 飞行淡出光点；按 tick 号去重，
+    // 池化复用（不 spawn/despawn），无事件时槽位保持隐藏。——
+    {
+        let now = Instant::now();
+        let evs: Vec<AttackEvent> =
+            session.with_engine(|e, _| e.recent_attacks().to_vec()).unwrap_or_default();
+        if !evs.is_empty() && s.n != thumbs.last_tick {
+            thumbs.last_tick = s.n;
+            for ev in &evs {
+                let (Some(p0), Some(p1)) = (nail_pos(&thumbs, seat, ev.from), nail_pos(&thumbs, seat, ev.to))
+                else {
+                    continue;
+                };
+                if (p1 - p0).length() < 8.0 {
+                    continue;
+                }
+                let Some(slot) = thumbs.slots.iter_mut().find(|s| s.is_none()) else {
+                    break; // 池满：丢最后续的事件（1 tick 最多 ~10 发）
+                };
+                // 来袭（to=本方）红、自发（from=本方）金、旁观（双方均非本方）灰且明显更暗
+                let (color, base) = if ev.from != seat && ev.to != seat {
+                    (Color::srgb(0.72, 0.75, 0.82), 0.15)
+                } else if ev.to == seat {
+                    (Color::srgb(1.0, 0.42, 0.30), 0.30 + ev.rows.min(20) as f32 / 20.0 * 0.30)
+                } else {
+                    (Color::srgb(1.0, 0.78, 0.28), 0.30 + ev.rows.min(20) as f32 / 20.0 * 0.30)
+                };
+                *slot = Some(DotFx {
+                    from: p0,
+                    to: p1,
+                    born: now,
+                    rows: ev.rows,
+                    color,
+                    base,
+                });
+            }
+        }
+        let atk_dots = thumbs.atk_dots.clone();
+        for (i, slot) in thumbs.slots.iter_mut().enumerate() {
+            let Some(&e) = atk_dots.get(i) else { continue };
+            let Some(d) = slot else { continue }; // 空闲槽：释放时已隐藏，保持原状即可
+            let el = (now.duration_since(d.born).as_secs_f32() / 0.3).min(1.0);
+            if el >= 1.0 {
+                if let Ok((mut v, _, _)) = vq.get_mut(e) {
+                    *v = Visibility::Hidden;
+                }
+                *slot = None;
+                continue;
+            }
+            let eased = el * (2.0 - el); // 缓出：起步快、落点稳
+            let p = d.from + (d.to - d.from) * eased;
+            let dir = d.to - d.from;
+            let r = (4.5 + d.rows as f32 * 0.4).min(11.0); // 亮度/大小随攻击力(1..=20)增加
+            if let Ok((mut v, mut sp, mut tr)) = vq.get_mut(e) {
+                *v = Visibility::Visible;
+                sp.custom_size = Some(Vec2::new(r * 2.4, r * 1.9));
+                sp.color = d.color.with_alpha(d.base * (1.0 - el) * (1.0 - el));
+                tr.translation = Vec3::new(p.x, p.y, 5.0);
+                tr.rotation = Quat::from_rotation_z(dir.y.atan2(dir.x));
+            }
+        }
+    }
+}
+
+/// pid → 连线/光点端点：本方 = 攻击面板中心菱形 (0,-344)；其他 = 缩略图中心（无缩略图则 None）。
+fn nail_pos(thumbs: &Thumbs, seat: usize, pid: usize) -> Option<Vec2> {
+    if pid == seat {
+        Some(Vec2::new(0.0, -344.0))
+    } else {
+        thumbs.views.iter().find(|t| t.pid == pid).map(|t| t.origin)
     }
 }
 
