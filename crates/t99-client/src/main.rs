@@ -1245,6 +1245,20 @@ mod repeat_tests {
     }
 
     #[test]
+    fn embedded_config_parses() {
+        // wasm 构建没有文件系统，client.toml / ruleset.toml 以 include_str! 嵌入；
+        // 这里验证嵌入文本本身可解析，避免浏览器版运行时才 panic。
+        let cfg = t99_config::ClientConfig::from_toml(include_str!("../../../client.toml"))
+            .expect("client.toml 应可解析");
+        assert!(!cfg.control.left.is_empty());
+        assert!(cfg.control.das_ticks >= 1);
+        let rc = t99_config::RulesetConfig::from_toml(include_str!("../../../ruleset.toml"))
+            .expect("ruleset.toml 应可解析");
+        assert_eq!(rc.ruleset.id, t99_core::RULESET_ID);
+        assert!(rc.to_ruleset().is_ok());
+    }
+
+    #[test]
     fn das_then_arr_emits_one_step_per_interval() {
         let t0 = Instant::now();
         let das = Duration::from_millis(167);
@@ -2402,6 +2416,7 @@ fn version_ok(protocol: u64, ruleset: &str) -> bool {
     protocol == PROTOCOL as u64 && ruleset == t99_core::RULESET_ID
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn net_thread(
     url: String,
     id: String,
@@ -2709,11 +2724,20 @@ fn main() {
         }
         i += 1;
     }
+    #[cfg(not(target_arch = "wasm32"))]
     let cfg = t99_config::load_client(config_path.as_deref().map(std::path::Path::new))
         .unwrap_or_else(|e| {
             eprintln!("[config] {e}");
             std::process::exit(2);
         });
+    // wasm 没有文件系统、环境变量与 CLI：把仓库里的 client.toml 编译期嵌入，
+    // 让浏览器版与 native 默认配置一致（键位、显示、observer/spectate 等）。
+    #[cfg(target_arch = "wasm32")]
+    let cfg = {
+        let _ = &config_path;
+        t99_config::ClientConfig::from_toml(include_str!("../../../client.toml"))
+            .unwrap_or_else(|e| panic!("内嵌 client.toml 解析失败: {e}"))
+    };
     if !observer_explicit {
         observer = cfg.client.observer;
     }
@@ -2731,11 +2755,19 @@ fn main() {
             cfg.display.framerate
         );
     }
+    #[cfg(not(target_arch = "wasm32"))]
     let rc = t99_config::load_ruleset(Some(std::path::Path::new(&cfg.ruleset_file)))
         .unwrap_or_else(|e| {
             eprintln!("[ruleset] {e}");
             std::process::exit(2);
         });
+    // wasm 同样嵌入 ruleset.toml：否则浏览器版本地局会静默退回默认规则。
+    #[cfg(target_arch = "wasm32")]
+    let rc = {
+        let _ = &cfg.ruleset_file;
+        t99_config::RulesetConfig::from_toml(include_str!("../../../ruleset.toml"))
+            .unwrap_or_else(|e| panic!("内嵌 ruleset.toml 解析失败: {e}"))
+    };
     if rc.ruleset.id != t99_core::RULESET_ID {
         eprintln!(
             "[ruleset] id 不匹配: file={} compiled={}；修改规则集后必须同步重编 RULESET_ID",

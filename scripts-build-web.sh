@@ -29,5 +29,29 @@ while pos < len(data):
 open('crates/t99-client/web/t99-client_bg.wasm','wb').write(bytes(out))
 print(f"strip -> {len(out)/1e6:.1f}MB")
 PY
+mkdir -p crates/t99-client/web/assets/fonts
 cp crates/t99-client/assets/fonts/CJK.otf crates/t99-client/web/assets/fonts/CJK.otf
+cat > crates/t99-client/web/index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>t99 · Arena Tetris</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<script type="module">
+  import init from './t99-client.js';
+  init().catch((e) => {
+    document.body.innerHTML = '<pre style="color:#f66;padding:16px">' + e + '</pre>';
+    throw e;
+  });
+</script>
+</body>
+</html>
+HTML
 echo "完成: cd crates/t99-client/web && python3 -m http.server 8137"
