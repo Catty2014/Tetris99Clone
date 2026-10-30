@@ -1336,8 +1336,17 @@ impl Match {
                     vec![(pool[idx], rows)]
                 } else {
                     // T99：反击把完整攻击分别打给每个攻击者，不均分；最多 10 人。
+                    // 超过 10 人时随机取 10 个，避免按 pid 截断对高编号席位的系统性偏置。
                     atk.sort_unstable();
-                    atk.truncate(10);
+                    if atk.len() > 10 {
+                        for i in 0..10 {
+                            let j = i + self.players[pid]
+                                .rng_misc
+                                .below((atk.len() - i) as u64) as usize;
+                            atk.swap(i, j);
+                        }
+                        atk.truncate(10);
+                    }
                     atk.into_iter().map(|r| (r, rows)).collect()
                 }
             }

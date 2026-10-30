@@ -240,10 +240,41 @@ fn ev(t_us: u32, key: Key) -> TimedKey {
 /// 平摊式的 TargetAttackers 会让火力全被 1:1 抵消，谁也打不死谁。
 /// 99 人基准实测：在“待进未满”的目标里均匀随机，优于 Kos/Badges/Spread 等集中策略。
 /// 集中攻击会撞上 12 行待进上限，并被目标的消行抵消，实际进场反而更少。
-pub fn desired_target(_s: &Snapshot) -> Key {
-    // 99 人实测：反击（完整攻击打给每个攻击者，最多 10 人）显著提高进场与淘汰。
-    // 无人瞄准时引擎会退化为随机，所以始终选择反击即可。
-    Key::TargetAttackers
+/// 攻防目标策略（徽章转移感知）：
+/// 被瞄且待进 ≥3 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
+/// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
+pub fn desired_target(s: &Snapshot) -> Key {
+    let pending = s.garbage_red + s.garbage_yellow + s.garbage_gray;
+    if !s.targeted_by.is_empty() && pending >= 3 {
+        // 待进已满的瞄准者会把攻击丢弃，优先反打仍有余量者；全员饱和才退回原逻辑
+        let roomy: Vec<usize> = s
+            .targeted_by
+            .iter()
+            .copied()
+            .filter(|&p| {
+                s.garbage_cap == 0 || s.pending_all.get(p).copied().unwrap_or(0) < s.garbage_cap
+            })
+            .collect();
+        let pool: &[usize] = if roomy.is_empty() { &s.targeted_by } else { &roomy };
+        let fattest = pool
+            .iter()
+            .copied()
+            .max_by_key(|&p| s.badges_all.get(p).copied().unwrap_or(0))
+            .unwrap_or(0);
+        Key::TargetPlayer(fattest as u16)
+    } else {
+        let leader = s
+            .badges_all
+            .iter()
+            .enumerate()
+            .filter(|&(p, _)| p != s.pid)
+            .max_by_key(|&(_, &b)| b)
+            .map(|(p, &b)| (p, b));
+        match leader {
+            Some((_, b)) if b >= 3 => Key::TargetBadges,
+            _ => Key::TargetKos,
+        }
+    }
 }
 // 注：反攻条件加 pending≥3（真正受威胁才反打），否则坚持围猎，避免「永远反攻」僵局。
 
@@ -440,7 +471,7 @@ impl Bot for BasicBot {
         }
         if self.frames == 0 {
             self.frames += 1;
-            return vec![ev(0, Key::TargetAttackers)];
+            return vec![ev(0, Key::TargetRandom)];
         }
         self.frames += 1;
         let Some(a) = s.active else { return vec![] };

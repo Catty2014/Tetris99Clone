@@ -1459,7 +1459,7 @@ fn sync(
     });
     // —— HUD ——
     set_text(&mut text_q, views.hud[0], format!("存活 {}/{} 相位{}", s.alive.len(), session.with_engine(|e, _| e.players.len()).unwrap_or(0), session.with_engine(|e, _| e.phase_idx + 1).unwrap_or(1)));
-    set_text(&mut text_q, views.hud[1], format!("徽章{} KO{} 块{}", s.badges, s.ko, s.pieces));
+    set_text(&mut text_q, views.hud[1], format!("徽章{} KO{} 块{}", s.badge_units, s.ko, s.pieces));
     set_text(
         &mut text_q,
         views.hud[2],
@@ -1703,12 +1703,12 @@ fn sync(
             set_text(
                 &mut text_q,
                 tv.badge,
-                if snap.badges == 0 {
+                if snap.badge_units == 0 {
                     "".into()
-                } else if snap.badges > 3 {
-                    format!("{}★", snap.badges)
+                } else if snap.badge_units > 3 {
+                    format!("{}★", snap.badge_units)
                 } else {
-                    "★".repeat(snap.badges as usize)
+                    "★".repeat(snap.badge_units as usize)
                 },
             );
             set_text(&mut text_q, tv.rank, if dead { format!("#{}", snap.place.unwrap_or(0)) } else { "".into() });
