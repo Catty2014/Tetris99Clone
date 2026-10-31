@@ -474,6 +474,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         // 墙钟节拍：绝对 deadline，避免 sleep 误差累积；逻辑帧本身仍是 16.6667ms
         let mut sched_origin = Instant::now();
         let mut frame_idx: u64 = 0;
+        // 服务器自报 TPS：按墙钟 1 秒窗口统计实际产出的 tick 数
+        let mut tps_win_start = Instant::now();
+        let mut tps_win_ticks: u32 = 0;
+        let mut last_tps: f32 = 0.0;
         while in_match {
             let deadline = sched_origin
                 + Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / tick_hz);
@@ -575,6 +579,16 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 }
             }
             engine.frame(&inputs);
+            // 服务器自报 TPS：1 秒窗口内的实际 tick 数，避免客户端按到达时间推断抖动
+            tps_win_ticks += 1;
+            {
+                let elapsed = tps_win_start.elapsed().as_secs_f32();
+                if elapsed >= 1.0 {
+                    last_tps = ((tps_win_ticks as f32 / elapsed) * 10.0).round() / 10.0;
+                    tps_win_ticks = 0;
+                    tps_win_start = Instant::now();
+                }
+            }
             // 重复动作被 sanitize 丢弃时警告该席位（每席位最多 1 秒一次）
             for pid in 0..players {
                 let total = engine.players[pid].dup_dropped;
@@ -625,6 +639,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             }
             let tick = serde_json::json!({
                 "type": "tick", "n": engine.frame_n,
+                "tps": last_tps,
                 "in": inputs.iter().enumerate()
                     .filter(|(_, ev)| !ev.is_empty())
                     .map(|(pid, ev)| serde_json::json!([pid, ev.iter().map(event_json).collect::<Vec<_>>()]))

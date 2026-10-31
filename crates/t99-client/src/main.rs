@@ -158,8 +158,10 @@ struct NetStats {
     rtt_ms: u32,
     loss_pct: u32,
     connected: bool,
-    /// 服务器 tick 速率（EMA，tick/s）
+    /// 服务器 tick 速率（服务器自报，1 秒窗口）
     server_tps: f32,
+    /// 客户端按到达时间观测到的 tick 速率（诊断用，含网络抖动）
+    obs_tps: f32,
     /// 内部：上一 tick 的序号与到达时刻
     last_tick_n: u64,
     last_tick_at: Option<Instant>,
@@ -1675,7 +1677,7 @@ fn set_debug_hud_text(
             if st.connected {
                 set(span_q, color_q, views.dbg_lat, format!(" | Lat {}ms", st.rtt_ms), lat_color(st.rtt_ms));
                 set(span_q, color_q, views.dbg_loss, format!(" | Loss {}%", st.loss_pct), loss_color(st.loss_pct));
-                set(span_q, color_q, views.dbg_tps, format!(" | TPS {:.2}", shown_tps), tps_color(shown_tps));
+                set(span_q, color_q, views.dbg_tps, format!(" | TPS {:.1} obs {:.1}", shown_tps, st.obs_tps), tps_color(shown_tps));
                 set(span_q, color_q, views.dbg_fps, format!(" | FPS {:.0}", shown_fps), fps_color(shown_fps));
             } else {
                 set(span_q, color_q, views.dbg_lat, " | Lat - | Loss - | TPS -".into(), HUD_DEFAULT);
@@ -2580,17 +2582,21 @@ fn handle_server_msg(
             if let Some(tn) = tn {
                 let now = Instant::now();
                 let mut st = stats.lock().unwrap();
+                // 服务器自报的 TPS 是权威值；到达速率只作为诊断（网络抖动会污染它）
+                if let Some(tps) = v["tps"].as_f64() {
+                    st.server_tps = tps as f32;
+                }
                 if st.last_tick_n > 0 && tn > st.last_tick_n {
                     if let Some(prev) = st.last_tick_at {
                         let dt = now.duration_since(prev).as_secs_f32();
-                        // 回填补史会在极短时间内重放大量 tick，dt≈0 会把瞬时 TPS 推到上万；
+                        // 回填补史会在极短时间内重放大量 tick，dt≈0 会把瞬时值推到上万；
                         // 只统计接近真实 60Hz 的间隔（≥10ms），并给瞬时值封顶。
                         if dt >= 0.01 {
                             let inst = ((tn - st.last_tick_n) as f32 / dt).min(1000.0);
-                            st.server_tps = if st.server_tps <= 0.0 {
+                            st.obs_tps = if st.obs_tps <= 0.0 {
                                 inst
                             } else {
-                                st.server_tps * 0.8 + inst * 0.2
+                                st.obs_tps * 0.8 + inst * 0.2
                             };
                         }
                     }
