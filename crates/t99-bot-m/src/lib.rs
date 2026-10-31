@@ -406,7 +406,7 @@ pub fn candidates(g: &Grid, kind: char, fr: &FrameIn, p: &Profile, danger: bool,
     let rot_n = if kind == 'O' { 1 } else { 4 };
     // T 槽只在 T 即将到手时才有意义：T 在 Hold、或 next 前 2 位。
     // 否则不奖励搭槽，避免为了远期收益先造一堆洞。
-    let t_near = fr.hold == Some('T') || fr.next.iter().take(2).any(|&c| c == 'T');
+    let t_near = fr.hold == Some('T') || fr.next.iter().take(3).any(|&c| c == 'T');
     let pre_cav = if t_near && p.weights(danger).cavity_fill > 0.0 {
         let well = if p.well_mode && !danger { Some(p.well_col) } else { None };
         cavity_mask(g, well)
@@ -693,7 +693,7 @@ pub fn master_profile() -> Profile {
             well_keep: 3.5,  // 每行井深 +3.5
             tslot: 0.5,
             spin_extra: 2.0,
-            cavity_keep: 0.3,
+            cavity_keep: 2.0,
             cavity_fill: 6.0,
             pollute: 10.0, // 每个入井格 -10（整块 -40 上下）
         },
@@ -762,7 +762,7 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
             well_keep: 0.0,
             tslot: 1.0,
             spin_extra: 4.0,
-            cavity_keep: 0.5,
+            cavity_keep: 3.0,
             cavity_fill: 8.0,
             pollute: 0.0,
         },
@@ -1055,6 +1055,75 @@ fn cavity_mask(g: &Grid, well: Option<usize>) -> [[bool; W]; ROWS] {
                             continue;
                         }
                         m[row as usize][col as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    m
+}
+
+/// 可执行的成品 T 槽：与 cavity_mask 不同，这里要求 T 能从静息位直落或踢墙真正进入，
+/// 否则会奖励“T 根本进不去的死洞”。当前未接入评分，留给模板式搭建使用。
+#[allow(dead_code)]
+fn reachable_tsd_mask(g: &Grid, well: Option<usize>) -> [[bool; W]; ROWS] {
+    let mut m = [[false; W]; ROWS];
+    let mut mark = |rot: u8, x: i32, y: i64| {
+        for (dx, dy) in cells('T', rot) {
+            let col = x + dx;
+            let row = (y + dy as i64 * MILLI).div_euclid(MILLI);
+            if col < 0 || col >= W as i32 || row < 0 || row >= ROWS as i64 {
+                continue;
+            }
+            if Some(col as usize) == well {
+                continue;
+            }
+            m[row as usize][col as usize] = true;
+        }
+    };
+    let clears2 = |rot: u8, x: i32, y: i64| -> bool {
+        matches!(stamp_and_clear(g, 'T', rot, x, y), Some((_, n, _, _)) if n >= 2)
+    };
+    // 直落：静息位 + 三角成立 + 消 2 行
+    for rot in 0..4u8 {
+        let cs = cells('T', rot);
+        let min_dx = cs.iter().map(|c| c.0).min().unwrap();
+        let max_dx = cs.iter().map(|c| c.0).max().unwrap();
+        for x in (-min_dx)..=(W as i32 - 1 - max_dx) {
+            let y = rest_y(g, 'T', rot, x);
+            if y >= i64::MAX / 2 || collides(g, 'T', rot, x, y) {
+                continue;
+            }
+            if spin_at(g, rot, x, y, 255) == 0 {
+                continue;
+            }
+            if clears2(rot, x, y) {
+                mark(rot, x, y);
+            }
+        }
+    }
+    // 踢墙：贴地静息后 CW/CCW 旋转进悬挑下的槽
+    for pre_rot in 0..4u8 {
+        let cs = cells('T', pre_rot);
+        let min_dx = cs.iter().map(|c| c.0).min().unwrap();
+        let max_dx = cs.iter().map(|c| c.0).max().unwrap();
+        for pre_x in (-min_dx)..=(W as i32 - 1 - max_dx) {
+            let pre_y = rest_y(g, 'T', pre_rot, pre_x);
+            if pre_y >= i64::MAX / 2 {
+                continue;
+            }
+            for &dir in &[1u8, 3u8] {
+                let to = (pre_rot + dir) % 4;
+                for (ki, (kx, ky)) in kicks('T', pre_rot, to).iter().enumerate() {
+                    let (x, y) = (pre_x + kx, pre_y + *ky as i64 * MILLI);
+                    if collides(g, 'T', to, x, y) {
+                        continue;
+                    }
+                    if spin_at(g, to, x, y, ki as u8) == 0 {
+                        continue;
+                    }
+                    if clears2(to, x, y) {
+                        mark(to, x, y);
                     }
                 }
             }
