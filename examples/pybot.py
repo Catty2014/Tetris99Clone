@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """t99 子进程示例程序：4 特征贪心（与内置 basic 同级），stdin/stdout 单行 JSON。
 
-协议（v2）：
+协议（v8 兼容；消息形状自 v2 起稳定）：
   收 {"type":"hello",...}            → 发 {"type":"ready"}
   收 {"type":"frame","n":N,...}      → 发 {"type":"input","n":N,"events":[{"t_us":0,"k":"cw"},...]}
   收 {"type":"result",...}           → 退出
