@@ -369,6 +369,8 @@ pub struct SubprocessAdapter {
     misses: u32,
     dead: bool,
     last_n: u64,
+    /// 上一帧快照尚未回包：固定 60Hz 下不再重复投递，避免管道堆积后 write 阻塞整个服务器
+    in_flight: bool,
 }
 
 impl SubprocessAdapter {
@@ -382,6 +384,7 @@ impl SubprocessAdapter {
             misses: 0,
             dead: false,
             last_n: 0,
+            in_flight: false,
         }
     }
 
@@ -538,12 +541,18 @@ impl PlayerAdapter for SubprocessAdapter {
             self.misses += 1;
             return true;
         }
+        if self.in_flight {
+            // 上一帧尚未回包：不再投递新盘面，避免管道堆积后 write 阻塞整个服务器
+            return true;
+        }
         let frame = FrameMsg::from_snapshot(snap, snap.pid);
         self.last_n = frame.n;
         let msg = serde_json::to_string(&frame).unwrap_or_default();
         if !self.send(&msg) {
             self.dead = true;
             self.misses += 1;
+        } else {
+            self.in_flight = true;
         }
         true
     }
@@ -576,10 +585,12 @@ impl PlayerAdapter for SubprocessAdapter {
             match serde_json::from_str::<InputMsg>(&line) {
                 Ok(m) if m.n == self.last_n => match m.to_timed() {
                     Some(events) => {
+                        self.in_flight = false;
                         self.misses = 0;
                         return Some(events);
                     }
                     None => {
+                        self.in_flight = false;
                         self.misses += 1;
                         return Some(vec![]);
                     }
