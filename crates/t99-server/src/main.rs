@@ -483,6 +483,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let (mut fs_n, mut fs_send, mut fs_send_max) = (0u32, 0u64, 0u64);
         let (mut fs_wait, mut fs_wait_max, mut fs_miss) = (0u64, 0u64, 0u32);
         let (mut fs_lat_sum, mut fs_lat_max, mut fs_lat_max_seat, mut fs_replies) = (0u64, 0u64, 0usize, 0u32);
+        let (mut fs_engine, mut fs_engine_max) = (0u64, 0u64);
         let mut sent_at: Vec<Option<Instant>> = vec![None; players];
         while in_match {
             let deadline = sched_origin
@@ -617,7 +618,13 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     }
                 }
             }
+            let t_engine = Instant::now();
             engine.frame(&inputs);
+            let engine_us = t_engine.elapsed().as_micros() as u64;
+            if frame_stats {
+                fs_engine += engine_us;
+                fs_engine_max = fs_engine_max.max(engine_us);
+            }
             // 服务器自报 TPS：1 秒窗口内的实际 tick 数，避免客户端按到达时间推断抖动
             tps_win_ticks += 1;
             {
@@ -628,12 +635,14 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     tps_win_start = Instant::now();
                     if frame_stats && fs_n > 0 {
                         eprintln!(
-                            "[frame] n={} send_avg={}us send_max={}us wait_avg={}us wait_max={}us misses={} reply_avg={}us reply_max={}us seat={} replies={} tps={:.1}",
+                            "[frame] n={} send_avg={}us send_max={}us wait_avg={}us wait_max={}us engine_avg={}us engine_max={}us misses={} reply_avg={}us reply_max={}us seat={} replies={} tps={:.1}",
                             fs_n,
                             fs_send / fs_n as u64,
                             fs_send_max,
                             fs_wait / fs_n as u64,
                             fs_wait_max,
+                            fs_engine / fs_n as u64,
+                            fs_engine_max,
                             fs_miss,
                             fs_lat_sum / fs_replies.max(1) as u64,
                             fs_lat_max,
@@ -646,6 +655,8 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                         fs_send_max = 0;
                         fs_wait = 0;
                         fs_wait_max = 0;
+                        fs_engine = 0;
+                        fs_engine_max = 0;
                         fs_miss = 0;
                         fs_lat_sum = 0;
                         fs_lat_max = 0;
