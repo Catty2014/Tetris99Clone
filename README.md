@@ -1,19 +1,28 @@
-# t99 — Tetris 99 复刻（Arena Module for AX1）
+# Tetris99Clone — Tetris 99 复刻（Arena Module for AX1）
 
 确定性 Tetris 99 风格对局引擎 + 无头评测主机 + Bevy 人类客户端 + 内置 Bot 梯队。
 同一套物理服务**人类游玩端**与**程序游玩端**：人类客户端只是输入事件的另一种来源，与子进程程序、内置 Bot 走完全相同的校验与物理路径。
 
 ```
 t99-core      确定性内核：整数物理/SRS/7-bag/垃圾/目标/徽章/名次（零外部依赖）
-t99-proto     线协议 v2（单行 JSON）+ 子进程适配器（16.666ms 帧预算/超时计数）
-t99-bots      内置 Bot：null / basic / advanced / expert（进程内、同视角、同限速；
-              basic/advanced 源码对参赛模型公开，expert 不公开）
+t99-proto     线协议 v8（单行 JSON）+ 适配器（stdio/WS）+ snapshot_from_frame 反向构造
+t99-bots      内置 Bot（按档分文件）：null / basic / advanced / expert（进程内、同视角、
+              同限速；basic/advanced 源码公开，expert 为闭源内建、挂 feature `expert`）
+t99-bot-ext   公开档外部程序：t99-bot-basic / t99-bot-advanced（参考实现/可修改陪练，
+              决策核与 internal 同一份代码；随 dist 分发）
 t99-bot-m     隐藏档外部程序 Master/GrandMaster（Arena 公开包剔除本目录；参赛方仅知其存在）
-t99-headless  无头主机：run（对局）/ replay（逐位回放校验）/ calibrate（梯队矩阵）
-t99-server    单局权威服务器：ID+Key 准入、事件流广播、观战席位、重启
-t99-client    Bevy 0.16 人类客户端（本地 1 人 + 3 Bot，含 HUD/落点影/垃圾表）
+t99-config    ruleset.toml / server.toml / client.toml 解析（CLI > env > file > 默认值）
+t99-headless  无头主机：run（对局，支持 ext:label=path 外部席位）/ replay（逐位回放校验）/
+              calibrate（梯队矩阵）
+t99-server    单局权威服务器：ID+Key 准入、事件流广播、观战席位、大厅模式
+t99-client    Bevy 0.16 人类客户端（本地 1 人 + 3 Bot，含 HUD/落点影/垃圾表；不随 dist 分发）
 examples/     pybot.py：Python 子进程示例程序（跨语言协议验证）
+utils/        time.py：Arena Utils 会话墙钟查询
+Makefile      make check（测试+冒烟）/ make dist（musl 静态分发 → dist/）
 ```
+
+正式参赛阵容：basic/advanced/expert 的 **internal** 版 + master/grandmaster 的 **external** 版；
+external 的 basic/advanced 是参考实现与陪练，与 internal 构造上等价但不做 1:1 断言。
 
 ## 快速开始
 
