@@ -297,8 +297,8 @@ fn rest_y(g: &Grid, kind: char, rot: u8, x: i32) -> i64 {
 }
 
 /// T-Spin 三角判定（与服务器一致：墙面/地面视为填充，踢 4 升格全旋）
-/// 返回 0 无 / 1 mini / 2 全旋
-fn spin_at(g: &Grid, rot: u8, x: i32, y: i64, kick_idx: u8) -> u8 {
+/// 三角判定的前/后角填充数（与引擎同口径：越界视为填充）
+fn spin_fb(g: &Grid, rot: u8, x: i32, y: i64) -> (u32, u32) {
     let yr = y.div_euclid(MILLI);
     let filled = |cx: i32, cy: i32| -> bool {
         let col = x + cx;
@@ -316,6 +316,12 @@ fn spin_at(g: &Grid, rot: u8, x: i32, y: i64, kick_idx: u8) -> u8 {
     };
     let f = filled(f0.0, f0.1) as u32 + filled(f1.0, f1.1) as u32;
     let b = filled(b0.0, b0.1) as u32 + filled(b1.0, b1.1) as u32;
+    (f, b)
+}
+
+/// 返回 0 无 / 1 mini / 2 全旋
+fn spin_at(g: &Grid, rot: u8, x: i32, y: i64, kick_idx: u8) -> u8 {
+    let (f, b) = spin_fb(g, rot, x, y);
     if f == 2 && b >= 1 {
         2
     } else if f >= 1 && b == 2 {
@@ -446,22 +452,23 @@ pub fn candidates(g: &Grid, kind: char, fr: &FrameIn, p: &Profile, danger: bool,
                 }
                 for &dir in &[1u8, 3u8] {
                     let to = (pre_rot + dir) % 4;
+                    // 与引擎 try_rotate 一致：只采用第一个不碰撞的踢墙档位。
+                    // 枚举所有档位会生成引擎根本到不了的落点（实测 Full 计划就是这样落空的）。
                     for (ki, (kx, ky)) in kicks(kind, pre_rot, to).iter().enumerate() {
                         let (x, y) = (pre_x + kx, pre_y + *ky as i64 * MILLI);
                         if collides(g, kind, to, x, y) {
                             continue;
                         }
                         let key = (to, x, y);
-                        if seen.contains(&key) {
-                            continue;
+                        if !seen.contains(&key) {
+                            seen.push(key);
+                            let straight = rest_y(g, kind, to, x);
+                            let spin = spin_at(g, to, x, y, ki as u8);
+                            if y > straight || spin > 0 {
+                                push_cand(&mut out, g, kind, fr, p, danger, redline_h, pre_rot, pre_x, true, to, x, y, spin, ki as u8, t_near, &pre_cav);
+                            }
                         }
-                        seen.push(key);
-                        // 直落可达的终位已由上面覆盖；踢墙候选只要终位比直落深或成立自旋
-                        let straight = rest_y(g, kind, to, x);
-                        let spin = spin_at(g, to, x, y, ki as u8);
-                        if y > straight || spin > 0 {
-                            push_cand(&mut out, g, kind, fr, p, danger, redline_h, pre_rot, pre_x, true, to, x, y, spin, ki as u8, t_near, &pre_cav);
-                        }
+                        break;
                     }
                 }
             }
@@ -1542,9 +1549,10 @@ impl Brain {
                     if c.spin > 0 {
                         self.t_spins += 1;
                         if std::env::var("T99_SPIN_TRACE").is_ok() {
+                            let (pf, pb) = spin_fb(&g, c.fin_rot, c.fin_x, c.fin_y);
                             eprintln!(
-                                "[spin-plan] seat={} piece={} kind={} rot={} x={} y={} cleared={} floor={} pre=({},{})",
-                                fr.seat, a.t, c.spin, c.fin_rot, c.fin_x, c.fin_y, c.cleared, c.floor_rot, c.pre_rot, c.pre_x
+                                "[spin-plan] seat={} frame={} pieces={} piece={} kind={} rot={} x={} y={} cleared={} floor={} pre=({},{}) f={} b={}",
+                                fr.seat, fr.n, fr.pieces, a.t, c.spin, c.fin_rot, c.fin_x, c.fin_y, c.cleared, c.floor_rot, c.pre_rot, c.pre_x, pf, pb
                             );
                         }
                     }

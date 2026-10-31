@@ -1665,6 +1665,7 @@ impl Match {
             return;
         }
         // T-Spin 判定（三角规则，踢墙索引 4 升格）
+        let mut fb = (0u32, 0u32);
         let spin = if kind == Kind::T {
             match self.players[pid].last_rot_kick {
                 Some(kick_idx) => {
@@ -1686,6 +1687,7 @@ impl Match {
                     };
                     let f = filled(f0.0, f0.1) as u32 + filled(f1.0, f1.1) as u32;
                     let b = filled(b0.0, b0.1) as u32 + filled(b1.0, b1.1) as u32;
+                    fb = (f, b);
                     if f == 2 && b >= 1 {
                         SpinKind::Full
                     } else if f >= 1 && b == 2 {
@@ -1705,8 +1707,8 @@ impl Match {
         };
         if kind == Kind::T && std::env::var("T99_SPIN_TRACE").is_ok() {
             eprintln!(
-                "[t-lock] pid={pid} frame={} spin={:?} rot={} x={} y={} kick={:?}",
-                self.frame_n, spin, rot, x, y, self.players[pid].last_rot_kick
+                "[t-lock] pid={pid} frame={} pieces={} spin={:?} rot={} x={} y={} kick={:?} f={} b={}",
+                self.frame_n, self.players[pid].pieces, spin, rot, x, y, self.players[pid].last_rot_kick, fb.0, fb.1
             );
         }
         if spin != SpinKind::None {
