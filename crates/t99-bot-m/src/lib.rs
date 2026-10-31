@@ -1361,6 +1361,8 @@ pub struct Brain {
     /// 本块内已证不可达的候选（fin_rot, fin_x）——BFS 失败后拉黑并重规划
     blocked: Vec<(u8, i32)>,
     blocked_sig: (u64, char, u8, bool),
+    /// 踢墙旋转后待验证的目标 (fin_rot, fin_x, fin_y)：下一帧确认落点再硬降
+    verify: Option<(u8, i32, i64)>,
 }
 
 pub struct Act {
@@ -1376,6 +1378,18 @@ fn rotate_at(g: &Grid, kind: char, x: i32, rot: u8, to: u8, y: i64) -> Option<(i
         let ny = y + *ky as i64 * MILLI;
         if !collides(g, kind, to, nx, ny) {
             return Some((nx, to));
+        }
+    }
+    None
+}
+
+/// 与引擎 try_rotate 完全一致：取第一个不碰撞的踢墙档，返回落点与档位。
+fn rotate_result(g: &Grid, kind: char, x: i32, rot: u8, y: i64, to: u8) -> Option<(i32, i64, u8)> {
+    for (ki, (kx, ky)) in kicks(kind, rot, to).iter().enumerate() {
+        let nx = x + kx;
+        let ny = y + *ky as i64 * MILLI;
+        if !collides(g, kind, to, nx, ny) {
+            return Some((nx, ny, ki as u8));
         }
     }
     None
@@ -1489,6 +1503,7 @@ impl Brain {
             t_spins: 0,
             blocked: vec![],
             blocked_sig: (0, '-', 0, false),
+            verify: None,
         }
     }
 
@@ -1522,6 +1537,34 @@ impl Brain {
         };
 
         let g = self.grid(fr);
+        // 踢墙旋转后的落点处理：
+        // - 与计划 (rot,x,y) 一致 → 直接硬降；
+        // - 不一致但当前落点本身就是「消行 Full T-Spin」→ 也硬降（引擎选了别的踢墙档）；
+        // - 否则拉黑候选重规划，绝不把错误位置硬降下去。
+        if let Some((vr, vx, vy)) = self.verify.take() {
+            let y = a.y_m + HID as i64 * MILLI;
+            let at_goal = a.r % 4 == vr && a.x == vx && y == vy;
+            let full_here = a.t == 'T'
+                && spin_at(&g, a.r % 4, a.x, y, 0) == 2
+                && matches!(stamp_and_clear(&g, 'T', a.r % 4, a.x, y), Some((_, n, _, _)) if n >= 1);
+            if at_goal || full_here {
+                self.plan = None;
+                return Act { evs: vec![(0, Ev::Hard)], soft_hold: self.soft_held };
+            }
+            if std::env::var("T99_SPIN_TRACE").is_ok() {
+                eprintln!(
+                    "[spin-verify-fail] want=({},{},{}) got=({},{},{})",
+                    vr, vx, vy, a.r % 4, a.x, y
+                );
+            }
+            self.blocked.push((vr, vx));
+            self.plan = None;
+            return Act {
+                evs: if self.soft_held { vec![(0, Ev::SoftUp)] } else { vec![] },
+                soft_hold: false,
+            };
+        }
+
         let sig = (fr.pieces as u64, a.t, fr.hold.map(|k| k as u8).unwrap_or(0), fr.hold_used);
         if self.blocked_sig != sig {
             self.blocked.clear();
@@ -1739,8 +1782,21 @@ impl Brain {
         }
         let d = (fin_rot + 4 - cur.1) % 4;
         let rot_ev = if d == 3 { Ev::Ccw } else { Ev::Cw };
+        // 贴地前置态现算旋转落点（与引擎 try_rotate 一致）：只有真正形成
+        // 「消行 Full T-Spin」才执行，否则拉黑候选重规划。
+        if let Some((nx, ny, ki)) = rotate_result(&g, a.t, a.x, a.r % 4, y, fin_rot) {
+            let good = a.t == 'T'
+                && spin_at(&g, fin_rot, nx, ny, ki) == 2
+                && matches!(stamp_and_clear(&g, 'T', fin_rot, nx, ny), Some((_, n, _, _)) if n >= 1);
+            if good {
+                self.verify = Some((fin_rot, nx, ny));
+                self.plan = None;
+                return Act { evs: vec![(0, Ev::SoftUp), (1200, rot_ev)], soft_hold: false };
+            }
+        }
+        self.blocked.push((goal.1, goal.0));
         self.plan = None;
-        Act { evs: vec![(0, Ev::SoftUp), (1200, rot_ev), (2800, Ev::Hard)], soft_hold: false }
+        Act { evs: if self.soft_held { vec![(0, Ev::SoftUp)] } else { vec![] }, soft_hold: false }
     }
 
     /// 执行路径首步；hard_on_goal 时该步恰抵达目标则同帧接硬降（踢墙前置阶段不得硬降）
