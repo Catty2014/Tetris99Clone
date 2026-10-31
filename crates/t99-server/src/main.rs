@@ -557,11 +557,18 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 }
             }
             let send_us = t_send.elapsed().as_micros() as u64;
-            // 阶段二：共享 deadline 收集，等最慢的一席，而不是逐个等 RTT。
+            // 阶段二：收集窗口只到本 tick 的边界。到点仍未回包的席位按“无操作”（ops=[]）
+            // 处理，绝不拖慢下一帧；服务器因此始终按固定 60Hz 推进。
             let t_wait = Instant::now();
             let mut missed = 0u32;
             if !pending.is_empty() {
-                let deadline = Instant::now() + FRAME_DEADLINE;
+                let frame_ns = 1_000_000_000u64 / tick_hz as u64;
+                let boundary = deadline + Duration::from_nanos(frame_ns);
+                let guard = boundary
+                    .checked_sub(Duration::from_micros(800))
+                    .unwrap_or(boundary);
+                let collect_until =
+                    std::cmp::min(guard, Instant::now() + FRAME_DEADLINE);
                 loop {
                     let mut still = Vec::with_capacity(pending.len());
                     for pid in pending.drain(..) {
@@ -583,7 +590,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                         }
                     }
                     pending = still;
-                    if pending.is_empty() || Instant::now() >= deadline {
+                    if pending.is_empty() || Instant::now() >= collect_until {
                         break;
                     }
                     std::thread::sleep(Duration::from_micros(200));
