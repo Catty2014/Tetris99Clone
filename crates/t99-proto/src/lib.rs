@@ -8,9 +8,11 @@
 //! v6：frame 增 `targeted_by`（正在瞄准本方的存活 pid 列表，反攻决策）、
 //! `time_secs_left`（对局倒计时）、`burn_x10`（倒计时燃烧倍率）。
 //! v7：frame 增 `badges`（全员徽章数组；徽章随 KO 转移，围猎徽章领先者的依据）。
-//! v8 起 frame 增可选 `pending_all` / `garbage_cap`（全员待进行数与队列上限，
-//! 供 bot 避开已饱和目标）；协议号不变，缺席按默认值处理，旧读取方不受影响。
+//! v8 起 frame 增可选 `pending_all` / `garbage_cap` / `max_stack`（全员待进行数、
+//! 队列上限、存活他人最高堆）；协议号不变，缺席按默认值处理，旧读取方不受影响。
 //! 读取方须容忍字段缺席（serde default）。
+//! 另提供 `snapshot_from_frame`：wire frame → 内存快照的反向构造，
+//! 使外部程序可以把 frame 直接喂给消费 `Snapshot` 的决策核。
 
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -217,11 +219,97 @@ impl FrameMsg {
             targeted_by: s.targeted_by.clone(),
             badges_all: s.badges_all.clone(),
             pending_all: s.pending_all.clone(),
-            max_stack: s.max_stack,
             garbage_cap: s.garbage_cap,
+            max_stack: s.max_stack,
             time_secs_left: s.match_secs_left,
             burn_x10: s.burn_x10,
         }
+    }
+}
+
+/// wire frame → 内存快照的反向构造。
+///
+/// 使外部程序（子进程 / WS）可以把收到的 frame 直接喂给消费 `Snapshot` 的
+/// 决策核，与进程内 Bot 共享同一份决策代码。phase 的 Clear/Are 只保留毫秒
+/// 精度（wire 本身即毫秒）；`garbage_batches`、`last_clear`、`place` 不在线上，
+/// 构造为空/None。
+pub fn snapshot_from_frame(f: &FrameMsg, pid: usize) -> Snapshot {
+    use t99_core::engine::{ActiveView, DasView, PlayerPhase};
+    use t99_core::{Cell, Kind, Milli, TargetMode, CELL_GARBAGE, H, TMS, W};
+
+    let mut board = [[0 as Cell; W]; H];
+    for (r, line) in f.board.iter().enumerate() {
+        for (c, ch) in line.chars().enumerate() {
+            board[r][c] = match ch {
+                '.' => 0,
+                'G' => CELL_GARBAGE,
+                other => Kind::from_ch(other).map(|k| k.id()).unwrap_or(0),
+            };
+        }
+    }
+    let phase = match f.phase.kind {
+        "clear" => PlayerPhase::Clear(f.phase.ms_left * TMS),
+        "are" => PlayerPhase::Are(f.phase.ms_left * TMS),
+        _ => PlayerPhase::Play,
+    };
+    let target_mode = match f.target_mode.as_str() {
+        "badges" => TargetMode::Badges,
+        "kos" => TargetMode::Kos,
+        "attackers" => TargetMode::Attackers,
+        "manual" => TargetMode::Manual(f.target.unwrap_or(0)),
+        _ => TargetMode::Random,
+    };
+    Snapshot {
+        n: f.n,
+        pid,
+        board,
+        active: f.active.as_ref().map(|a| ActiveView {
+            kind: Kind::from_ch(a.t).unwrap_or(Kind::I),
+            rot: a.r,
+            x: a.x,
+            y_milli: a.y_m as Milli,
+        }),
+        phase,
+        next: f.next.iter().filter_map(|&c| Kind::from_ch(c)).collect(),
+        hold: f.hold.and_then(Kind::from_ch),
+        hold_used: f.hold_used,
+        combo: f.combo as i32,
+        b2b: f.b2b,
+        garbage_red: f.garbage.red,
+        garbage_yellow: f.garbage.yellow,
+        garbage_gray: f.garbage.gray,
+        garbage_batches: vec![],
+        clearing: f.clearing.clone(),
+        badges: f.badges,
+        badge_units: f.badge_units,
+        target: f.target,
+        target_mode,
+        alive: f.alive.clone(),
+        gravity_milli: f.gravity,
+        soft: f.soft,
+        lock_ms_left: f.lock.ms_left,
+        lock_resets: f.lock.resets,
+        das: DasView {
+            left_held: f.das.left,
+            right_held: f.das.right,
+            active_dir: if f.das.dir == 0 { None } else { Some(f.das.dir as i8) },
+            das_ms: f.das.das_ms,
+            arr_ms: f.das.arr_ms,
+        },
+        ko: f.ko,
+        lines: f.lines,
+        sent: f.sent,
+        pieces: f.pieces,
+        alive_self: f.alive.contains(&pid),
+        place: None,
+        match_secs_left: f.time_secs_left,
+        burn_x10: f.burn_x10,
+        targeted_by: f.targeted_by.clone(),
+        badges_all: f.badges_all.clone(),
+        pending_all: f.pending_all.clone(),
+        max_stack: f.max_stack,
+        garbage_cap: f.garbage_cap,
+        last_clear: None,
     }
 }
 
@@ -908,5 +996,58 @@ mod tests {
         assert!(s.contains(r#""player_id":"human-1234""#));
         assert!(s.contains(r#""protocol":8"#));
         assert!(s.contains(r#""ruleset":"9f3c1a7e""#));
+    }
+
+    /// snapshot → frame → snapshot roundtrip：Bot 可见字段逐位一致。
+    /// 于一局真实对局中随机抽多帧校验（含垃圾、T-Spin、各相位）。
+    #[test]
+    fn snapshot_frame_roundtrip() {
+        use t99_core::{MatchConfig, Ruleset};
+        let mut m = t99_core::Match::new(MatchConfig {
+            players: 3,
+            seed: 2026_1101,
+            ruleset: Ruleset::default(),
+        });
+        let no_input: Vec<Vec<TimedKey>> = vec![vec![]; 3];
+        for i in 0..2400 {
+            let pid = i % 3;
+            let snap = m.snapshot(pid);
+            let frame = FrameMsg::from_snapshot(&snap, pid);
+            let back = snapshot_from_frame(&frame, pid);
+            assert_eq!(back.board, snap.board, "frame {}", i);
+            assert_eq!(back.active.map(|a| (a.kind, a.rot, a.x, a.y_milli / 100)), snap.active.map(|a| (a.kind, a.rot, a.x, a.y_milli / 100)));
+            assert_eq!(back.phase.tag(), snap.phase.tag());
+            assert_eq!(back.next, snap.next);
+            assert_eq!(back.hold, snap.hold);
+            assert_eq!(back.hold_used, snap.hold_used);
+            assert_eq!(back.combo, snap.combo);
+            assert_eq!(back.b2b, snap.b2b);
+            assert_eq!((back.garbage_red, back.garbage_yellow, back.garbage_gray), (snap.garbage_red, snap.garbage_yellow, snap.garbage_gray));
+            assert_eq!(back.clearing, snap.clearing);
+            assert_eq!((back.badges, back.badge_units), (snap.badges, snap.badge_units));
+            assert_eq!(back.target, snap.target);
+            assert_eq!(back.target_mode.name(), snap.target_mode.name());
+            assert_eq!(back.alive, snap.alive);
+            assert_eq!(back.alive_self, snap.alive_self);
+            assert_eq!(back.gravity_milli, snap.gravity_milli);
+            assert_eq!(back.soft, snap.soft);
+            assert_eq!(back.lock_ms_left, snap.lock_ms_left);
+            assert_eq!(back.lock_resets, snap.lock_resets);
+            assert_eq!(back.das.left_held, snap.das.left_held);
+            assert_eq!(back.das.right_held, snap.das.right_held);
+            assert_eq!(back.ko, snap.ko);
+            assert_eq!((back.lines, back.sent, back.pieces), (snap.lines, snap.sent, snap.pieces));
+            assert_eq!(back.targeted_by, snap.targeted_by);
+            assert_eq!(back.badges_all, snap.badges_all);
+            assert_eq!(back.pending_all, snap.pending_all);
+            assert_eq!(back.garbage_cap, snap.garbage_cap);
+            assert_eq!(back.max_stack, snap.max_stack);
+            assert_eq!(back.match_secs_left, snap.match_secs_left);
+            assert_eq!(back.burn_x10, snap.burn_x10);
+            m.frame(&no_input);
+            if m.over.is_some() {
+                break;
+            }
+        }
     }
 }
