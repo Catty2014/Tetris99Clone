@@ -393,6 +393,8 @@ pub struct Cand {
     pub sent: u32,
     /// 本落点污染井列的格子数（井型模式：非 I 且井开放时计数）
     pub pollute: i64,
+    /// 本落点填进成品 T 槽的格子数（非自旋落子）
+    pub cav_fill: i64,
     pub score: f64,
 }
 
@@ -402,6 +404,15 @@ pub fn candidates(g: &Grid, kind: char, fr: &FrameIn, p: &Profile, danger: bool,
     let mut out: Vec<Cand> = Vec::new();
     let mut seen: Vec<(u8, i32, i64)> = Vec::new();
     let rot_n = if kind == 'O' { 1 } else { 4 };
+    // T 槽只在 T 即将到手时才有意义：T 在 Hold、或 next 前 2 位。
+    // 否则不奖励搭槽，避免为了远期收益先造一堆洞。
+    let t_near = fr.hold == Some('T') || fr.next.iter().take(2).any(|&c| c == 'T');
+    let pre_cav = if t_near && p.weights(danger).cavity_fill > 0.0 {
+        let well = if p.well_mode && !danger { Some(p.well_col) } else { None };
+        cavity_mask(g, well)
+    } else {
+        [[false; W]; ROWS]
+    };
 
     // 直落：空中旋转 → 硬降（末次操作是旋转 → T 落进凹槽即成立自旋）
     for rot in 0..rot_n {
@@ -418,7 +429,7 @@ pub fn candidates(g: &Grid, kind: char, fr: &FrameIn, p: &Profile, danger: bool,
                 continue;
             }
             seen.push(key);
-            push_cand(&mut out, g, kind, fr, p, danger, redline_h, rot, x, false, rot, x, y, 0, 255);
+            push_cand(&mut out, g, kind, fr, p, danger, redline_h, rot, x, false, rot, x, y, 255, 255, t_near, &pre_cav);
         }
     }
 
@@ -449,7 +460,7 @@ pub fn candidates(g: &Grid, kind: char, fr: &FrameIn, p: &Profile, danger: bool,
                         let straight = rest_y(g, kind, to, x);
                         let spin = spin_at(g, to, x, y, ki as u8);
                         if y > straight || spin > 0 {
-                            push_cand(&mut out, g, kind, fr, p, danger, redline_h, pre_rot, pre_x, true, to, x, y, spin, ki as u8);
+                            push_cand(&mut out, g, kind, fr, p, danger, redline_h, pre_rot, pre_x, true, to, x, y, spin, ki as u8, t_near, &pre_cav);
                         }
                     }
                 }
@@ -476,6 +487,8 @@ fn push_cand(
     fin_y: i64,
     spin_hint: u8,
     kick_idx: u8,
+    t_near: bool,
+    pre_cav: &[[bool; W]; ROWS],
 ) {
     let spin = if kind == 'T' {
         if spin_hint != 255 {
@@ -491,7 +504,26 @@ fn push_cand(
     };
     let sent = sent_estimate(fr, spin, cleared, allclear);
     let pollute = well_pollution(p, g, kind, fin_rot, fin_x, danger, cleared);
-    let score = evaluate(p, &grid, fr, fin_y, cleared, eroded, spin, sent, allclear, danger, redline_h, kind, pollute);
+    // 已有成品 T 槽被非自旋落子填掉：每格重罚；T 自旋进槽是正常消费。
+    let cav_fill = if !t_near || (kind == 'T' && spin > 0) {
+        0
+    } else {
+        cells(kind, fin_rot)
+            .iter()
+            .filter(|(dx, dy)| {
+                let col = fin_x + dx;
+                let row = (fin_y + *dy as i64 * MILLI).div_euclid(MILLI);
+                if col < 0 || col >= W as i32 || row < 0 || row >= ROWS as i64 {
+                    return false;
+                }
+                pre_cav[row as usize][col as usize]
+            })
+            .count() as i64
+    };
+    let score = evaluate(
+        p, &grid, fr, fin_y, cleared, eroded, spin, sent, allclear, danger, redline_h, kind, pollute,
+        cav_fill, t_near,
+    );
     out.push(Cand {
         pre_rot,
         pre_x,
@@ -506,6 +538,7 @@ fn push_cand(
         allclear,
         sent,
         pollute,
+        cav_fill,
         score,
     });
 }
@@ -584,6 +617,10 @@ pub struct Weights {
     pub well_keep: f64,
     pub tslot: f64,
     pub spin_extra: f64,
+    /// T 槽空腔：T 在 2 块内时，已被屋顶覆盖且 T 落下能消 2+ 行的空格，每格奖励
+    pub cavity_keep: f64,
+    /// 非自旋落子填进成品 T 槽：每格罚
+    pub cavity_fill: f64,
     /// 非 I 块污染井列：每个入井格的罚（仅 well_mode 且非 danger）
     pub pollute: f64,
 }
@@ -656,6 +693,8 @@ pub fn master_profile() -> Profile {
             well_keep: 3.5,  // 每行井深 +3.5
             tslot: 0.5,
             spin_extra: 2.0,
+            cavity_keep: 0.3,
+            cavity_fill: 6.0,
             pollute: 10.0, // 每个入井格 -10（整块 -40 上下）
         },
         w_danger: Weights {
@@ -674,6 +713,8 @@ pub fn master_profile() -> Profile {
             well_keep: 0.0, // 危险时不奖励井（掩码也关闭，井洞按普通洞处理→自然填平）
             tslot: 0.0,
             spin_extra: 1.0,
+            cavity_keep: 0.0,
+            cavity_fill: 2.0,
             pollute: 0.0,
         },
     }
@@ -721,6 +762,8 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
             well_keep: 0.0,
             tslot: 1.0,
             spin_extra: 4.0,
+            cavity_keep: 0.5,
+            cavity_fill: 8.0,
             pollute: 0.0,
         },
         w_danger: Weights {
@@ -739,6 +782,8 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
             well_keep: 0.0,
             tslot: 0.0,
             spin_extra: 1.0,
+            cavity_keep: 0.0,
+            cavity_fill: 2.0,
             pollute: 0.0,
         },
     };
@@ -797,6 +842,8 @@ fn evaluate(
     redline_h: usize,
     _kind: char,
     pollute: i64,
+    cav_fill: i64,
+    t_near: bool,
 ) -> f64 {
     let w = p.weights(danger);
     // 井型工业：非 danger 时把专用井列从通用堆面指标中掩码（按「已填实」处理），
@@ -805,6 +852,7 @@ fn evaluate(
     let mut heights = [0i64; W];
     let mut holes = 0i64;
     let mut hole_depth = 0i64;
+    let mut hole_m = [[false; W]; ROWS];
     let mut row_t = 0i64;
     let mut col_t = 0i64;
     let mut wells = 0i64;
@@ -829,6 +877,7 @@ fn evaluate(
             } else if seen {
                 holes += 1;
                 hole_depth += depth;
+                hole_m[r][c] = true;
             }
         }
         let mut prev = false;
@@ -888,6 +937,29 @@ fn evaluate(
 
     // T 槽蓄势：成品 T 槽（某空格四角三实）数量——给后续 T 存弹药
     let tslot = t_slots(g) as f64;
+    // 成品 T 槽：T 落下即消 2+ 行、且被屋顶覆盖的空格。只在 T 即将到手时计入，
+    // 并按槽位价值奖励、从普通洞罚中剔除，否则搭槽永远是「先亏洞」。
+    let (cav_n, cav_holes) = if t_near {
+        let well = if wcm { Some(p.well_col) } else { None };
+        let cav = cavity_mask(g, well);
+        let mut n = 0i64;
+        let mut h = 0i64;
+        for (r, row) in cav.iter().enumerate() {
+            for (c, &is_cav) in row.iter().enumerate() {
+                if !is_cav {
+                    continue;
+                }
+                n += 1;
+                if hole_m[r][c] {
+                    h += 1;
+                }
+            }
+        }
+        (n, h)
+    } else {
+        (0, 0)
+    };
+    let holes_excess = (holes - cav_holes).max(0);
     // I 井：偏好列比其余最矮列深多少（封顶 8）——Tetris 弹药
     let rim = heights
         .iter()
@@ -902,7 +974,7 @@ fn evaluate(
         + w.eroded * eroded as f64
         - w.row_t * row_t as f64
         - w.col_t * col_t as f64
-        - w.holes * holes as f64
+        - w.holes * holes_excess as f64
         - w.hole_depth * hole_depth as f64
         - w.bump * bump as f64
         - w.wells * wells as f64
@@ -920,17 +992,75 @@ fn evaluate(
     }
     sc += w.well_keep * well_depth as f64;
     sc -= w.pollute * pollute as f64; // 非 I 污染井列（含架桥）
-    if spin > 0 {
+    if spin > 0 && cleared > 0 {
         sc += w.spin_extra;
     }
     if !danger {
         sc += w.tslot * tslot;
+    }
+    if t_near {
+        // 槽位价值 + 填槽惩罚（危险档 cavity_keep 为 0，只剩轻微填充罚）
+        sc += w.cavity_keep * cav_n.min(12) as f64;
+        sc -= w.cavity_fill * cav_fill as f64;
     }
     // 生存红线：超高时额外压制堆高（钓鱼时红线抬到 feign_cap）
     if max_h as usize > redline_h {
         sc -= 2.0 * (max_h - redline_h as i64) as f64;
     }
     sc
+}
+
+/// 成品 T 槽掩码：以「被屋顶覆盖的空格」为锚点反推 T 落位，
+/// 只标记 T 落下即消 2 行以上（TSD/TST）的空腔。well：井列不算槽。
+fn cavity_mask(g: &Grid, well: Option<usize>) -> [[bool; W]; ROWS] {
+    let mut m = [[false; W]; ROWS];
+    let filled = |r: i64, c: i64| -> bool {
+        if r < 0 || r >= ROWS as i64 || c < 0 || c >= W as i64 {
+            return true;
+        }
+        g[r as usize][c as usize] != 0
+    };
+    for r in HID..ROWS {
+        for c in 0..W {
+            if g[r][c] != 0 || !filled(r as i64 - 1, c as i64) {
+                continue;
+            }
+            for rot in 0..4u8 {
+                for (dx, dy) in cells('T', rot) {
+                    let x = c as i32 - dx;
+                    let y = r as i64 * MILLI - dy as i64 * MILLI;
+                    if collides(g, 'T', rot, x, y) {
+                        continue;
+                    }
+                    // 必须稳定：还能下落说明不是槽
+                    if !collides(g, 'T', rot, x, y + MILLI) {
+                        continue;
+                    }
+                    if spin_at(g, rot, x, y, 255) == 0 {
+                        continue;
+                    }
+                    let Some((_, cleared, _, _)) = stamp_and_clear(g, 'T', rot, x, y) else {
+                        continue;
+                    };
+                    if cleared < 2 {
+                        continue;
+                    }
+                    for (mx, my) in cells('T', rot) {
+                        let col = x + mx;
+                        let row = (y + my as i64 * MILLI).div_euclid(MILLI);
+                        if col < 0 || col >= W as i32 || row < 0 || row >= ROWS as i64 {
+                            continue;
+                        }
+                        if Some(col as usize) == well {
+                            continue;
+                        }
+                        m[row as usize][col as usize] = true;
+                    }
+                }
+            }
+        }
+    }
+    m
 }
 
 /// 成品 T 槽计数：空格的相邻四角 ≥3 实（可旋转进 T 的凹槽）
@@ -1459,7 +1589,7 @@ impl Brain {
         let cur = (a.x, a.r % 4);
         let (goal, is_spin) = {
             let p = self.plan.as_ref().unwrap();
-            ((p.cand.fin_x, p.cand.fin_rot % 4), p.cand.spin > 0 && !p.cand.floor_rot)
+            ((p.cand.fin_x, p.cand.fin_rot % 4), p.cand.spin > 0 && p.cand.cleared > 0 && !p.cand.floor_rot)
         };
 
         if !self.plan.as_ref().unwrap().cand.floor_rot {
