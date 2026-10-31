@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# expert 档位（internal 专有）。分发源码剔除 expert.rs 并以
+# --no-default-features 构建；分发的二进制内含闭源 expert 实现。
+default = ["expert"]
+expert = []
+
 [dependencies]
 t99-core = { path = "../t99-core" }
 t99-proto = { path = "../t99-proto" }

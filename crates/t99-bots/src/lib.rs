@@ -1,13 +1,29 @@
 //! 内置 Bot：与子进程程序同视角（只读自身快照）、同输入协议、同 DAS 限速。
 //!
-//! 档位（能力超集递进）：
-//! - NullBot    什么都不做（地板校准）
-//! - BasicBot   单块贪心（4 特征），静态随机目标，不用 Hold/预览
-//! - AdvancedBot Dellacherie 6 特征 + Hold + next[0]，反击/残血目标切换，危险转平堆
-//! - ExpertBot  2 深度束搜索 + Hold 分支 + 阶段化目标策略
+//! 档位按文件解耦（能力超集递进）：
+//! - `null.rs`     NullBot    什么都不做（地板校准）
+//! - `basic.rs`    BasicBot   单块贪心（4 特征），静态随机目标，不用 Hold/预览
+//! - `advanced.rs` AdvancedBot Dellacherie 6 特征 + Hold + next[0]，加权目标策略，危险转平堆
+//! - `expert.rs`   ExpertBot  2 深度束搜索 + Hold 分支 + 加权目标策略
+//!
+//! `expert.rs` 挂 feature `expert`（默认启用）。分发源码剔除该文件并关闭
+//! feature 后，本 crate 仍可独立构建与对局（expert 档位以闭源形式内建在
+//! 分发的二进制中）。
 
 use t99_core::{Key, Snapshot, TimedKey, Kind, W, H};
 use t99_proto::{AdapterError, Hello, PlayerAdapter, ResultMsg};
+
+pub mod advanced;
+pub mod basic;
+pub mod null;
+#[cfg(feature = "expert")]
+pub mod expert;
+
+pub use advanced::AdvancedBot;
+pub use basic::BasicBot;
+pub use null::NullBot;
+#[cfg(feature = "expert")]
+pub use expert::ExpertBot;
 
 pub type Grid = [[u8; W]; H];
 
@@ -213,11 +229,11 @@ pub fn placements(grid: &Grid, kind: Kind) -> Vec<Placement> {
     out
 }
 
-fn grid_of(s: &Snapshot) -> Grid {
+pub(crate) fn grid_of(s: &Snapshot) -> Grid {
     s.board
 }
 
-fn max_height(g: &Grid) -> usize {
+pub(crate) fn max_height(g: &Grid) -> usize {
     let mut m = 0;
     for c in 0..W {
         for r in 0..H {
@@ -230,41 +246,8 @@ fn max_height(g: &Grid) -> usize {
     m
 }
 
-fn ev(t_us: u32, key: Key) -> TimedKey {
+pub(crate) fn ev(t_us: u32, key: Key) -> TimedKey {
     TimedKey { t_us, key }
-}
-
-/// 攻防目标策略（徽章转移感知）：
-/// 被瞄 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
-/// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
-/// 平摊式的 TargetAttackers 会让火力全被 1:1 抵消，谁也打不死谁。
-/// 99 人基准实测：在“待进未满”的目标里均匀随机，优于 Kos/Badges/Spread 等集中策略。
-/// 集中攻击会撞上 12 行待进上限，并被目标的消行抵消，实际进场反而更少。
-/// 攻防目标策略（徽章转移感知）：
-/// 被瞄且待进 ≥3 → 集中反打徽章最肥的瞄准者（击杀吞徽章，双倍收益）；
-/// 无人瞄 → 有徽章领先者（≥3）就围猎（制造转移链），否则抢人头。
-/// advanced 的加权目标：Random / KOs / Badges 各 1；反击 `min(9, 被瞄) / 3`。
-/// 每次成功送出后重抽。
-fn advanced_weighted(s: &Snapshot, rng: &mut u64) -> Key {
-    let w_att = s.targeted_by.len().min(9) as f64 / 3.0;
-    let weights = [
-        (Key::TargetRandom, 1.0),
-        (Key::TargetKos, 1.0),
-        (Key::TargetBadges, 1.0),
-        (Key::TargetAttackers, w_att),
-    ];
-    let sum: f64 = weights.iter().map(|(_, w)| *w).sum();
-    *rng = rng
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    let mut roll = ((*rng >> 11) as f64 / (1u64 << 53) as f64) * sum;
-    for (k, w) in weights {
-        if roll < w {
-            return k;
-        }
-        roll -= w;
-    }
-    Key::TargetRandom
 }
 
 /// 目标切换最小驻留（60Hz 下 0.5 秒）；紧急情况与 Random 目标不受此限。
@@ -277,7 +260,7 @@ const ARR_FRAMES: u64 = 2;
 
 /// 横向移动节流：距上次移动不足 `ARR_FRAMES` 帧则本帧不发移动。
 /// 返回 true 表示放行并已把本帧记为「上次移动帧」。
-fn allow_move(frames: u64, last: &mut u64) -> bool {
+pub(crate) fn allow_move(frames: u64, last: &mut u64) -> bool {
     if frames.saturating_sub(*last) < ARR_FRAMES {
         return false;
     }
@@ -290,70 +273,20 @@ pub fn switch_due(frames: u64, last_switch: u64, has_mode: bool, urgent: bool) -
     urgent || !has_mode || frames.saturating_sub(last_switch) >= TARGET_DWELL_FRAMES
 }
 
-/// expert 的加权目标：Random 100；Badges (max-own)/max*100；KOs (max_stack-10)*10；Attackers min(aim,12)/6*100。
-fn weighted_target(s: &Snapshot, rng: &mut u64) -> Key {
-    let own = s.badge_units as f64;
-    let max_b = s
-        .alive
-        .iter()
-        .filter(|&&p| p != s.pid)
-        .map(|&p| s.badges_all.get(p).copied().unwrap_or(0))
-        .max()
-        .unwrap_or(0) as f64;
-    let w_badges = if max_b > 0.0 {
-        ((max_b - own).max(0.0) / max_b) * 100.0
-    } else {
-        0.0
-    };
-    let w_kos = ((s.max_stack as f64 - 10.0) * 10.0).max(0.0);
-    let w_att = s.targeted_by.len().min(12) as f64 / 6.0 * 100.0;
-    let weights = [
-        (Key::TargetRandom, 100.0),
-        (Key::TargetBadges, w_badges),
-        (Key::TargetKos, w_kos),
-        (Key::TargetAttackers, w_att),
-    ];
-    let sum: f64 = weights.iter().map(|(_, w)| *w).sum();
-    *rng = rng
-        .wrapping_mul(6_364_136_223_846_793_005)
-        .wrapping_add(1_442_695_040_888_963_407);
-    let mut roll = ((*rng >> 11) as f64 / (1u64 << 53) as f64) * sum;
-    for (k, w) in weights {
-        if roll < w {
-            return k;
-        }
-        roll -= w;
-    }
-    Key::TargetRandom
-}
-
-// ———— NullBot ————
-
-pub struct NullBot;
-
-impl Bot for NullBot {
-    fn name(&self) -> &'static str {
-        "null"
-    }
-    fn decide(&mut self, _s: &Snapshot) -> Vec<TimedKey> {
-        vec![]
-    }
-}
-
 // ———— 计划执行骨架 ————
 
 #[derive(Clone, Debug)]
-struct Plan {
-    sig_pieces: u64,
-    sig_kind: u8,
-    sig_hold: u8,
-    sig_hold_used: bool,
-    rot: u8,
-    col: i32,
-    want_hold: bool,
+pub(crate) struct Plan {
+    pub(crate) sig_pieces: u64,
+    pub(crate) sig_kind: u8,
+    pub(crate) sig_hold: u8,
+    pub(crate) sig_hold_used: bool,
+    pub(crate) rot: u8,
+    pub(crate) col: i32,
+    pub(crate) want_hold: bool,
 }
 
-trait PlanBot {
+pub(crate) trait PlanBot {
     fn use_hold(&self) -> bool;
     fn use_panic(&self) -> bool;
     /// 返回 (rot, col) 或 None 表示想先 Hold
@@ -439,7 +372,7 @@ trait PlanBot {
     }
 }
 
-fn best_basic(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32)> {
+pub(crate) fn best_basic(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32)> {
     let mut best: Option<(f64, u8, i32)> = None;
     for p in placements(grid, kind) {
         let mut sc = p.score_basic;
@@ -453,7 +386,7 @@ fn best_basic(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32)> {
     best.map(|(_, r, c)| (r, c))
 }
 
-fn best_dellach(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32, Grid, f64)> {
+pub(crate) fn best_dellach(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32, Grid, f64)> {
     let mut best: Option<(f64, u8, i32, Grid)> = None;
     for p in placements(grid, kind) {
         let mut sc = p.score_dellach;
@@ -467,328 +400,6 @@ fn best_dellach(grid: &Grid, kind: Kind, panic: bool) -> Option<(u8, i32, Grid, 
     best.map(|(s, r, c, g)| (r, c, g, s))
 }
 
-// ———— BasicBot ————
-
-pub struct BasicBot {
-    plan: Option<Plan>,
-    frames: u64,
-    last_move_frame: u64,
-}
-
-impl BasicBot {
-    pub fn new() -> Self {
-        BasicBot { plan: None, frames: 0, last_move_frame: 0 }
-    }
-}
-
-impl Default for BasicBot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Bot for BasicBot {
-    fn name(&self) -> &'static str {
-        "basic"
-    }
-    fn decide(&mut self, s: &Snapshot) -> Vec<TimedKey> {
-        if !s.alive_self {
-            return vec![];
-        }
-        if self.frames == 0 {
-            self.frames += 1;
-            return vec![ev(0, Key::TargetRandom)];
-        }
-        self.frames += 1;
-        let Some(a) = s.active else { return vec![] };
-        let sig = (s.pieces as u64, a.kind.id(), s.hold.map(|k| k.id()).unwrap_or(0), s.hold_used);
-        let need = match &self.plan {
-            Some(p) => (p.sig_pieces, p.sig_kind, p.sig_hold, p.sig_hold_used) != sig,
-            None => true,
-        };
-        if need {
-            let grid = grid_of(s);
-            let panic = max_height(&grid) >= 15;
-            let found = best_basic(&grid, a.kind, panic).map(|(r, c)| Plan {
-                sig_pieces: sig.0,
-                sig_kind: sig.1,
-                sig_hold: sig.2,
-                sig_hold_used: sig.3,
-                rot: r,
-                col: c,
-                want_hold: false,
-            });
-            self.plan = found;
-        }
-        let plan = match &self.plan {
-            Some(p) if (p.sig_pieces, p.sig_kind, p.sig_hold, p.sig_hold_used) == sig => p,
-            _ => return vec![],
-        };
-        let diff = (plan.rot as i32 + 4 - (a.rot as i32 % 4)) % 4;
-        if diff == 3 {
-            return vec![ev(0, Key::RotCcw)];
-        }
-        if diff != 0 {
-            return vec![ev(0, Key::RotCw)];
-        }
-        if a.x < plan.col {
-            if !allow_move(self.frames, &mut self.last_move_frame) {
-                return vec![];
-            }
-            return vec![ev(0, Key::RightDown), ev(4000, Key::RightUp)];
-        }
-        if a.x > plan.col {
-            if !allow_move(self.frames, &mut self.last_move_frame) {
-                return vec![];
-            }
-            return vec![ev(0, Key::LeftDown), ev(4000, Key::LeftUp)];
-        }
-        vec![ev(0, Key::HardDrop)]
-    }
-}
-
-// ———— AdvancedBot ————
-
-pub struct AdvancedBot {
-    plan: Option<Plan>,
-    frames: u64,
-    last_mode: Option<Key>,
-    last_switch: u64,
-    last_move_frame: u64,
-    last_sent: u32,
-    weighted_mode: Option<Key>,
-    rng: u64,
-}
-
-impl AdvancedBot {
-    pub fn new() -> Self {
-        AdvancedBot {
-            plan: None,
-            frames: 0,
-            last_mode: None,
-            last_switch: 0,
-            last_move_frame: 0,
-            last_sent: 0,
-            weighted_mode: None,
-            rng: 0,
-        }
-    }
-}
-
-impl PlanBot for AdvancedBot {
-    fn use_hold(&self) -> bool {
-        true
-    }
-    fn use_panic(&self) -> bool {
-        true
-    }
-    fn search(&mut self, s: &Snapshot) -> Option<(u8, i32)> {
-        let grid = grid_of(s);
-        let panic = self.use_panic() && max_height(&grid) >= 15;
-        let a = s.active?;
-        let cur = best_dellach(&grid, a.kind, panic);
-        if !self.use_hold() || s.hold_used {
-            return cur.map(|(r, c, _, _)| (r, c));
-        }
-        // Hold 分支：hold 空则换入 next[0]，否则换入 hold
-        let swap_kind = match s.hold {
-            Some(k) => Some(k),
-            None => s.next.first().copied(),
-        };
-        if let Some(k) = swap_kind {
-            let alt = best_dellach(&grid, k, panic);
-            let better = match (&cur, &alt) {
-                (_, None) => false,
-                (None, Some(_)) => true,
-                (Some((_, _, _, s1)), Some((_, _, _, s2))) => *s2 > *s1,
-            };
-            if better {
-                return None; // 触发 Hold
-            }
-        }
-        cur.map(|(r, c, _, _)| (r, c))
-    }
-    fn plan_mut(&mut self) -> &mut Option<Plan> {
-        &mut self.plan
-    }
-    fn frames_mut(&mut self) -> &mut u64 {
-        &mut self.frames
-    }
-    fn last_move_frame_mut(&mut self) -> &mut u64 {
-        &mut self.last_move_frame
-    }
-    fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        if self.rng == 0 {
-            self.rng = 0x9E37_79B9_7F4A_7C15 ^ (s.pid as u64 + 1);
-        }
-        if s.sent != self.last_sent || self.weighted_mode.is_none() {
-            self.last_sent = s.sent;
-            self.weighted_mode = Some(advanced_weighted(s, &mut self.rng));
-        }
-        let want = match self.weighted_mode {
-            Some(k) => k,
-            None => Key::TargetRandom,
-        };
-        if Some(want) != self.last_mode {
-            self.last_mode = Some(want);
-            self.last_switch = self.frames;
-            return Some(want);
-        }
-        None
-    }
-}
-
-impl Bot for AdvancedBot {
-    fn name(&self) -> &'static str {
-        "advanced"
-    }
-    fn decide(&mut self, s: &Snapshot) -> Vec<TimedKey> {
-        PlanBot::decide(self, s)
-    }
-}
-
-// ———— ExpertBot ————
-
-pub struct ExpertBot {
-    plan: Option<Plan>,
-    frames: u64,
-    last_mode: Option<Key>,
-    last_switch: u64,
-    last_move_frame: u64,
-    last_sent: u32,
-    weighted_mode: Option<Key>,
-    rng: u64,
-}
-
-impl ExpertBot {
-    pub fn new() -> Self {
-        ExpertBot {
-            plan: None,
-            frames: 0,
-            last_mode: None,
-            last_switch: 0,
-            last_move_frame: 0,
-            last_sent: 0,
-            weighted_mode: None,
-            rng: 0,
-        }
-    }
-}
-
-const EXPERT_BEAM: usize = 12;
-
-impl PlanBot for ExpertBot {
-    fn use_hold(&self) -> bool {
-        true
-    }
-    fn use_panic(&self) -> bool {
-        true
-    }
-    fn search(&mut self, s: &Snapshot) -> Option<(u8, i32)> {
-        let grid = grid_of(s);
-        let panic = self.use_panic() && max_height(&grid) >= 15;
-        let a = s.active?;
-        let next = s.next.first().copied();
-        let beam_root = |kind: Kind| -> Option<(f64, u8, i32)> {
-            // 深度 2：root + next，按 root 分数截断束宽，终局分数主导
-            let mut cands: Vec<(f64, f64, u8, i32, Grid)> = placements(&grid, kind)
-                .into_iter()
-                .map(|p| {
-                    let mut sc = p.score_dellach;
-                    if panic {
-                        sc += p.f.cleared * 25.0;
-                    }
-                    (sc, 0.0, p.rot, p.col, p.grid)
-                })
-                .collect();
-            if cands.is_empty() {
-                return None;
-            }
-            cands.sort_by(|x, y| y.0.partial_cmp(&x.0).unwrap_or(std::cmp::Ordering::Equal));
-            cands.truncate(EXPERT_BEAM);
-            let mut best: Option<(f64, u8, i32)> = None;
-            for (root_sc, _, rot, col, g) in cands {
-                let mut tail_best = root_sc;
-                if let Some(nk) = next {
-                    if let Some(b) = placements(&g, nk)
-                        .into_iter()
-                        .map(|p| {
-                            let mut sc = p.score_dellach;
-                            if panic {
-                                sc += p.f.cleared * 25.0;
-                            }
-                            sc
-                        })
-                        .max_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
-                    {
-                        tail_best = tail_best * 0.3 + b * 0.7;
-                    }
-                }
-                if best.as_ref().map(|(b, _, _)| tail_best > *b).unwrap_or(true) {
-                    best = Some((tail_best, rot, col));
-                }
-            }
-            best
-        };
-        let cur = beam_root(a.kind).map(|(_, r, c)| (r, c));
-        if !self.use_hold() || s.hold_used {
-            return cur;
-        }
-        let swap_kind = match s.hold {
-            Some(k) => Some(k),
-            None => s.next.first().copied(),
-        };
-        if let Some(k) = swap_kind {
-            // Hold 决策：两种棋型在同一局面下的单块最优评估公平比较
-            let grid = grid_of(s);
-            let panic = self.use_panic() && max_height(&grid) >= 15;
-            let cur_sc = best_dellach(&grid, a.kind, panic).map(|x| x.3);
-            let alt_sc = best_dellach(&grid, k, panic).map(|x| x.3);
-            if alt_sc > cur_sc {
-                return None;
-            }
-        }
-        cur
-    }
-    fn plan_mut(&mut self) -> &mut Option<Plan> {
-        &mut self.plan
-    }
-    fn frames_mut(&mut self) -> &mut u64 {
-        &mut self.frames
-    }
-    fn last_move_frame_mut(&mut self) -> &mut u64 {
-        &mut self.last_move_frame
-    }
-    fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
-        if self.rng == 0 {
-            self.rng = 0x9E37_79B9_7F4A_7C15 ^ (s.pid as u64 + 1);
-        }
-        if s.sent != self.last_sent || self.weighted_mode.is_none() {
-            self.last_sent = s.sent;
-            self.weighted_mode = Some(weighted_target(s, &mut self.rng));
-        }
-        let want = match self.weighted_mode {
-            Some(k) => k,
-            None => Key::TargetRandom,
-        };
-        if Some(want) != self.last_mode {
-            self.last_mode = Some(want);
-            self.last_switch = self.frames;
-            return Some(want);
-        }
-        None
-    }
-}
-
-impl Bot for ExpertBot {
-    fn name(&self) -> &'static str {
-        "expert"
-    }
-    fn decide(&mut self, s: &Snapshot) -> Vec<TimedKey> {
-        PlanBot::decide(self, s)
-    }
-}
-
 // ———— 工厂与适配器 ————
 
 pub fn make_bot(tier: &str) -> Box<dyn Bot> {
@@ -796,7 +407,10 @@ pub fn make_bot(tier: &str) -> Box<dyn Bot> {
         "null" => Box::new(NullBot),
         "basic" => Box::new(BasicBot::new()),
         "advanced" => Box::new(AdvancedBot::new()),
+        #[cfg(feature = "expert")]
         "expert" => Box::new(ExpertBot::new()),
+        #[cfg(not(feature = "expert"))]
+        "expert" => panic!("expert: 本源码分发不含 expert 档位（feature `expert` 关闭；二进制内建闭源实现）"),
         _ => panic!("unknown tier: {tier}"),
     }
 }
@@ -900,5 +514,13 @@ mod tests {
         let a = run_match(&["basic", "advanced"], 9000, 77);
         let b = run_match(&["basic", "advanced"], 9000, 77);
         assert_eq!(a.hash_state(), b.hash_state());
+    }
+
+    #[cfg(feature = "expert")]
+    #[test]
+    fn expert_survives_solo_long() {
+        let m = run_match(&["expert"], 10000, 5);
+        assert!(m.over.is_none());
+        assert!(m.players[0].alive);
     }
 }
