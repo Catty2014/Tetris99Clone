@@ -1541,6 +1541,12 @@ impl Brain {
                 Some(Decision::Place(c)) => {
                     if c.spin > 0 {
                         self.t_spins += 1;
+                        if std::env::var("T99_SPIN_TRACE").is_ok() {
+                            eprintln!(
+                                "[spin-plan] seat={} piece={} kind={} rot={} x={} y={} cleared={} floor={} pre=({},{})",
+                                fr.seat, a.t, c.spin, c.fin_rot, c.fin_x, c.fin_y, c.cleared, c.floor_rot, c.pre_rot, c.pre_x
+                            );
+                        }
                     }
                     if std::env::var("T99_BOT_DEBUG").is_ok() {
                         let (dbg_danger, dbg_redline) = danger_state(&g, fr, &self.profile);
@@ -1708,6 +1714,9 @@ impl Brain {
         let grounded = y >= rest_y(g, a.t, a.r, a.x);
         if cur != pre {
             let Some(path) = bfs_path(g, a.t, y, cur, pre, false) else {
+                if std::env::var("T99_SPIN_TRACE").is_ok() {
+                    eprintln!("[exec-fail] kick BFS cur=({},{}) pre=({},{}) y={}", cur.0, cur.1, pre.0, pre.1, y);
+                }
                 self.blocked.push((goal.1, goal.0));
                 self.plan = None;
                 return Act { evs: vec![], soft_hold: false };

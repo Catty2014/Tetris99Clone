@@ -1703,11 +1703,23 @@ impl Match {
         } else {
             SpinKind::None
         };
+        if kind == Kind::T && std::env::var("T99_SPIN_TRACE").is_ok() {
+            eprintln!(
+                "[t-lock] pid={pid} frame={} spin={:?} rot={} x={} y={} kick={:?}",
+                self.frame_n, spin, rot, x, y, self.players[pid].last_rot_kick
+            );
+        }
         if spin != SpinKind::None {
             let p = &mut self.players[pid];
             p.t_spins += 1;
             if spin == SpinKind::Full {
                 p.t_spin_full += 1;
+            }
+            if std::env::var("T99_SPIN_TRACE").is_ok() {
+                eprintln!(
+                    "[spin-lock] pid={pid} frame={} spin={:?} piece={:?} rot={} x={} y={} kick={:?}",
+                    self.frame_n, spin, kind, rot, x, y, self.players[pid].last_rot_kick
+                );
             }
         }
         // 消行
