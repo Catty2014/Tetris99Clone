@@ -3665,6 +3665,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "t99-bot-ext"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "t99-bots",
+ "t99-core",
+ "t99-proto",
+ "tungstenite",
+]
+
+[[package]]
 name = "t99-bot-m"
 version = "0.1.0"
 dependencies = [

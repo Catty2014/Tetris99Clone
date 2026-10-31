@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use t99_bots::BotAdapter;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TimedKey};
-use t99_proto::{hello_for, PlayerAdapter, ResultMsg, SubprocessAdapter};
+use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter};
 
 const DEFAULT_MAX_FRAMES: u64 = 54_000; // 15 分钟 @60Hz
 
@@ -95,8 +95,19 @@ fn build_seats(args: &[String], players: usize) -> (Vec<Seat>, Vec<String>, u64)
         .filter(|s| !s.is_empty())
         .collect();
     for b in &bots {
-        seat_specs.push(format!("bot:{b}"));
-        seats.push(Seat { adapter: Box::new(BotAdapter::new(b)), killed: false });
+        // 档位（内建）或 ext:label=path（外部程序，与提交程序同通道）
+        match parse_seat(b) {
+            SeatProgram::BuiltIn(tier) => {
+                seat_specs.push(format!("bot:{tier}"));
+                seats.push(Seat { adapter: Box::new(BotAdapter::new(&tier)), killed: false });
+            }
+            SeatProgram::Ext { label, path } => {
+                seat_specs.push(format!("ext:{label}={path}"));
+                let adapter =
+                    SubprocessAdapter::new(format!("ext:{label}"), vec![path]);
+                seats.push(Seat { adapter: Box::new(adapter), killed: false });
+            }
+        }
     }
     while seats.len() < players {
         seat_specs.push("bot:basic".into());

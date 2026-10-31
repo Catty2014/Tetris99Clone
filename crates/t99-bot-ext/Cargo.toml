@@ -1,0 +1,25 @@
+[package]
+name = "t99-bot-ext"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# 公开档外部程序（basic / advanced）：参考实现与可修改陪练。
+# 决策核与进程内 Bot（t99-bots）为同一份代码——内外等价由构造保证。
+# 分发包含本 crate 源码与静态编译的二进制；不含 master/grandmaster。
+
+[[bin]]
+name = "t99-bot-basic"
+path = "src/bin/t99-bot-basic.rs"
+
+[[bin]]
+name = "t99-bot-advanced"
+path = "src/bin/t99-bot-advanced.rs"
+
+[dependencies]
+t99-core = { path = "../t99-core" }
+t99-proto = { path = "../t99-proto" }
+t99-bots = { path = "../t99-bots" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }

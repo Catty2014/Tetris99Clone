@@ -71,10 +71,10 @@ pub fn hello_for(pid: usize, player_id: &str, players: usize, preview: usize) ->
     }
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct FrameMsg {
     #[serde(rename = "type")]
-    pub kind: &'static str,
+    pub kind: String,
     pub n: u64,
     /// 引擎内部席位编号；外部身份在 hello.player_id
     pub seat: usize,
@@ -126,7 +126,7 @@ pub struct FrameMsg {
     pub burn_x10: u16,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct ActiveMsg {
     pub t: char,
     pub r: u8,
@@ -135,7 +135,7 @@ pub struct ActiveMsg {
     pub y_m: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct GarbageMsg {
     /// 红：即将进场
     pub red: u32,
@@ -145,19 +145,19 @@ pub struct GarbageMsg {
     pub gray: u32,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct PhaseMsg {
-    pub kind: &'static str,
+    pub kind: String,
     pub ms_left: i64,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct LockMsg {
     pub ms_left: i64,
     pub resets: u32,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DasMsg {
     pub left: bool,
     pub right: bool,
@@ -184,12 +184,12 @@ fn board_rows(s: &Snapshot) -> Vec<String> {
 impl FrameMsg {
     pub fn from_snapshot(s: &Snapshot, pid: usize) -> Self {
         FrameMsg {
-            kind: "frame",
+            kind: "frame".to_string(),
             n: s.n,
             seat: pid,
             board: board_rows(s),
             active: s.active.map(|a| ActiveMsg { t: a.kind.ch(), r: a.rot, x: a.x, y_m: a.y_milli }),
-            phase: PhaseMsg { kind: s.phase.tag(), ms_left: s.phase.ms_left() },
+            phase: PhaseMsg { kind: s.phase.tag().to_string(), ms_left: s.phase.ms_left() },
             next: s.next.iter().map(|k| k.ch()).collect(),
             hold: s.hold.map(|k| k.ch()),
             hold_used: s.hold_used,
@@ -247,7 +247,7 @@ pub fn snapshot_from_frame(f: &FrameMsg, pid: usize) -> Snapshot {
             };
         }
     }
-    let phase = match f.phase.kind {
+    let phase = match f.phase.kind.as_str() {
         "clear" => PlayerPhase::Clear(f.phase.ms_left * TMS),
         "are" => PlayerPhase::Are(f.phase.ms_left * TMS),
         _ => PlayerPhase::Play,
