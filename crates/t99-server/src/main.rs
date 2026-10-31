@@ -478,6 +478,12 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let mut tps_win_start = Instant::now();
         let mut tps_win_ticks: u32 = 0;
         let mut last_tps: f32 = 0.0;
+        // 帧内耗时诊断（T99_FRAME_STATS=1）：发送快照 / 等待回包 / 超时席位
+        let frame_stats = std::env::var("T99_FRAME_STATS").is_ok();
+        let (mut fs_n, mut fs_send, mut fs_send_max) = (0u32, 0u64, 0u64);
+        let (mut fs_wait, mut fs_wait_max, mut fs_miss) = (0u64, 0u64, 0u32);
+        let (mut fs_lat_sum, mut fs_lat_max, mut fs_lat_max_seat, mut fs_replies) = (0u64, 0u64, 0usize, 0u32);
+        let mut sent_at: Vec<Option<Instant>> = vec![None; players];
         while in_match {
             let deadline = sched_origin
                 + Duration::from_nanos(frame_idx.saturating_mul(1_000_000_000) / tick_hz);
@@ -530,6 +536,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     }
                 }
             }
+            let t_send = Instant::now();
             let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; players];
             // 阶段一：所有异步席位先发本帧快照；进程内 bot 仍同步 act。
             let mut pending: Vec<usize> = Vec::new();
@@ -540,6 +547,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 if let Some(b) = bots[pid].as_mut() {
                     let snap = engine.snapshot(pid);
                     if b.begin_frame(&snap) {
+                        sent_at[pid] = Some(Instant::now());
                         pending.push(pid);
                     } else {
                         inputs[pid] = b.act(&snap);
@@ -548,7 +556,10 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     inputs[pid] = ev;
                 }
             }
+            let send_us = t_send.elapsed().as_micros() as u64;
             // 阶段二：共享 deadline 收集，等最慢的一席，而不是逐个等 RTT。
+            let t_wait = Instant::now();
+            let mut missed = 0u32;
             if !pending.is_empty() {
                 let deadline = Instant::now() + FRAME_DEADLINE;
                 loop {
@@ -556,7 +567,18 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     for pid in pending.drain(..) {
                         let b = bots[pid].as_mut().expect("pending 席位必有 adapter");
                         match b.try_input() {
-                            Some(ev) => inputs[pid] = ev,
+                            Some(ev) => {
+                                if let Some(t) = sent_at[pid].take() {
+                                    let lat = t.elapsed().as_micros() as u64;
+                                    fs_lat_sum += lat;
+                                    fs_replies += 1;
+                                    if lat > fs_lat_max {
+                                        fs_lat_max = lat;
+                                        fs_lat_max_seat = pid;
+                                    }
+                                }
+                                inputs[pid] = ev;
+                            }
                             None => still.push(pid),
                         }
                     }
@@ -566,9 +588,19 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     }
                     std::thread::sleep(Duration::from_micros(200));
                 }
+                missed = pending.len() as u32;
                 for pid in pending.drain(..) {
                     inputs[pid] = bots[pid].as_mut().expect("pending 席位必有 adapter").end_frame();
                 }
+            }
+            let wait_us = t_wait.elapsed().as_micros() as u64;
+            if frame_stats {
+                fs_n += 1;
+                fs_send += send_us;
+                fs_send_max = fs_send_max.max(send_us);
+                fs_wait += wait_us;
+                fs_wait_max = fs_wait_max.max(wait_us);
+                fs_miss += missed;
             }
             // 外部程序死亡/持续不应答：宿主强制判负
             for pid in 0..players {
@@ -587,6 +619,32 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     last_tps = ((tps_win_ticks as f32 / elapsed) * 10.0).round() / 10.0;
                     tps_win_ticks = 0;
                     tps_win_start = Instant::now();
+                    if frame_stats && fs_n > 0 {
+                        eprintln!(
+                            "[frame] n={} send_avg={}us send_max={}us wait_avg={}us wait_max={}us misses={} reply_avg={}us reply_max={}us seat={} replies={} tps={:.1}",
+                            fs_n,
+                            fs_send / fs_n as u64,
+                            fs_send_max,
+                            fs_wait / fs_n as u64,
+                            fs_wait_max,
+                            fs_miss,
+                            fs_lat_sum / fs_replies.max(1) as u64,
+                            fs_lat_max,
+                            fs_lat_max_seat,
+                            fs_replies,
+                            last_tps
+                        );
+                        fs_n = 0;
+                        fs_send = 0;
+                        fs_send_max = 0;
+                        fs_wait = 0;
+                        fs_wait_max = 0;
+                        fs_miss = 0;
+                        fs_lat_sum = 0;
+                        fs_lat_max = 0;
+                        fs_lat_max_seat = 0;
+                        fs_replies = 0;
+                    }
                 }
             }
             // 重复动作被 sanitize 丢弃时警告该席位（每席位最多 1 秒一次）
