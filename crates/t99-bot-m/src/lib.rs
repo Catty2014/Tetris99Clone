@@ -1329,7 +1329,7 @@ fn frame_after(fr: &FrameIn, c: &Cand) -> FrameIn {
 
 #[derive(Clone, Debug)]
 pub struct Plan {
-    pub sig: (u64, char, u8, bool),
+    pub sig: (u64, char, u8, bool, u64),
     pub cand: Cand,
     pub age: u32,
 }
@@ -1363,7 +1363,7 @@ pub struct Brain {
     pub t_spins: u32,
     /// 本块内已证不可达的候选（fin_rot, fin_x）——BFS 失败后拉黑并重规划
     blocked: Vec<(u8, i32)>,
-    blocked_sig: (u64, char, u8, bool),
+    blocked_sig: (u64, char, u8, bool, u64),
     /// 踢墙旋转后待验证的目标 (fin_rot, fin_x, fin_y)：下一帧确认落点再硬降
     verify: Option<(u8, i32, i64)>,
     // —— GM 策略：拉取对手盘面 + 评分 ——
@@ -1614,7 +1614,7 @@ impl Brain {
             rng: 0,
             t_spins: 0,
             blocked: vec![],
-            blocked_sig: (0, '-', 0, false),
+            blocked_sig: (0, '-', 0, false, 0),
             verify: None,
             boards: std::collections::HashMap::new(),
             want_query: false,
@@ -1676,7 +1676,7 @@ impl Brain {
         // - 否则拉黑候选重规划，绝不把错误位置硬降下去。
         if let Some((vr, vx, vy)) = self.verify.take() {
             let y = a.y_m + HID as i64 * MILLI;
-            let at_goal = a.r % 4 == vr && a.x == vx && y == vy;
+            let at_goal = a.r % 4 == vr && a.x == vx && y / MILLI == vy / MILLI;
             let full_here = a.t == 'T'
                 && spin_at(&g, a.r % 4, a.x, y, 0) == 2
                 && matches!(stamp_and_clear(&g, 'T', a.r % 4, a.x, y), Some((_, n, _, _)) if n >= 1);
@@ -1690,15 +1690,28 @@ impl Brain {
                     vr, vx, vy, a.r % 4, a.x, y
                 );
             }
+            // 盘面或落点不符：本块内拉黑该 (rot,x)，避免同一目标反复重试；
+            // 盘面签名变化（垃圾插入）会自动清空 blocked，重新允许尝试。
             self.blocked.push((vr, vx));
             self.plan = None;
-            return Act {
-                evs: if self.soft_held { vec![(0, Ev::SoftUp)] } else { vec![] },
-                soft_hold: false,
-            };
+            self.soft_held = false;
         }
 
-        let sig = (fr.pieces as u64, a.t, fr.hold.map(|k| k as u8).unwrap_or(0), fr.hold_used);
+        // 盘面签名：垃圾行插入会改变堆面，旧计划必须作废并重算
+        let mut bh: u64 = 0xcbf2_9ce4_8422_2325;
+        for row in fr.board.iter().take(20) {
+            for b in row.as_bytes() {
+                bh ^= *b as u64;
+                bh = bh.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        let sig = (
+            fr.pieces as u64,
+            a.t,
+            fr.hold.map(|k| k as u8).unwrap_or(0),
+            fr.hold_used,
+            bh,
+        );
         if self.blocked_sig != sig {
             self.blocked.clear();
             self.blocked_sig = sig;
@@ -1993,10 +2006,26 @@ impl Brain {
         // 贴地前置态现算旋转落点（与引擎 try_rotate 一致）：只有真正形成
         // 「消行 Full T-Spin」才执行，否则拉黑候选重规划。
         if let Some((nx, ny, ki)) = rotate_result(&g, a.t, a.x, a.r % 4, y, fin_rot) {
-            let good = a.t == 'T'
-                && spin_at(&g, fin_rot, nx, ny, ki) == 2
-                && matches!(stamp_and_clear(&g, 'T', fin_rot, nx, ny), Some((_, n, _, _)) if n >= 1);
+            let spin_v = if a.t == 'T' {
+                spin_at(&g, fin_rot, nx, ny, ki)
+            } else {
+                0
+            };
+            let clr = matches!(stamp_and_clear(&g, 'T', fin_rot, nx, ny), Some((_, n, _, _)) if n >= 1);
+            let good = a.t == 'T' && spin_v == 2 && clr;
+            if std::env::var("T99_SPIN_TRACE").is_ok() {
+                eprintln!(
+                    "[kick-eval] f={} cur=({},{},{}) to={} -> ({},{}) ki={} spin={} clr={}",
+                    _fr.n, cur.0, cur.1, y, fin_rot, nx, ny, ki, spin_v, clr
+                );
+            }
             if good {
+                if std::env::var("T99_SPIN_TRACE").is_ok() {
+                    eprintln!(
+                        "[spin-exec] f={} from=({},{},{}) -> rot={} ({},{}) kick={}",
+                        _fr.n, a.r % 4, a.x, y, fin_rot, nx, ny, ki
+                    );
+                }
                 self.verify = Some((fin_rot, nx, ny));
                 self.plan = None;
                 return Act { evs: vec![(0, Ev::SoftUp), (1200, rot_ev)], soft_hold: false };

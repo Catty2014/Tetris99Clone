@@ -834,18 +834,22 @@ impl Match {
                 }
             }
         }
-        // 夹到静息位
+        // 夹到静息位：只修正越界（重力步进可能越过地面）。
+        // 不能用列顶推算：旋转进悬挑下的方块本来就在堆顶之下，按列顶会被错误地抬上去。
         {
             let (k, r, x) = {
                 let a = self.players[pid].active.unwrap();
                 (a.kind, a.rot, a.x)
             };
-            let rest = rest_y(&self.players[pid], k, r, x);
-            let p = &mut self.players[pid];
-            if let Some(a) = p.active.as_mut() {
-                if a.y > rest {
-                    a.y = rest;
-                }
+            let mut y = match self.players[pid].active {
+                Some(a) => a.y,
+                None => return,
+            };
+            while y > 0 && collides(&self.players[pid], k, r, x, y) {
+                y -= MILLI_CELL;
+            }
+            if let Some(a) = self.players[pid].active.as_mut() {
+                a.y = y;
             }
         }
         // grounded 与锁定计时
@@ -926,6 +930,12 @@ impl Match {
             let nx = x + *kx;
             let ny = y + *ky as Milli * MILLI_CELL;
             if !collides(&self.players[pid], k, to, nx, ny) {
+                if std::env::var("T99_SPIN_TRACE").is_ok() {
+                    eprintln!(
+                        "[rot] pid={pid} f={} piece={} from=({},{},{}) to={} kick={} -> ({},{})",
+                        self.frame_n, k.ch(), r, x, y, to, i, nx, ny
+                    );
+                }
                 let p = &mut self.players[pid];
                 if let Some(a) = p.active.as_mut() {
                     a.rot = to;
@@ -939,6 +949,12 @@ impl Match {
                 }
                 return true;
             }
+        }
+        if std::env::var("T99_SPIN_TRACE").is_ok() {
+            eprintln!(
+                "[rot-fail] pid={pid} f={} piece={} from=({},{},{}) to={}",
+                self.frame_n, k.ch(), r, x, y, to
+            );
         }
         false
     }
@@ -1120,15 +1136,18 @@ impl Match {
                 }
             }
             Key::HardDrop => {
-                let (k, r, x) = match self.players[pid].active {
-                    Some(a) => (a.kind, a.rot, a.x),
+                let (k, r, x, cur_y) = match self.players[pid].active {
+                    Some(a) => (a.kind, a.rot, a.x, a.y),
                     None => return,
                 };
                 let rest = rest_y(&self.players[pid], k, r, x);
+                // 只向下硬降：悬挑下旋转进来的方块当前位置可能比列顶推算的 rest 更低，
+                // 用 max 保留当前位置，否则会被抬回去、T-Spin 不成立。
+                let y = rest.max(cur_y);
                 {
                     let p = &mut self.players[pid];
                     if let Some(a) = p.active.as_mut() {
-                        a.y = rest;
+                        a.y = y;
                     }
                     // 硬降覆盖同帧软降，且不把软降状态带到下一块
                     p.soft = false;
@@ -1544,6 +1563,12 @@ impl Match {
         let g = self.players[pid].pending.remove(0);
         let n = g.rows as usize;
         let last_sender = g.sender;
+        if std::env::var("T99_SPIN_TRACE").is_ok() {
+            eprintln!(
+                "[garb] pid={pid} f={} rows={} sender={}",
+                self.frame_n, n, last_sender
+            );
+        }
         self.players[pid].inserted += g.rows;
         let p_same = self.cfg.ruleset.p_same_hole_pct;
         {
