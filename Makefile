@@ -39,6 +39,9 @@ dist: musl-build
 	for b in $(DIST_BINS); do cp $(MUSL_BIN)/$$b $(DIST)/bin/; done
 	# 配置
 	cp ruleset.toml server.toml client.toml $(DIST)/
+	# 认证：分发环境默认放行所有 PlayerID（server.toml 指向 auth/players.txt）
+	mkdir -p $(DIST)/auth
+	printf '# 分发环境默认放行所有 PlayerID\n*\n' > $(DIST)/auth/players.txt
 	cp dist-README.md $(DIST)/README.md
 	cp LICENSE $(DIST)/
 	cp examples/pybot.py $(DIST)/examples/

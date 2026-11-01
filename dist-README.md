@@ -26,13 +26,18 @@
 ./bin/t99-headless run --players 4 --seed 42 \
     --bots "basic,ext:basic=./bin/t99-bot-basic,advanced"
 
-# 单局服务器 + lobby（等待玩家接入）
+# 单局服务器：3 个陪练 + 1 个席位留给你的提交程序（--lobby 会等它接入）
 ./bin/t99-server --port 8138 --key t99 --players 4 --lobby \
     --bots "ext:basic=./bin/t99-bot-basic,advanced"
 
-# 你的程序以子进程接入（stdin/stdout 单行 JSON，见 protocol.md）
-# 或以 WebSocket 玩家接入：
-./bin/t99-bot-advanced --connect ws://127.0.0.1:8138 --id my-advanced --key t99
+# 你的程序以 WebSocket 玩家接入（占最后一个席位；接入后立即开局）
+./bin/t99-bot-advanced --connect ws://127.0.0.1:8138 --id my-submit --key t99
+
+# 也可以用子进程方式接入：把程序放进 --bots 的 ext: 列表，players 等于 bot 数
+./bin/t99-server --port 8138 --key t99 --players 3 \
+    --bots "ext:basic=./bin/t99-bot-basic,advanced,ext:mine=./my-bot"
+
+# 子进程协议：stdin/stdout 单行 JSON，示例见 examples/pybot.py
 
 # 逐位回放校验（确定性）
 ./bin/t99-headless replay --transcript /tmp/m.jsonl
@@ -46,4 +51,6 @@ cd src && cargo build --release
 - 二进制为 musl 静态链接（x86_64），无 libc/运行时依赖。
 - 分发源码中 `crates/t99-bots` 的 expert 档位已剔除（feature 关闭）；
   分发二进制中的 expert 为闭源内建实现，仅可通过内建档位名 `expert` 使用。
-- 引擎语义版本（`ENGINE_SEMANTICS`）与协议号随握手下发，两端不一致会被拒绝。
+- 握手下发 `protocol` 与 `ruleset`，任一不匹配会被拒绝；`auth/players.txt` 默认放行所有 PlayerID。
+- 服务器只按固定 60Hz 推进；某个程序在该帧内没有回包，本帧按“无操作”处理，不会拖慢整局。
+- 引擎语义版本常量 `ENGINE_SEMANTICS` 目前不参与握手校验。

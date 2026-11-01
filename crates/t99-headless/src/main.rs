@@ -15,11 +15,43 @@ struct Seat {
 }
 
 fn usage() {
-    eprintln!("用法:");
-    eprintln!("  t99-headless run --players N --bots basic,advanced [--candidate 'python3 bot.py'] \\");
-    eprintln!("                    [--seed S] [--max-frames F] [--transcript PATH] [--realtime]");
-    eprintln!("  t99-headless replay --transcript PATH");
-    eprintln!("  t99-headless calibrate --tiers basic,advanced,expert [--games G] [--seed S]");
+    let u = r#"t99-headless — 无头对局主机（确定性引擎直连；离线评测/自测用）
+
+用法: t99-headless <命令> [参数]
+
+命令:
+  run         跑一局对局
+  replay      从 transcript 逐位回放并校验状态 hash
+  calibrate   梯队校准矩阵（两两循环赛，验证档位严格传递）
+
+run 参数:
+  --players N          参与方总数（默认 2；席位不足时用 basic 补齐）
+  --bots LIST          逗号分隔的席位列表。每项为内建档位
+                       （null|basic|advanced|expert）或外部程序
+                       ext:label=path（path 为可执行文件，与参赛提交同通道，
+                       经 stdin/stdout 单行 JSON 通信，见 protocol.md）
+  --candidate 'CMD'    单外部程序简写：以命令行 CMD 启动一个子进程席位（仅 1 个）
+  --seed S             对局种子（默认 42；同种子同事件流逐位可复现）
+  --max-frames F       帧数上限（默认 54000 = 15 分钟 @60Hz；对局提前结束时提前返回）
+  --transcript PATH    逐帧事件流记录输出路径（供 replay 校验与对局诊断）
+  --realtime           按墙钟 60Hz 节流推进（缺省为引擎直连全速，跑得越快越好）
+
+replay 参数:
+  --transcript PATH    （必需）run 写出的逐帧记录
+
+calibrate 参数:
+  --tiers LIST         参与校准的内建档位（默认 null,basic,advanced,expert）
+  --games G            每对档位对局数（默认 12；对局双方交替座位）
+  --seed S             起始种子（每局递增派生）
+
+示例:
+  t99-headless run --players 4 --bots basic,advanced,expert,advanced --seed 31415
+  t99-headless run --players 2 --bots basic,ext:basic=./t99-bot-basic --seed 7
+  t99-headless run --players 2 --bots basic --candidate "python3 pybot.py"
+  t99-headless replay --transcript /tmp/m.jsonl
+  t99-headless calibrate --tiers null,basic,advanced --games 12
+"#;
+    println!("{u}");
 }
 
 fn arg_val(args: &[String], name: &str) -> Option<String> {
@@ -63,6 +95,10 @@ fn main() {
     if args.is_empty() {
         usage();
         std::process::exit(2);
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        usage();
+        std::process::exit(0);
     }
     let cmd = args[0].clone();
     let rest = &args[1..];

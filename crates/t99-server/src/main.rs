@@ -60,8 +60,58 @@ struct Args {
     force_target: Option<TargetPolicy>,
 }
 
+fn print_help() {
+    let u = r#"t99-server — 单局权威服务器（stdio 子进程 + WebSocket 玩家/观战，事件流广播）
+
+用法: t99-server [参数]
+服务器只服务一局；对局结束后驻留现场（保持连接与历史回填），新对局需重启服务器。
+规则集从 ruleset.toml 读取（只读；其 id 必须与编译进二进制的 RULESET_ID 一致，
+否则拒绝启动）。
+
+接入:
+  玩家      ws://<address>:<port>/ws?id=<player_id>&key=<key>（lobby 模式等待人数到齐开局）
+  观战      同上，握手声明 role=observer；只需 key，不需 PlayerID
+  子进程    --bots 用 ext:label=path 时由服务器 spawn，stdin/stdout 单行 JSON
+
+参数:
+  --address ADDR      监听地址（默认 127.0.0.1；对外暴露用 0.0.0.0）
+  --port N            监听端口（默认 6666）
+  --key K             房间准入 key（默认 "t99"；key 是房间凭据而非机密）
+  --players N         参与方总数（默认 99；含 Bot 席位）
+  --bots LIST         逗号分隔的非网络席位：内建档位（null|basic|advanced|expert）或
+                      ext:label=path。players - bots 数 = 网络席位（lobby 等待其接入）；
+                      非 lobby 局网络席位以空席计
+  --lobby / --no-lobby   lobby 模式：等待网络席位到齐后开局（--lobby-timeout 兜底）；
+                      开局后加入无效。缺省遵循 server.toml 的 match.lobby
+  --ids LIST          逗号分隔的 PlayerID 允许列表（glob）；缺省接受任意非空 ID，
+                      lobby 且未提供时读取 server.toml auth.id_files
+  --seed S            对局种子（0 = 随机并在启动时打印；缺省 0）
+  --time-limit-secs S 对局倒计时（0 = 按人数自动：4p=5min → 99p=15min；缺省 0）
+  --max-frames F      帧数硬上限（缺省随时间预算）
+  --stall-accel 1|0   0 杀 60s 后倒计时按对局时钟倍速燃烧（展览/自测机制，正式评测关闭）
+  --loglevel L        ERROR/WARN/INFO/DEBUG/TRACE（默认 INFO）
+  --debug             调试输出
+  --config PATH       server.toml 路径（缺省 ./server.toml；优先级 CLI > env > file > 默认）
+  --force-target P    强制全部席位的目标策略（参考局用）：
+                      random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|
+                      spreadweak|randomtop|attackers
+  --force-random-target  等价于 --force-target random
+  --dump-matrix       结算时向 stderr 输出逐对送出/抵消矩阵
+
+示例:
+  t99-server --port 8138 --key t99 --players 4 --lobby \
+      --bots "ext:basic=./t99-bot-basic,advanced,expert"
+  t99-server --port 8138 --players 99 --seed 24680 --bots basic,advanced,...   # 纯 Bot 大乱斗
+"#;
+    println!("{u}");
+}
+
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        std::process::exit(0);
+    }
     let get = |name: &str| -> Option<String> {
         let mut it = args.iter();
         while let Some(a) = it.next() {

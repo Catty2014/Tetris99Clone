@@ -17,6 +17,28 @@ use t99_core::TimedKey;
 pub const PROTOCOL_MIN: u32 = 5;
 pub const PROTOCOL_MAX: u32 = 8;
 
+const HELP: &str = r#"t99-bot-basic / t99-bot-advanced — 公开档外部程序（参考实现/可修改陪练）
+
+两种接入方式（缺省无参数 = 子进程 stdio 模式）:
+
+1. 子进程模式（被 t99-server / t99-headless 以 ext:label=path 启动）
+     stdin/stdout 单行 JSON：hello → ready → (frame → input)* → result
+     示例（服务器端指定席位）:
+       t99-headless run --players 2 --bots "ext:basic=./t99-bot-basic,basic"
+
+2. WebSocket 玩家模式（自主接入 lobby 服务器，与参赛提交程序同通道）
+     --connect URL   服务器地址，如 ws://127.0.0.1:8138（自动拼接 /ws 路径）
+     --id ID         PlayerID（需通过服务器的身份校验）
+     --key KEY       房间准入 key
+     示例:
+       t99-bot-basic --connect ws://127.0.0.1:8138 --id my-bot --key t99
+
+说明:
+  - 本程序的决策核与进程内 Bot（t99-bots）为同一份代码，可自由修改。
+  - 帧响应预算 16.666ms（实际判定 16ms），连续 600 帧无有效响应判负。
+  - 协议 v8；可选字段缺席按默认处理（容忍 5..=8）。
+"#;
+
 pub fn main_entry(make: fn() -> Box<dyn Bot>) {
     let args: Vec<String> = std::env::args().collect();
     let get = |name: &str| -> Option<String> {
@@ -28,6 +50,10 @@ pub fn main_entry(make: fn() -> Box<dyn Bot>) {
         }
         None
     };
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{HELP}");
+        std::process::exit(0);
+    }
     if let (Some(url), Some(id), Some(key)) = (get("--connect"), get("--id"), get("--key")) {
         run_ws(make, &url, &id, &key);
     } else {
