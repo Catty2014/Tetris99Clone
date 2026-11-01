@@ -51,6 +51,9 @@ pub struct ExpertBot {
     last_switch: u64,
     last_move_frame: u64,
     last_sent: u32,
+    /// 上次消行数与“连续无伤害消行”计数
+    last_lines: u32,
+    dry_clears: u32,
     weighted_mode: Option<Key>,
     rng: u64,
 }
@@ -64,6 +67,8 @@ impl ExpertBot {
             last_switch: 0,
             last_move_frame: 0,
             last_sent: 0,
+            last_lines: 0,
+            dry_clears: 0,
             weighted_mode: None,
             rng: 0,
         }
@@ -163,6 +168,40 @@ impl PlanBot for ExpertBot {
     fn target_policy(&mut self, s: &Snapshot) -> Option<Key> {
         if self.rng == 0 {
             self.rng = 0x9E37_79B9_7F4A_7C15 ^ (s.pid as u64 + 1);
+        }
+        // 连续 5 次消行都没有造成伤害 → 随机换一次目标。
+        // 高徽章目标会把火力吸住，双方互相抵消时容易出现“打太极”式的僵持。
+        if s.lines > self.last_lines {
+            if s.sent == self.last_sent {
+                self.dry_clears += 1;
+            } else {
+                self.dry_clears = 0;
+            }
+        }
+        self.last_lines = s.lines;
+        // 反攻模式本身就是“被打之后的反制”，不参与这条强制切换
+        if self.dry_clears >= 5 && self.last_mode != Some(Key::TargetAttackers) {
+            self.dry_clears = 0;
+            self.last_sent = s.sent;
+            let choices = [
+                Key::TargetRandom,
+                Key::TargetBadges,
+                Key::TargetKos,
+                Key::TargetAttackers,
+            ];
+            self.rng = self
+                .rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut idx = ((self.rng >> 33) % 4) as usize;
+            if Some(choices[idx]) == self.last_mode {
+                idx = (idx + 1) % 4;
+            }
+            let pick = choices[idx];
+            self.last_mode = Some(pick);
+            self.last_switch = self.frames;
+            self.weighted_mode = Some(pick);
+            return Some(pick);
         }
         if s.sent != self.last_sent || self.weighted_mode.is_none() {
             self.last_sent = s.sent;
