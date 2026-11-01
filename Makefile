@@ -34,12 +34,11 @@ musl-build:
 
 dist: musl-build
 	rm -rf $(DIST)
-	mkdir -p $(DIST)/bin $(DIST)/src/crates $(DIST)/examples $(DIST)/utils $(DIST)/docs
+	mkdir -p $(DIST)/bin $(DIST)/src/crates $(DIST)/examples $(DIST)/utils
 	# 二进制（musl 静态）
 	for b in $(DIST_BINS); do cp $(MUSL_BIN)/$$b $(DIST)/bin/; done
-	# 配置与文档
+	# 配置
 	cp ruleset.toml server.toml client.toml $(DIST)/
-	cp -r docs/design docs/rules $(DIST)/docs/
 	cp dist-README.md $(DIST)/README.md
 	cp examples/pybot.py $(DIST)/examples/
 	cp utils/time.py $(DIST)/utils/
@@ -57,9 +56,10 @@ dist: musl-build
 	# t99-bots：剔除 expert 源码并关闭 feature
 	rm -f $(DIST)/src/crates/t99-bots/src/expert.rs
 	sed -i 's/^default = \["expert"\]$$/default = []/' $(DIST)/src/crates/t99-bots/Cargo.toml
-	# 剔除断言：未公开内容不得进入分发
+	# 剔除断言：未公开内容与内部产物不得进入分发
 	@if find $(DIST) \( -name '*bot-m*' -o -name '*bot-master*' -o -name '*bot-gm*' \
-	    -o -name 'expert.rs' -o -name 't99-client' \) | grep -q .; then \
+	    -o -name 'expert.rs' -o -name 't99-client' -o -name 'docs' -o -name 'target' \
+	    -o -name '*.html' -o -name 'lab' \) | grep -q .; then \
 	    echo "[dist] 断言失败：发现应剔除的内容"; exit 1; fi
 	@if grep -rE '"crates/t99-(client|bot-m)"' $(DIST)/src/Cargo.toml; then \
 	    echo "[dist] 断言失败：workspace members 含应剔除 crate"; exit 1; fi

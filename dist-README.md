@@ -8,7 +8,7 @@
 | 组件 | 形式 | 说明 |
 | --- | --- | --- |
 | t99-core | 源码 + 二进制（headless 内含） | 确定性引擎（内核） |
-| t99-proto | 源码 + 文档（`docs/` 与题目 `protocol.md`） | 线协议 v8 + `snapshot_from_frame` 反向构造 |
+| t99-proto | 源码（协议说明见题目 `protocol.md`） | 线协议 v8 + `snapshot_from_frame` 反向构造 |
 | t99-headless | 源码 + `bin/t99-headless` | 无头主机：run / replay / calibrate；内含全部内建档位（expert 为闭源内建） |
 | t99-server | 源码 + `bin/t99-server` | 单局权威服务器（stdio 子进程 + WebSocket 玩家/观战） |
 | t99-bots | 源码（无 expert；`--no-default-features` 可构建） | 内建 basic / advanced / null 源码；expert 源码不提供 |
