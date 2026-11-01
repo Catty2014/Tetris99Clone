@@ -1356,6 +1356,9 @@ pub struct Brain {
     /// master 加权策略的当前模式 / 上次送出计数 / 随机源
     weighted_mode: Option<Ev>,
     last_sent: u32,
+    /// 上次消行数与“连续无伤害消行”计数（master：连续 5 次无伤害 → 随机换目标）
+    last_lines: u32,
+    dry_clears: u32,
     rng: u64,
     pub t_spins: u32,
     /// 本块内已证不可达的候选（fin_rot, fin_x）——BFS 失败后拉黑并重规划
@@ -1363,6 +1366,19 @@ pub struct Brain {
     blocked_sig: (u64, char, u8, bool),
     /// 踢墙旋转后待验证的目标 (fin_rot, fin_x, fin_y)：下一帧确认落点再硬降
     verify: Option<(u8, i32, i64)>,
+    // —— GM 策略：拉取对手盘面 + 评分 ——
+    /// 最近一次拉取到的对手盘面（seat -> 20 行字符串）
+    boards: std::collections::HashMap<usize, Vec<String>>,
+    /// 需要向服务器发一次盘面查询
+    want_query: bool,
+    /// 对局总时长（秒），首帧从 time_secs_left 推定
+    match_total: u32,
+    /// 最近 60 tick 的 pending 峰值与窗口起点
+    pending_peak: u32,
+    pending_win_start: u64,
+    /// GM 决策缓存：每 30 tick 重算一次
+    gm_calc_tick: u64,
+    gm_cached: Option<Ev>,
 }
 
 pub struct Act {
@@ -1451,6 +1467,100 @@ fn bfs_path(g: &Grid, kind: char, y: i64, from: (i32, u8), to: (i32, u8), spin_l
 }
 
 /// master 的加权目标：Random 100；Badges (max-own)/max*100；KOs (max_stack-10)*10；Attackers min(aim,12)/6*100。
+/// 徽章单位 → 档位（与 ruleset 的 badge_tier_units 一致：2/6/14/30）
+fn badge_tier_of(units: u32) -> u32 {
+    if units >= 30 {
+        4
+    } else if units >= 14 {
+        3
+    } else if units >= 6 {
+        2
+    } else if units >= 2 {
+        1
+    } else {
+        0
+    }
+}
+
+/// 目标危险度：
+///   (最高行数 - 10) × 10
+///   + 堆顶向下第 d 行（空格 ≥4）× 50 >> d
+///   − 垃圾底向上第 u 行（有顶部连通空格）× 50 >> u
+fn board_danger(rows: &[String]) -> f64 {
+    let h = rows.len();
+    if h == 0 {
+        return 0.0;
+    }
+    let w = rows[0].chars().count();
+    if w == 0 {
+        return 0.0;
+    }
+    let cell = |r: usize, c: usize| -> char { rows[r].chars().nth(c).unwrap_or('.') };
+    let mut max_h = 0i64;
+    let mut top = h;
+    for c in 0..w {
+        for r in 0..h {
+            if cell(r, c) != '.' {
+                max_h = max_h.max((h - r) as i64);
+                if r < top {
+                    top = r;
+                }
+                break;
+            }
+        }
+    }
+    // 近表面空腔
+    let mut cavities = 0.0;
+    for (d, r) in (top..h).enumerate() {
+        let empties = (0..w).filter(|&c| cell(r, c) == '.').count();
+        if empties >= 4 {
+            cavities += 50.0 / (1u64 << d.min(20)) as f64;
+        }
+    }
+    // 底部连续垃圾行
+    let mut garb = 0usize;
+    for r in (0..h).rev() {
+        if (0..w).any(|c| cell(r, c) == 'G') {
+            garb += 1;
+        } else {
+            break;
+        }
+    }
+    // 与顶部连通的空格
+    let mut conn = vec![vec![false; w]; h];
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for c in 0..w {
+        if cell(0, c) == '.' {
+            conn[0][c] = true;
+            stack.push((0, c));
+        }
+    }
+    while let Some((r, c)) = stack.pop() {
+        for (dr, dc) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
+            let nr = r as i64 + dr;
+            let nc = c as i64 + dc;
+            if nr < 0 || nr >= h as i64 || nc < 0 || nc >= w as i64 {
+                continue;
+            }
+            let (nr, nc) = (nr as usize, nc as usize);
+            if !conn[nr][nc] && cell(nr, nc) == '.' {
+                conn[nr][nc] = true;
+                stack.push((nr, nc));
+            }
+        }
+    }
+    // 可用深井：从真底部（垃圾行之上）往上
+    let true_bottom = h.saturating_sub(garb);
+    let mut wells = 0.0;
+    for u in 0..true_bottom.min(20) {
+        let r = true_bottom - 1 - u;
+        if (0..w).any(|c| conn[r][c]) {
+            wells += 50.0 / (1u64 << u.min(20)) as f64;
+        }
+    }
+    (max_h as f64 - 10.0) * 10.0 + cavities - wells
+}
+
 fn pick_weighted_mode(fr: &FrameIn, rng: &mut u64) -> Ev {
     let own = fr.badge_units as f64;
     let max_b = fr
@@ -1499,16 +1609,39 @@ impl Brain {
             last_switch: 0,
             weighted_mode: None,
             last_sent: 0,
+            last_lines: 0,
+            dry_clears: 0,
             rng: 0,
             t_spins: 0,
             blocked: vec![],
             blocked_sig: (0, '-', 0, false),
             verify: None,
+            boards: std::collections::HashMap::new(),
+            want_query: false,
+            match_total: 0,
+            pending_peak: 0,
+            pending_win_start: 0,
+            gm_calc_tick: 0,
+            gm_cached: None,
         }
     }
 
     pub fn decide(&mut self, fr: &FrameIn) -> Act {
         self.frames += 1;
+        if self.profile.name == "gm" || self.profile.name.starts_with("berserk") {
+            // 总时长推定（首帧的 time_secs_left 即剩余预算）；60 tick pending 峰值；每 30 tick 拉一次盘面
+            if self.match_total == 0 && fr.time_secs_left > 0 {
+                self.match_total = fr.time_secs_left;
+            }
+            if self.frames.saturating_sub(self.pending_win_start) >= 60 {
+                self.pending_peak = 0;
+                self.pending_win_start = self.frames;
+            }
+            self.pending_peak = self.pending_peak.max(fr.pending());
+            if self.frames % 30 == 0 {
+                self.want_query = true;
+            }
+        }
         // 目标策略：最小驻留 30 帧；被瞄且待进垃圾 ≥3 时紧急豁免；首次评估立即执行
         let urgent = !fr.targeted_by.is_empty() && fr.pending() >= 3;
         let sent_changed = self.profile.name == "master" && fr.sent != self.last_sent;
@@ -1638,11 +1771,130 @@ impl Brain {
         self.exec(fr, a, &g)
     }
 
+    /// 记录服务器返回的对手盘面（type=boards）
+    pub fn update_boards(&mut self, v: &serde_json::Value) {
+        let Some(rows) = v["rows"].as_array() else { return };
+        self.boards.clear();
+        for pair in rows {
+            let Some(seat) = pair[0].as_u64() else { continue };
+            let Some(list) = pair[1].as_array() else { continue };
+            let board: Vec<String> = list
+                .iter()
+                .filter_map(|r| r.as_str().map(|s| s.to_string()))
+                .collect();
+            self.boards.insert(seat as usize, board);
+        }
+    }
+
+    /// 是否该向服务器发一次盘面查询
+    pub fn take_query_flag(&mut self) -> bool {
+        std::mem::take(&mut self.want_query)
+    }
+
+    /// GM 目标评分：徽章权重（半场二次衰减到 0）+ 危险度；反击单独比较
+    fn gm_pick(&mut self, fr: &FrameIn) -> Option<Ev> {
+        // 每 30 tick 重算一次；期间沿用缓存，避免每帧遍历全部对手盘面
+        if self.gm_cached.is_some() && self.frames.saturating_sub(self.gm_calc_tick) < 30 {
+            return self.gm_cached;
+        }
+        let own = fr.badge_units as f64;
+        let max_b = fr
+            .alive
+            .iter()
+            .filter(|&&p| p != fr.seat)
+            .map(|&p| fr.badges_all.get(p).copied().unwrap_or(0))
+            .max()
+            .unwrap_or(0) as f64;
+        let base = if max_b > 0.0 {
+            ((max_b - own).max(0.0) / max_b) * 100.0
+        } else {
+            0.0
+        };
+        // K = 1 - x²，x = 已过时间 / 半场：开场几乎不衰减，接近半场迅速归零
+        let total = self.match_total.max(1) as f64;
+        let elapsed = (total - fr.time_secs_left as f64).max(0.0);
+        let x = (2.0 * elapsed / total).min(1.0);
+        let badge_w = base * (1.0 - x * x);
+
+        // 反击价值：4 × 徽章倍率 × 被瞄加成 − 60 tick 内最高待进
+        let mult = 1.0 + 0.25 * badge_tier_of(fr.badge_units) as f64;
+        let bonus = [0.0, 0.0, 1.0, 3.0, 5.0, 7.0, 9.0][fr.targeted_by.len().min(6)];
+        let counter = (4.0 * mult * bonus - self.pending_peak as f64) * 25.0;
+
+        let mut best: Option<(f64, usize)> = None;
+        for &p in fr.alive.iter().filter(|&&p| p != fr.seat) {
+            let danger = match self.boards.get(&p) {
+                Some(rows) => board_danger(rows),
+                None => (fr.max_stack as f64 - 10.0) * 10.0,
+            };
+            let score = badge_w + danger;
+            if best.map_or(true, |(bs, _)| score > bs) {
+                best = Some((score, p));
+            }
+        }
+        let dbg = std::env::var("T99_BOT_TARGET").is_ok();
+        let pick = if !fr.targeted_by.is_empty()
+            && counter > 0.0
+            && best.map_or(true, |(bs, _)| counter > bs)
+        {
+            if dbg {
+                eprintln!(
+                    "[gm] f{} boards={} badge_w={:.1} counter={:.1} → attackers",
+                    fr.n, self.boards.len(), badge_w, counter
+                );
+            }
+            Some(Ev::TargetAttackers)
+        } else {
+            if dbg {
+                eprintln!(
+                    "[gm] f{} boards={} badge_w={:.1} counter={:.1} best={:?}",
+                    fr.n, self.boards.len(), badge_w, counter, best
+                );
+            }
+            best.map(|(_, p)| Ev::TargetPlayer(p as u16))
+        };
+        self.gm_calc_tick = self.frames;
+        self.gm_cached = pick;
+        pick
+    }
+
     fn target_mode(&mut self, fr: &FrameIn) -> Option<Ev> {
         // master：按奖励函数权重，每次成功送出后重抽目标模式。
         if self.profile.name == "master" {
             if self.rng == 0 {
                 self.rng = 0x9E37_79B9_7F4A_7C15 ^ (fr.seat as u64 + 1);
+            }
+            // 连续 5 次消行都没有造成伤害 → 随机换一次目标。
+            // 高徽章目标会把火力吸住，双方互相抵消时容易出现“打太极”式的僵持。
+            if fr.lines > self.last_lines {
+                if fr.sent == self.last_sent {
+                    self.dry_clears += 1;
+                } else {
+                    self.dry_clears = 0;
+                }
+            }
+            self.last_lines = fr.lines;
+            // 反攻模式本身就是“被打之后的反制”，不参与这条强制切换
+            if self.dry_clears >= 5 && self.weighted_mode != Some(Ev::TargetAttackers) {
+                self.dry_clears = 0;
+                self.last_sent = fr.sent;
+                let choices = [
+                    Ev::TargetRandom,
+                    Ev::TargetBadges,
+                    Ev::TargetKos,
+                    Ev::TargetAttackers,
+                ];
+                self.rng = self
+                    .rng
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let mut idx = ((self.rng >> 33) % 4) as usize;
+                if Some(choices[idx]) == self.weighted_mode {
+                    idx = (idx + 1) % 4;
+                }
+                let pick = choices[idx];
+                self.weighted_mode = Some(pick);
+                return Some(pick);
             }
             if fr.sent != self.last_sent || self.weighted_mode.is_none() {
                 self.last_sent = fr.sent;
@@ -1650,52 +1902,8 @@ impl Brain {
             }
             return self.weighted_mode;
         }
-        // GM：被 6 人以上瞄准时无论待进多少，优先全线反击。
-        if fr.targeted_by.len() >= 6 {
-            return Some(Ev::TargetAttackers);
-        }
-        let dbg = std::env::var("T99_BOT_TARGET").is_ok();
-        let trace = |m: &str| if dbg { eprintln!("[target:{} f{}] {}", self.profile.name, fr.n, m); };
-        // 攻防策略（徽章转移感知）：
-        // 被瞄 → 集中反打徽章最肥的瞄准者（击杀吞其全部徽章，双倍收益）；
-        // 无人瞄 → 场上徽章领先者 ≥ harvest_badges 即围猎（TargetBadges，制造转移链）；
-        // 否则抢人头。平摊式 TargetAttackers 会让火力全被抵消，谁也打不死谁。
-        let p = &self.profile;
-        let leader = fr
-            .badges_all
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != fr.seat)
-            .max_by_key(|&(_, &b)| b);
-        // GM（「可以不活，其余参赛者必须死」）：围猎永远优先于反攻；
-        // Master：仅当真正受威胁（待进垃圾 ≥3 行）才反攻，否则坚持围猎/进攻。
-        let counter_first = if p.name == "gm" || p.name.starts_with("berserk") { false } else { fr.pending() >= 3 };
-        if counter_first && !fr.targeted_by.is_empty() {
-            // 待进已满的瞄准者收不下攻击，优先反打仍有余量者；全员饱和才退回原逻辑
-            let roomy: Vec<usize> = fr
-                .targeted_by
-                .iter()
-                .copied()
-                .filter(|&p| fr.has_garbage_room(p))
-                .collect();
-            let pool: &[usize] = if roomy.is_empty() { &fr.targeted_by } else { &roomy };
-            let fattest = pool
-                .iter()
-                .copied()
-                .max_by_key(|&p| fr.badges_all.get(p).copied().unwrap_or(0))
-                .unwrap_or(0);
-            trace(&format!("被瞄{} 待进{} → 反打 pid{} (徽章{})", fr.targeted_by.len(), fr.pending(), fattest, fr.badges_all.get(fattest).copied().unwrap_or(0)));
-            return Some(Ev::TargetPlayer(fattest as u16));
-        }
-        if let Some((lp, &b)) = leader {
-            if b >= p.harvest_badges {
-                trace(&format!("围猎领先者 pid{} (徽章{}) 被瞄{}", lp, b, fr.targeted_by.len()));
-                return Some(Ev::TargetBadges);
-            }
-        }
-        // 兜底：TargetKos——引擎会集火堆最高（最接近死亡）者，pack 击杀产生首枚徽章，
-        // 徽章经济启动后由围猎接管（「永远反攻」只会让火力被抵消，谁也拿不到击杀）。
-        Some(Ev::TargetKos)
+        // GM：按「徽章权重（半场衰减）+ 危险度 + 反击价值」逐人评分，选单目标或直接反击
+        self.gm_pick(fr)
     }
 
     fn grid(&self, fr: &FrameIn) -> Grid {
@@ -1870,6 +2078,10 @@ pub fn run_ws(profile: Profile, url: &str, id: &str, key: &str) {
             Ok(Message::Text(t)) => {
                 let line = t.to_string();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                if v["type"].as_str() == Some("boards") {
+                    brain.update_boards(&v);
+                    continue;
+                }
                 match v["type"].as_str().unwrap_or("") {
                     "hello" if v.get("frame_hz").is_some() => {
                         let proto = v["protocol"].as_u64().unwrap_or(0) as u32;
@@ -1890,6 +2102,11 @@ pub fn run_ws(profile: Profile, url: &str, id: &str, key: &str) {
                     "frame" => {
                         let Ok(fr) = serde_json::from_str::<FrameIn>(&line) else { continue };
                         let act = brain.decide(&fr);
+                        if brain.take_query_flag() {
+                            let _ = ws.send(Message::Text(
+                                r#"{"type":"query","what":"boards"}"#.into(),
+                            ));
+                        }
                         let mut evs = act.evs;
                         if brain.soft_held && !act.soft_hold && !evs.iter().any(|(_, e)| *e == Ev::SoftUp) {
                             evs.insert(0, (0, Ev::SoftUp));
@@ -1938,6 +2155,10 @@ pub fn run(profile: Profile) {
             break; // 管道关闭
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if v["type"].as_str() == Some("boards") {
+            brain.update_boards(&v);
+            continue;
+        }
         match v["type"].as_str().unwrap_or("") {
             "hello" => {
                 if let Ok(h) = serde_json::from_str::<HelloIn>(&line) {
@@ -1952,6 +2173,10 @@ pub fn run(profile: Profile) {
             "frame" => {
                 let Ok(fr) = serde_json::from_str::<FrameIn>(&line) else { continue };
                 let act = brain.decide(&fr);
+                if brain.take_query_flag() {
+                    let _ = writeln!(out, "{}", r#"{"type":"query","what":"boards"}"#);
+                    let _ = out.flush();
+                }
                 // 软降状态切换维护：上一帧按住、本帧不再按住 → 补 SoftUp
                 let mut evs = act.evs;
                 if brain.soft_held && !act.soft_hold && !evs.iter().any(|(_, e)| *e == Ev::SoftUp) {

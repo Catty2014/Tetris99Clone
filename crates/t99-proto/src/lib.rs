@@ -166,7 +166,7 @@ pub struct DasMsg {
     pub arr_ms: i64,
 }
 
-fn board_rows(s: &Snapshot) -> Vec<String> {
+pub fn board_rows(s: &Snapshot) -> Vec<String> {
     s.board
         .iter()
         .map(|row| {
@@ -445,6 +445,12 @@ pub trait PlayerAdapter {
     fn consecutive_misses(&self) -> u32;
     fn is_dead(&self) -> bool;
     fn finish(&mut self, result: &ResultMsg);
+    /// 非阻塞取出程序发来的查询（如 `opponents`）；默认无。
+    fn take_query(&mut self) -> Option<String> {
+        None
+    }
+    /// 向程序发送一条额外消息（查询响应等）；默认忽略。
+    fn send_json(&mut self, _msg: &str) {}
 }
 
 /// 子进程参与方：stdin/stdout 单行 JSON。
@@ -459,6 +465,8 @@ pub struct SubprocessAdapter {
     last_n: u64,
     /// 上一帧快照尚未回包：固定 60Hz 下不再重复投递，避免管道堆积后 write 阻塞整个服务器
     in_flight: bool,
+    /// 程序发来的查询（type=query），由服务器每帧取走并回包
+    queries: std::collections::VecDeque<String>,
 }
 
 impl SubprocessAdapter {
@@ -473,6 +481,7 @@ impl SubprocessAdapter {
             dead: false,
             last_n: 0,
             in_flight: false,
+            queries: Default::default(),
         }
     }
 
@@ -670,6 +679,15 @@ impl PlayerAdapter for SubprocessAdapter {
                 self.misses += 1;
                 return Some(vec![]);
             }
+            // 程序可以在任意帧插入查询（type=query）；不占用帧回包
+            if line.contains("query") {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+                    if v["type"].as_str() == Some("query") {
+                        self.queries.push_back(v["what"].as_str().unwrap_or("").to_string());
+                        continue;
+                    }
+                }
+            }
             match serde_json::from_str::<InputMsg>(&line) {
                 Ok(m) if m.n == self.last_n => match m.to_timed() {
                     Some(events) => {
@@ -702,6 +720,14 @@ impl PlayerAdapter for SubprocessAdapter {
 
     fn consecutive_misses(&self) -> u32 {
         self.misses
+    }
+
+    fn take_query(&mut self) -> Option<String> {
+        self.queries.pop_front()
+    }
+
+    fn send_json(&mut self, msg: &str) {
+        let _ = self.send(msg);
     }
 
     fn is_dead(&self) -> bool {

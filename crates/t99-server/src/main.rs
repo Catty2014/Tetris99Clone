@@ -18,7 +18,7 @@ use tungstenite::Message;
 use t99_bots::BotAdapter;
 use t99_core::engine::TargetPolicy;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, RULESET_ID};
-use t99_proto::{hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
+use t99_proto::{board_rows, hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
 
 /// 逻辑帧墙钟周期由 ruleset.tick_hz 决定；引擎时基本身是 frame_ticks，这里只负责节流。
 /// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
@@ -563,9 +563,15 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         // 外部程序握手：ready 超时/拒绝 → 直接判负（与正式 Arena 语义一致）
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
-                if let Err(e) = b.setup(&hello_for(pid, &seat_ids[pid], players, 6)) {
-                    eprintln!("[seat {pid}] {} setup 失败: {e:?}", b.name());
-                    engine.kill(pid, "setup_failed");
+                match b.setup(&hello_for(pid, &seat_ids[pid], players, 6)) {
+                    Err(e) => {
+                        eprintln!("[seat {pid}] {} setup 失败: {e:?}", b.name());
+                        engine.kill(pid, "setup_failed");
+                    }
+                    Ok(()) => {
+                        // 席位 ↔ 程序 的对照：外部程序用 label，内建档用档位名
+                        eprintln!("[seat {pid}] {} ready player_id={}", b.name(), seat_ids[pid]);
+                    }
                 }
             }
         }
@@ -575,6 +581,8 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let mut last_dup = vec![0u32; players];
         let mut dup_acc = vec![0u32; players];
         let mut last_warn: Vec<Option<Instant>> = vec![None; players];
+        // 拉取式盘面查询的限频（tick 号）
+        let mut last_boards = vec![0u64; players];
         // ARRCheck 告警
         let mut last_arr = vec![0u32; players];
         let mut arr_acc = vec![0u32; players];
@@ -726,6 +734,36 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 if let Some(b) = bots[pid].as_mut() {
                     if b.is_dead() || b.consecutive_misses() > MAX_CONSECUTIVE_MISS {
                         engine.kill(pid, "program_dead");
+                    }
+                }
+            }
+            // 拉取式查询：程序可请求全部存活对手的盘面；每席限频 15 tick
+            for pid in 0..players {
+                let mut queries: Vec<String> = Vec::new();
+                if let Some(b) = bots[pid].as_mut() {
+                    while let Some(q) = b.take_query() {
+                        queries.push(q);
+                    }
+                }
+                for what in queries {
+                    if what != "boards" || engine.frame_n < last_boards[pid] + 15 {
+                        continue;
+                    }
+                    last_boards[pid] = engine.frame_n;
+                    let mut rows = Vec::new();
+                    for op in 0..players {
+                        if !engine.players[op].alive {
+                            continue;
+                        }
+                        let snap = engine.snapshot(op);
+                        rows.push(serde_json::json!([op, board_rows(&snap)]));
+                    }
+                    let msg = serde_json::json!({
+                        "type": "boards", "n": engine.frame_n, "rows": rows,
+                    })
+                    .to_string();
+                    if let Some(b) = bots[pid].as_mut() {
+                        b.send_json(&msg);
                     }
                 }
             }
