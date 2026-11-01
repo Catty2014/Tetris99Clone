@@ -8,6 +8,8 @@ MUSL      := x86_64-unknown-linux-musl
 MUSL_BIN  := target/$(MUSL)/release
 HOST_BIN  := target/release
 DIST      := dist
+# 题目目录（AX1）：make dist 时自动把分发模块部署进去，并同步公开 bot 源码
+AX1_DIR   ?= ../Problem/AX1
 
 # 分发二进制（musl）
 DIST_BINS := t99-server t99-headless t99-bot-basic t99-bot-advanced
@@ -52,7 +54,7 @@ dist: musl-build
 	  '    "crates/t99-core",' '    "crates/t99-proto",' '    "crates/t99-config",' \
 	  '    "crates/t99-bots",' '    "crates/t99-headless",' '    "crates/t99-server",' \
 	  '    "crates/t99-bot-ext",' ']' '' \
-	  '[workspace.package]' 'version = "0.1.0"' 'edition = "2021"' 'license = "MIT"' '' \
+	  '[workspace.package]' 'version = "0.1.0"' 'edition = "2021"' 'license = "MIT-0"' '' \
 	  '[profile.release]' 'debug = 1' '' \
 	  '[profile.release.package."*"]' 'debug = false' > $(DIST)/src/Cargo.toml
 	for c in $(SRC_CRATES); do cp -r crates/$$c $(DIST)/src/crates/; done
@@ -73,6 +75,15 @@ dist: musl-build
 	CARGO_TARGET_DIR=$(DIST)/.buildcheck cargo test --manifest-path $(DIST)/src/Cargo.toml
 	rm -rf $(DIST)/.buildcheck
 	@echo "[dist] 完成：$$(du -sh $(DIST) | cut -f1)，源码自洽构建通过"
+	# 部署到题目目录：分发模块 + 同步公开 bot 源码（与 crate 原文逐字一致）
+	@if [ -d "$(AX1_DIR)" ]; then \
+	    rm -rf "$(AX1_DIR)/dist"; \
+	    cp -r $(DIST) "$(AX1_DIR)/dist"; \
+	    cp crates/t99-bots/src/basic.rs crates/t99-bots/src/advanced.rs "$(AX1_DIR)/"; \
+	    echo "[dist] 已部署到题目目录 $(AX1_DIR)（dist/ + basic.rs + advanced.rs）"; \
+	else \
+	    echo "[dist] 未找到题目目录 $(AX1_DIR)，跳过部署"; \
+	fi
 
 clean:
 	rm -rf $(DIST) target/$(MUSL)
