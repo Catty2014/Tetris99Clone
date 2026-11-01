@@ -4,7 +4,7 @@
 //! - `null.rs`     NullBot    什么都不做（地板校准）
 //! - `basic.rs`    BasicBot   单块贪心（4 特征），静态随机目标，不用 Hold/预览
 //! - `advanced.rs` AdvancedBot Dellacherie 6 特征 + Hold + next[0]，加权目标策略，危险转平堆
-//! - `expert.rs`   ExpertBot  2 深度束搜索 + Hold 分支 + 加权目标策略
+//! - `expert.rs`   ExpertBot  internal 专有档（能力描述与实现见 expert.rs，不随公开文档展开）
 //!
 //! `expert.rs` 挂 feature `expert`（默认启用）。分发源码剔除该文件并关闭
 //! feature 后，本 crate 仍可独立构建与对局（expert 档位以闭源形式内建在
