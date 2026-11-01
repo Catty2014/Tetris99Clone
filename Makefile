@@ -40,6 +40,7 @@ dist: musl-build
 	# 配置
 	cp ruleset.toml server.toml client.toml $(DIST)/
 	cp dist-README.md $(DIST)/README.md
+	cp LICENSE $(DIST)/
 	cp examples/pybot.py $(DIST)/examples/
 	cp utils/time.py $(DIST)/utils/
 	# 源码：dist workspace 根（members 剔除 t99-client / t99-bot-m）
