@@ -13,7 +13,7 @@ use t99_bots::Bot;
 use t99_proto::{snapshot_from_frame, FrameMsg};
 use t99_core::TimedKey;
 
-/// 与 t99-bot-m 相同的容忍区间：读取方对可选字段用 serde default。
+/// 容忍区间与全部 t99 外部程序一致：读取方对可选字段用 serde default。
 pub const PROTOCOL_MIN: u32 = 5;
 pub const PROTOCOL_MAX: u32 = 8;
 
