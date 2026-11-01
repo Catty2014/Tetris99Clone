@@ -28,7 +28,7 @@
 
 # 单局服务器：3 个陪练 + 1 个席位留给你的提交程序（--lobby 会等它接入）
 ./bin/t99-server --port 8138 --key t99 --players 4 --lobby \
-    --bots "ext:basic=./bin/t99-bot-basic,advanced"
+    --bots "ext:basic=./bin/t99-bot-basic,advanced,basic"
 
 # 你的程序以 WebSocket 玩家接入（占最后一个席位；接入后立即开局）
 ./bin/t99-bot-advanced --connect ws://127.0.0.1:8138 --id my-submit --key t99

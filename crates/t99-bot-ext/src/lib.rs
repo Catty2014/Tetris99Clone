@@ -39,6 +39,39 @@ const HELP: &str = r#"t99-bot-basic / t99-bot-advanced — 公开档外部程序
   - 协议 v8；可选字段缺席按默认处理（容忍 5..=8）。
 "#;
 
+const HELP_EN: &str = r#"t99-bot-basic / t99-bot-advanced — public-tier external programs (reference implementation / modifiable sparring partner)
+
+Two ways to connect (no arguments = subprocess stdio mode):
+
+1. Subprocess mode (spawned by t99-server / t99-headless via ext:label=path)
+     stdin/stdout single-line JSON: hello → ready → (frame → input)* → result
+     Example (server-side seat spec):
+       t99-headless run --players 2 --bots "ext:basic=./t99-bot-basic,basic"
+
+2. WebSocket player mode (connect to a lobby server yourself; same channel as submissions)
+     --connect URL   server address, e.g. ws://127.0.0.1:8138 (/ws path appended automatically)
+     --id ID         PlayerID (must pass the server's identity check)
+     --key KEY       room admission key
+     Example:
+       t99-bot-basic --connect ws://127.0.0.1:8138 --id my-bot --key t99
+
+Notes:
+  - The decision core is the same code as the in-process bots (t99-bots); modify freely.
+  - Frame response budget 16.666ms (enforced at 16ms); 600 consecutive unanswered frames → loss.
+  - Protocol v8; absent optional fields fall back to defaults (tolerates 5..=8).
+"#;
+
+fn lang_is_zh() -> bool {
+    for k in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(v) = std::env::var(k) {
+            if v.starts_with("zh") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn main_entry(make: fn() -> Box<dyn Bot>) {
     let args: Vec<String> = std::env::args().collect();
     let get = |name: &str| -> Option<String> {
@@ -51,7 +84,7 @@ pub fn main_entry(make: fn() -> Box<dyn Bot>) {
         None
     };
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("{HELP}");
+        println!("{}", if lang_is_zh() { HELP } else { HELP_EN });
         std::process::exit(0);
     }
     if let (Some(url), Some(id), Some(key)) = (get("--connect"), get("--id"), get("--key")) {

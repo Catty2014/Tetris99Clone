@@ -15,7 +15,11 @@ struct Seat {
 }
 
 fn usage() {
-    let u = r#"t99-headless — 无头对局主机（确定性引擎直连；离线评测/自测用）
+    let u = if lang_is_zh() { HELP_ZH } else { HELP_EN };
+    println!("{u}");
+}
+
+const HELP_ZH: &str = r#"t99-headless — 无头对局主机（确定性引擎直连；离线评测/自测用）
 
 用法: t99-headless <命令> [参数]
 
@@ -51,8 +55,55 @@ calibrate 参数:
   t99-headless replay --transcript /tmp/m.jsonl
   t99-headless calibrate --tiers null,basic,advanced --games 12
 "#;
-    println!("{u}");
+
+const HELP_EN: &str = r#"t99-headless — headless match host (deterministic engine, direct connection; offline eval/self-test)
+
+Usage: t99-headless <command> [options]
+
+Commands:
+  run         play one match
+  replay      bit-exact replay of a transcript and state-hash verification
+  calibrate   tier calibration matrix (round robin; verifies strict tier ordering)
+
+run options:
+  --players N          total number of seats (default 2; missing seats filled with basic)
+  --bots LIST          comma-separated seat list. Each item is a built-in tier
+                       (null|basic|advanced|expert) or an external program
+                       ext:label=path (executable; same channel as submissions,
+                       single-line JSON over stdin/stdout, see protocol.md)
+  --candidate 'CMD'    shorthand for one external seat: run command CMD as a subprocess seat
+  --seed S             match seed (default 42; same seed + same events replay bit-for-bit)
+  --max-frames F       frame cap (default 54000 = 15 min @60Hz; returns early if the match ends)
+  --transcript PATH    per-frame event log output path (for replay verification and diagnosis)
+  --realtime           advance at wall-clock 60Hz (default: engine direct, as fast as possible)
+
+replay options:
+  --transcript PATH    (required) per-frame log written by run
+
+calibrate options:
+  --tiers LIST         built-in tiers to calibrate (default null,basic,advanced,expert)
+  --games G            games per pair (default 12; seats alternate between pairs)
+  --seed S             starting seed (incremented per game)
+
+Examples:
+  t99-headless run --players 4 --bots basic,advanced,expert,advanced --seed 31415
+  t99-headless run --players 2 --bots basic,ext:basic=./t99-bot-basic --seed 7
+  t99-headless run --players 2 --bots basic --candidate "python3 pybot.py"
+  t99-headless replay --transcript /tmp/m.jsonl
+  t99-headless calibrate --tiers null,basic,advanced --games 12
+"#;
+
+fn lang_is_zh() -> bool {
+    for k in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(v) = std::env::var(k) {
+            if v.starts_with("zh") {
+                return true;
+            }
+        }
+    }
+    false
 }
+
 
 fn arg_val(args: &[String], name: &str) -> Option<String> {
     let mut it = args.iter();

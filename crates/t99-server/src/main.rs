@@ -61,7 +61,11 @@ struct Args {
 }
 
 fn print_help() {
-    let u = r#"t99-server — 单局权威服务器（stdio 子进程 + WebSocket 玩家/观战，事件流广播）
+    let u = if lang_is_zh() { HELP_ZH } else { HELP_EN };
+    println!("{u}");
+}
+
+const HELP_ZH: &str = r#"t99-server — 单局权威服务器（stdio 子进程 + WebSocket 玩家/观战，事件流广播）
 
 用法: t99-server [参数]
 服务器只服务一局；对局结束后驻留现场（保持连接与历史回填），新对局需重启服务器。
@@ -103,8 +107,65 @@ fn print_help() {
       --bots "ext:basic=./t99-bot-basic,advanced,expert"
   t99-server --port 8138 --players 99 --seed 24680 --bots basic,advanced,...   # 纯 Bot 大乱斗
 "#;
-    println!("{u}");
+
+const HELP_EN: &str = r#"t99-server — single-match authoritative server (stdio subprocess + WebSocket players/spectators, event-stream broadcast)
+
+Usage: t99-server [options]
+The server serves exactly one match; after the match it stays resident (keeps connections and
+history backfill). A new match requires restarting the server.
+The ruleset is read from ruleset.toml (read-only; its id must equal the RULESET_ID compiled
+into this binary, otherwise startup is refused).
+
+Access:
+  player     ws://<address>:<port>/ws?id=<player_id>&key=<key> (lobby waits until seats fill)
+  spectator  same URL, declare role=observer in the handshake; needs the key only
+  subprocess --bots with ext:label=path; the server spawns it, single-line JSON on stdin/stdout
+
+Options:
+  --address ADDR      listen address (default 127.0.0.1; use 0.0.0.0 to expose)
+  --port N            listen port (default 6666)
+  --key K             room admission key (default "t99"; a room gate, not a secret)
+  --players N         total seats (default 99; including bot seats)
+  --bots LIST         comma-separated non-network seats: built-in tiers
+                      (null|basic|advanced|expert) or ext:label=path.
+                      players - bots = network seats (lobby waits for them);
+                      in non-lobby matches they sit empty
+  --lobby / --no-lobby   lobby mode: wait for network seats to fill before starting
+                      (--lobby-timeout as fallback). Joining after start has no effect.
+                      Default follows server.toml match.lobby
+  --ids LIST          comma-separated PlayerID allowlist (glob); default accepts any
+                      non-empty ID; in lobby without --ids, server.toml auth.id_files is read
+  --seed S            match seed (0 = random, printed at startup; default 0)
+  --time-limit-secs S match countdown (0 = auto by player count: 4p=5min → 99p=15min; default 0)
+  --max-frames F      hard frame cap (default follows the time budget)
+  --stall-accel 1|0   after 60s of zero kills, burn the countdown faster (exhibition/self-test
+                      mechanism; disabled in official evaluation)
+  --loglevel L        ERROR/WARN/INFO/DEBUG/TRACE (default INFO)
+  --debug             debug output
+  --config PATH       path to server.toml (default ./server.toml; precedence CLI > env > file)
+  --force-target P    force one target policy for all seats (reference matches):
+                      random|kos|badges|spread|huntweak|avoidattackers|spreadsafe|
+                      spreadweak|randomtop|attackers
+  --force-random-target  same as --force-target random
+  --dump-matrix       print per-pair sent/cancel matrix to stderr at settlement
+
+Examples:
+  t99-server --port 8138 --key t99 --players 4 --lobby \
+      --bots "ext:basic=./t99-bot-basic,advanced,expert"
+  t99-server --port 8138 --players 99 --seed 24680 --bots basic,advanced,...   # all-bot melee
+"#;
+
+fn lang_is_zh() -> bool {
+    for k in ["LC_ALL", "LC_MESSAGES", "LANG"] {
+        if let Ok(v) = std::env::var(k) {
+            if v.starts_with("zh") {
+                return true;
+            }
+        }
+    }
+    false
 }
+
 
 fn parse_args() -> Args {
     let args: Vec<String> = std::env::args().collect();
