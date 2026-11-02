@@ -3,5 +3,5 @@ crates/*/target
 crates/t99-client/web/
 nohup.out
 *.log
-lab/*/target/
+lab
 dist/
