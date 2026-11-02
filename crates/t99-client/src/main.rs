@@ -1978,13 +1978,14 @@ fn sync(
         }
     });
     // 垃圾条单列：红在下（即将进场，T99 红闪：以黄转红的相同间隔闪烁）、黄其上（计时中）、灰顶层（排队）
-    let red_on = session
-        .with_engine(|e, _| {
-            let stage_ms = e.cfg.ruleset.garbage_stage(e.phase_idx) / TMS;
-            let cycle = (2 * stage_ms).max(1);
-            (s.n as i64 * 16666 / 1000) % cycle < stage_ms
-        })
-        .unwrap_or(true);
+    // 红闪固定 5Hz（100ms 亮 / 100ms 灭）。红态本身只持续 0.x~2s，
+    // 旧实现用 2×garbage_stage 当周期，实测只有 1~2Hz，几乎看不出在闪。
+    const RED_FLASH_HALF_MS: i64 = 100;
+    let tick_ms = session
+        .with_engine(|e, _| (1000.0 / e.cfg.ruleset.tick_hz.max(1) as f64).round() as i64)
+        .unwrap_or(17)
+        .max(1);
+    let red_on = (s.n as i64 * tick_ms) % (2 * RED_FLASH_HALF_MS) < RED_FLASH_HALF_MS;
     // 垃圾条按批次分组摆位：同一 sender 的连续条目相邻（普通行距），
     // 不同批之间的空档 = 3 倍行距；队首（红，即将进场）贴棋盘在下，灰(排队)在顶。
     // 批次总高超出列框时整体等比压缩行距（方块随之缩小），全部保持可见。
