@@ -44,6 +44,50 @@ cat > crates/t99-client/web/index.html <<'HTML'
 </style>
 </head>
 <body>
+<script>
+(function () {
+  // 后备缓冲上限：wgpu 配置 surface 时若 width/height 超过 GL 的 MAX_TEXTURE_SIZE 会 panic，
+  // 画面全黑。Firefox 开 privacy.resistFingerprinting 后会改写 devicePixelRatio 与视口尺寸，
+  // 高 dpr + 小显存/软件渲染（上限 2048）就会命中。这里按下限压低 dpr，保证物理像素不越界。
+  var cap = 4096;
+  try {
+    var probe = document.createElement('canvas');
+    var gl = probe.getContext('webgl2') || probe.getContext('webgl');
+    if (gl) cap = gl.getParameter(gl.MAX_TEXTURE_SIZE) || cap;
+  } catch (e) {}
+  var realDpr = window.devicePixelRatio || 1;
+  function cappedDpr() {
+    var w = window.innerWidth || 1;
+    var h = window.innerHeight || 1;
+    var lim = Math.min(cap / w, cap / h);
+    return Math.max(0.1, Math.min(realDpr, Math.floor(lim * 100) / 100));
+  }
+  try {
+    Object.defineProperty(window, 'devicePixelRatio', {
+      configurable: true,
+      get: cappedDpr,
+    });
+  } catch (e) {
+    try { window.devicePixelRatio = cappedDpr(); } catch (e2) {}
+  }
+  // wasm 里的 panic 走的是回调，init().catch 抓不到；这里兜一层可见的错误提示。
+  function showError(err) {
+    if (document.getElementById('t99-err')) return;
+    var pre = document.createElement('pre');
+    pre.id = 't99-err';
+    pre.style.cssText =
+      'color:#f66;padding:16px;white-space:pre-wrap;font:12px/1.4 monospace;max-height:100%;overflow:auto';
+    pre.textContent = String(err);
+    document.body.appendChild(pre);
+  }
+  window.addEventListener('error', function (e) {
+    showError(e.message || e.error || 'unknown error');
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    showError(e.reason || 'unhandled rejection');
+  });
+})();
+</script>
 <script type="module">
   import init from './t99-client.js';
   // ?config=<url> / ?ruleset=<url>：在启动前把配置取回并交给 Rust（避免在 wasm 里做异步 IO）
