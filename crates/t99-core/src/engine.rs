@@ -1578,8 +1578,9 @@ impl Match {
                     GarbState::Red(t) => {
                         let nt = *t - dt;
                         p.pending[0].state = GarbState::Red(nt.max(0));
-                        // 连击进行中（combo >= 0）阻挡进场
-                        nt <= 0 && p.combo < 0
+                        // 连击阻挡：只有 combo > 0（真正的连击段）才挡进场。
+                        // combo == 0 只是单次消行，T99 里不算连击，也不显示连击。
+                        nt <= 0 && p.combo <= 0
                     }
                 }
             };
@@ -2466,6 +2467,43 @@ mod tests {
             TimedKey { t_us: 100, key: Key::RotCw },
         ]]);
         assert_eq!(m.players[0].dup_dropped, before + 1);
+    }
+
+    #[test]
+    fn garbage_enters_when_combo_is_zero() {
+        // combo == 0 只是一次消行，不构成 T99 连击，不能挡垃圾进场。
+        let mut m = solo();
+        m.players[0].combo = 0;
+        m.players[0].pending.push(Garb {
+            rows: 1,
+            sender: 0,
+            state: GarbState::Red(1),
+        });
+        let before = m.players[0].inserted;
+        m.frame(&[vec![]]);
+        assert_eq!(
+            m.players[0].inserted,
+            before + 1,
+            "combo==0 时垃圾应当进场"
+        );
+    }
+
+    #[test]
+    fn garbage_blocked_during_combo() {
+        let mut m = solo();
+        m.players[0].combo = 1;
+        m.players[0].pending.push(Garb {
+            rows: 1,
+            sender: 0,
+            state: GarbState::Red(1),
+        });
+        let before = m.players[0].inserted;
+        m.frame(&[vec![]]);
+        assert_eq!(
+            m.players[0].inserted,
+            before,
+            "连击进行中不应进场"
+        );
     }
 
     #[test]
