@@ -3,6 +3,13 @@
 use crate::*;
 use std::collections::VecDeque;
 
+/// 目标饱和时把攻击改投给有余量的玩家（系统策略，默认开启）。
+/// 用于对照实验时设 T99_NO_REDIRECT=1 关闭。
+fn redirect_full_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("T99_NO_REDIRECT").is_err())
+}
+
 /// 目标策略：离线评测用的强制锁敌行为，按策略而非 TargetMode 选择对手。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TargetPolicy {
@@ -1436,8 +1443,7 @@ impl Match {
         }
     }
 
-    fn resolve_receivers(&mut self, pid: usize, rows: u32) -> Vec<(usize, u32)> {
-        let mode = self.players[pid].target_mode;
+    fn resolve_receivers(&mut self, pid: usize, rows: u32) -> Vec<(usize, u32)> {        let mode = self.players[pid].target_mode;
         let others: Vec<usize> = self
             .players
             .iter()
@@ -1447,7 +1453,7 @@ impl Match {
         if others.is_empty() || rows == 0 {
             return vec![];
         }
-        let out = match mode {
+        let mut out = match mode {
             TargetMode::Attackers => {
                 let mut atk: Vec<usize> = others
                     .iter()
@@ -1545,6 +1551,31 @@ impl Match {
                 }
             }
         };
+        // 系统策略：目标待进已满时，把攻击改投给仍有余量的玩家，而不是直接丢弃。
+        // 对全部目标模式生效（含反击）；T99_NO_REDIRECT=1 可关闭做对照。
+        if redirect_full_enabled() {
+            let cap = self.cfg.ruleset.pending_cap_rows;
+            let pending_of = |m: &Self, t: usize| -> u32 {
+                m.players[t].pending.iter().map(|g| g.rows).sum()
+            };
+            if out.iter().any(|&(t, _)| pending_of(self, t) >= cap) {
+                let mut redirected = Vec::with_capacity(out.len());
+                for (t, rows) in out.drain(..) {
+                    if pending_of(self, t) < cap {
+                        redirected.push((t, rows));
+                        continue;
+                    }
+                    let best = (0..self.players.len())
+                        .filter(|&i| i != pid && self.players[i].alive && pending_of(self, i) < cap)
+                        .max_by_key(|&i| cap - pending_of(self, i));
+                    match best {
+                        Some(r) => redirected.push((r, rows)),
+                        None => redirected.push((t, rows)),
+                    }
+                }
+                out = redirected;
+            }
+        }
         if let Some(&(first, _)) = out.first() {
             self.players[pid].last_target = Some(first);
         }

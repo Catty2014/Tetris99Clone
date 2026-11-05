@@ -563,7 +563,23 @@ fn col_height(g: &Grid, c: usize) -> i64 {
 /// 非 I 块对井列的污染格数：井开放（相对其余最矮列有深度）且本块不消 4 行时，
 /// 凡落入井列即计污染（含架桥——桥面同样挡住 I 的入口）。danger 态关闭（保命优先允许填井）。
 fn well_pollution(p: &Profile, g: &Grid, kind: char, fin_rot: u8, fin_x: i32, danger: bool, cleared: u32) -> i64 {
-    if !p.well_mode || danger || kind == 'I' || cleared >= 4 {
+    if !p.well_mode || danger {
+        return 0;
+    }
+    let in_well = |c: i32| c >= p.well_col as i32 && c < (p.well_col + p.well_span) as i32;
+    if p.well_span > 1 {
+        // 4-wide：井区就是工作区，只有「填进井区却消不掉行」才算污染
+        if cleared > 0 {
+            return 0;
+        }
+        // 4-wide：井区是工作区，任何「填进井区却不消行」的落子都算污染，
+        // 不论井区当前高低（旧判断在开局 rim=0 时失效，导致方块直接填死井区）。
+        return cells(kind, fin_rot)
+            .iter()
+            .filter(|(dx, _)| in_well(fin_x + dx))
+            .count() as i64;
+    }
+    if kind == 'I' || cleared >= 4 {
         return 0;
     }
     let rim = (0..W).filter(|&c| c != p.well_col).map(|c| col_height(g, c)).min().unwrap_or(0);
@@ -600,6 +616,10 @@ fn sent_estimate(fr: &FrameIn, spin: u8, cleared: u32, allclear: bool) -> u32 {
 
 pub const COMBO_BONUS: [u32; 11] = [0, 1, 1, 2, 2, 3, 3, 4, 4, 4, 5];
 
+/// 终盘判定：剩余秒数低于该值视为终盘（900s 局的最后 25%）。
+/// 只影响连击偏好权重，不影响任何规则。
+pub const LATE_GAME_SECS: u32 = 225;
+
 // ———— 评估 ————
 
 #[derive(Clone, Copy, Debug)]
@@ -630,6 +650,8 @@ pub struct Weights {
     pub cavity_fill: f64,
     /// 非 I 块污染井列：每个入井格的罚（仅 well_mode 且非 danger）
     pub pollute: f64,
+    /// 连击偏好：被集火/终盘时，每次消行的额外收益（配合 LATE_GAME_SECS）
+    pub combo: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -646,6 +668,8 @@ pub struct Profile {
     pub harvest_badges: u32,
     /// I 柱偏好列（Tetris 井）
     pub well_col: usize,
+    /// 井宽（列）：1 = 单列 I 井；4 = 4-wide 连击区
+    pub well_span: usize,
     /// KO 钓鱼：被瞄准时维持攻势权重（消行=抵消+反打双赚），直到 feign_cap 行
     pub feign: bool,
     pub feign_cap: usize,
@@ -680,6 +704,7 @@ pub fn master_profile() -> Profile {
         danger_pending: 4,
         harvest_badges: 2,
         well_col: 9,
+        well_span: 1,
         feign: false,
         feign_cap: 21,
         well_mode: true,
@@ -703,6 +728,7 @@ pub fn master_profile() -> Profile {
             cavity_keep: 2.0,
             cavity_fill: 6.0,
             pollute: 10.0, // 每个入井格 -10（整块 -40 上下）
+            combo: 3.0,
         },
         w_danger: Weights {
             landing: -0.8,
@@ -723,6 +749,7 @@ pub fn master_profile() -> Profile {
             cavity_keep: 0.0,
             cavity_fill: 2.0,
             pollute: 0.0,
+            combo: 0.5,
         },
     }
 }
@@ -732,7 +759,26 @@ pub fn master_profile() -> Profile {
 /// 徽章 ≥1 即收割（无 b2b/combo 门槛）；保留 GM 强兜底（w_danger 原样）但触发更晚——
 /// 实际上未必能活，火力分摊依赖其他 GM/M。10 人实杀场送出 1.4-2× 于旧 GM。
 pub fn gm_profile() -> Profile {
-    berserk7()
+    // 实验档：T99_GM_4W=1 时改用 4-wide 连击区（左 4 列），
+    // 靠连击权重 + 井区保低工作；危险时照常回落到激进兜底权重。
+    if std::env::var("T99_GM_4W").is_ok() {
+        let mut p = berserk7();
+        p.name = "gm4w";
+        p.well_mode = true;
+        p.well_col = 0;
+        p.well_span = 4;
+        p.w.well_keep = 4.0;
+        p.w.combo = 8.0;
+        p.w.b2b_break = -2.0;
+        p.w.attack = 14.0;
+        p.w.agg = 0.10;
+        p.w.holes = 5.0;
+        p.w_danger.well_keep = 0.0;
+        p.w_danger.combo = 2.0;
+        p
+    } else {
+        berserk7()
+    }
 }
 
 /// Berserk 谱系公共骨架：GM 兜底不变（w_danger 原样保留），进攻档拉满。
@@ -749,6 +795,7 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
         danger_pending: 8,
         harvest_badges: 2,
         well_col: 9,
+        well_span: 1,
         feign: false,
         feign_cap: 21,
         well_mode: false,
@@ -772,6 +819,7 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
             cavity_keep: 3.0,
             cavity_fill: 8.0,
             pollute: 0.0,
+            combo: 6.0,
         },
         w_danger: Weights {
             landing: -0.8,
@@ -792,6 +840,7 @@ fn berserk(name: &'static str, attack: f64, danger_h: usize, danger_pending: u32
             cavity_keep: 0.0,
             cavity_fill: 2.0,
             pollute: 0.0,
+            combo: 1.0,
         },
     };
     p.name = name;
@@ -872,8 +921,8 @@ fn evaluate(
             }
         }
         heights[c] = ROWS as i64 - top;
-        if wcm && c == p.well_col {
-            continue; // 井列不参与 holes/col_t
+        if wcm && c >= p.well_col && c < p.well_col + p.well_span {
+            continue; // 井区不参与 holes/col_t
         }
         let mut seen = false;
         let mut depth = 0i64;
@@ -968,14 +1017,20 @@ fn evaluate(
     };
     let holes_excess = (holes - cav_holes).max(0);
     // I 井：偏好列比其余最矮列深多少（封顶 8）——Tetris 弹药
+    let in_well = |i: usize| i >= p.well_col && i < p.well_col + p.well_span;
     let rim = heights
         .iter()
         .enumerate()
-        .filter(|(i, _)| *i != p.well_col)
+        .filter(|(i, _)| !in_well(*i))
         .map(|(_, h)| *h)
         .min()
         .unwrap_or(0);
-    let well_depth = (rim - heights[p.well_col]).clamp(0, 8);
+    // 单列井看井列深度；4-wide 看井区最高列与 rim 的差（井区整体要低）
+    let well_h = (p.well_col..(p.well_col + p.well_span).min(W))
+        .map(|c| heights[c])
+        .max()
+        .unwrap_or(0);
+    let well_depth = (rim - well_h).clamp(0, 8);
 
     let mut sc = w.landing * landing
         + w.eroded * eroded as f64
@@ -1009,6 +1064,15 @@ fn evaluate(
         // 槽位价值 + 填槽惩罚（危险档 cavity_keep 为 0，只剩轻微填充罚）
         sc += w.cavity_keep * cav_n.min(12) as f64;
         sc -= w.cavity_fill * cav_fill as f64;
+    }
+    // 连击偏好：被集火或进入终盘（剩余 ≤25%）时，优先小消连锁——
+    // 消行既抵垃圾又能吃到 combo 加成，比堆大消更抗压。
+    let focused = !fr.targeted_by.is_empty();
+    let late = fr.time_secs_left > 0 && fr.time_secs_left <= LATE_GAME_SECS;
+    let combo_scale = (if focused { 1.0 } else { 0.0 }) + (if late { 2.0 } else { 0.0 });
+    if cleared > 0 && combo_scale > 0.0 && w.combo > 0.0 {
+        let chain = 1.0 + 0.5 * fr.combo.max(0).min(8) as f64;
+        sc += w.combo * combo_scale * chain;
     }
     // 生存红线：超高时额外压制堆高（钓鱼时红线抬到 feign_cap）
     if max_h as usize > redline_h {
@@ -1242,7 +1306,7 @@ pub fn choose_blocked(g: &Grid, fr: &FrameIn, p: &Profile, skip: &[(u8, i32)]) -
         let mut sorted = candidates(g, k0, fr, p, danger, redline);
         sorted.retain(|c| !skip.contains(&(c.fin_rot % 4, c.fin_x)));
         // 井等 I：井深 ≥4（一发 Tetris 就绪）且非危险态时，非 I 禁止进入井列（硬过滤，空则回退全量）
-        if p.well_mode && !danger && k0 != 'I' {
+        if p.well_mode && p.well_span == 1 && !danger && k0 != 'I' {
             let rim = (0..W).filter(|&c| c != p.well_col).map(|c| col_height(g, c)).min().unwrap_or(0);
             let well_depth = rim - col_height(g, p.well_col);
             if well_depth >= 4 {
@@ -1835,12 +1899,17 @@ impl Brain {
         let counter = (4.0 * mult * bonus - self.pending_peak as f64) * 25.0;
 
         let mut best: Option<(f64, usize)> = None;
+        let cap = fr.garbage_cap.max(1) as f64;
         for &p in fr.alive.iter().filter(|&&p| p != fr.seat) {
             let danger = match self.boards.get(&p) {
                 Some(rows) => board_danger(rows),
                 None => (fr.max_stack as f64 - 10.0) * 10.0,
             };
-            let score = badge_w + danger;
+            // 待进已满的目标收不下攻击：按填充率平方衰减其吸引力，
+            // 避免火力反复砸在将被上限吞掉的人身上。
+            let pend = fr.pending_all.get(p).copied().unwrap_or(0) as f64;
+            let fill = (pend / cap).clamp(0.0, 1.0);
+            let score = (badge_w + danger) * (1.0 - 0.85 * fill * fill);
             if best.map_or(true, |(bs, _)| score > bs) {
                 best = Some((score, p));
             }
