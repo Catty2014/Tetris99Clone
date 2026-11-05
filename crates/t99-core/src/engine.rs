@@ -283,6 +283,14 @@ pub struct Player {
     last_move_frame: [i64; 2],
     /// ARRCheck 丢弃的移动次数
     pub arr_violations: u32,
+    /// 诊断：累计被推进的 tick 数
+    pub dbg_adv: u64,
+    /// 诊断：上一帧事件之后剩余的推进 tick 数
+    pub dbg_dt: Ticks,
+    /// 诊断：step_player 调用数 / active 缺失返回数 / 进入重力次数
+    pub dbg_steps: u64,
+    pub dbg_none: u64,
+    pub dbg_play: u64,
     /// 因对方待进上限或无人可送而丢弃的行
     pub dropped: u32,
     /// 自己消行时抵消掉的待进垃圾行
@@ -471,6 +479,11 @@ impl Match {
                 dup_dropped: 0,
                 last_move_frame: [-1, -1],
                 arr_violations: 0,
+                dbg_adv: 0,
+                dbg_dt: 0,
+                dbg_steps: 0,
+                dbg_none: 0,
+                dbg_play: 0,
                 dropped: 0,
                 canceled: 0,
                 inserted: 0,
@@ -742,6 +755,7 @@ impl Match {
             if !stop {
                 self.advance(pid, frame_ticks - cursor);
             }
+            self.players[pid].dbg_dt = frame_ticks - cursor;
             if self.over.is_some() {
                 break;
             }
@@ -783,6 +797,9 @@ impl Match {
     }
 
     fn advance(&mut self, pid: usize, mut dt: Ticks) {
+        if dt > 0 {
+            self.players[pid].dbg_adv = self.players[pid].dbg_adv.saturating_add(dt as u64);
+        }
         while dt > 0 && self.players[pid].alive {
             let step = dt.min(SUB_TICKS);
             self.step_player(pid, step);
@@ -791,6 +808,7 @@ impl Match {
     }
 
     fn step_player(&mut self, pid: usize, dt: Ticks) {
+        self.players[pid].dbg_steps = self.players[pid].dbg_steps.wrapping_add(1);
         // 垃圾队列独立推进（任何相位；T99：黄→红→进场，连击阻挡）
         self.tick_garbage(pid, dt);
         // 相位推进
@@ -816,8 +834,10 @@ impl Match {
             PlayerPhase::Play => {}
         }
         if self.players[pid].active.is_none() {
+            self.players[pid].dbg_none = self.players[pid].dbg_none.wrapping_add(1);
             return;
         }
+        self.players[pid].dbg_play = self.players[pid].dbg_play.wrapping_add(1);
         let rate = if self.players[pid].soft {
             self.cfg.ruleset.soft_milli_per_sec
         } else {
@@ -829,8 +849,21 @@ impl Match {
             let adv = (p.grav_rem / TPS as i128) as Milli;
             if adv > 0 {
                 p.grav_rem %= TPS as i128;
-                if let Some(a) = p.active.as_mut() {
-                    a.y += adv;
+                // 逐毫格下落，接触即停。不能先整体下移再整格夹回：
+                // 那样每帧都会被抬回一格，永远进不了 grounded，方块既不定格也不判死。
+                if let Some(a) = p.active {
+                    let (k, r, x, mut y) = (a.kind, a.rot, a.x, a.y);
+                    let mut moved = 0;
+                    while moved < adv && moved < MILLI_CELL * 10 {
+                        if collides(&*p, k, r, x, y + 1) {
+                            break;
+                        }
+                        y += 1;
+                        moved += 1;
+                    }
+                    if let Some(a) = p.active.as_mut() {
+                        a.y = y;
+                    }
                 }
             }
         }
@@ -2123,6 +2156,48 @@ impl Match {
         1 + ((elapsed - start) / step) as u32
     }
 
+    /// 诊断用：单席位内部状态一行（T99_SEAT_DUMP）。
+    /// 用于定位“存活但不再推进”的席位，正常对局不需要。
+    pub fn debug_seat(&self, pid: usize) -> String {
+        let p = &self.players[pid];
+        let phase = match p.phase {
+            PlayerPhase::Play => "play".to_string(),
+            PlayerPhase::Clear(t) => format!("clear({})", t / SUB_TICKS),
+            PlayerPhase::Are(t) => format!("are({})", t / SUB_TICKS),
+        };
+        let active = match p.active {
+            Some(a) => format!("{}@{},{} y={}", a.kind.ch(), a.x, a.rot, a.y),
+            None => "none".to_string(),
+        };
+        let pending: u32 = p.pending.iter().map(|g| g.rows).sum();
+        let overlap = match p.active {
+            Some(a) => collides(p, a.kind, a.rot, a.x, a.y),
+            None => false,
+        };
+        format!(
+            "seat={} alive={} pieces={} lines={} phase={} active={} pending={} inserted={} overlap={} grounded={} lock_timer={} soft={} adv={} dt={} ft={} grav_rem={} steps={} none={} play={}",
+            pid,
+            p.alive,
+            p.pieces,
+            p.lines,
+            phase,
+            active,
+            pending,
+            p.inserted,
+            overlap,
+            p.grounded,
+            p.lock_timer,
+            p.soft,
+            p.dbg_adv,
+            p.dbg_dt,
+            self.cfg.ruleset.frame_ticks(),
+            p.grav_rem,
+            p.dbg_steps,
+            p.dbg_none,
+            p.dbg_play
+        )
+    }
+
     pub fn snapshot(&self, pid: usize) -> Snapshot {
         let p = &self.players[pid];
         let pid_field = pid;
@@ -2391,6 +2466,28 @@ mod tests {
             TimedKey { t_us: 100, key: Key::RotCw },
         ]]);
         assert_eq!(m.players[0].dup_dropped, before + 1);
+    }
+
+    #[test]
+    fn idle_player_eventually_tops_out() {
+        // 回归：重力下落必须能停在接触位置并进入锁定计时。
+        // 早期实现在重力步进后把方块整格夹回静息位，方块每帧被抬起一格，
+        // grounded 永远为 false —— 停止输入的席位既不落子也不判死（99 人局“不死”事件）。
+        let mut m = Match::new(MatchConfig {
+            players: 1,
+            seed: 11,
+            ruleset: Ruleset::default(),
+        });
+        let mut died_at = None;
+        for f in 0..40_000 {
+            m.frame(&[vec![]]);
+            if !m.players[0].alive {
+                died_at = Some(f);
+                break;
+            }
+        }
+        assert!(died_at.is_some(), "idle player never topped out");
+        assert!(died_at.unwrap() < 40_000);
     }
 
     #[test]

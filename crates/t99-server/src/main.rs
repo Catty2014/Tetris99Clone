@@ -599,6 +599,11 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         let mut last_tps: f32 = 0.0;
         // 帧内耗时诊断（T99_FRAME_STATS=1）：发送快照 / 等待回包 / 超时席位
         let frame_stats = std::env::var("T99_FRAME_STATS").is_ok();
+        let seat_dump: Option<usize> = std::env::var("T99_SEAT_DUMP")
+            .ok()
+            .map(|v| v.parse::<usize>().unwrap_or(usize::MAX));
+        let mut seat_last_piece: Vec<u32> = vec![0; players];
+        let mut seat_stall: Vec<u32> = vec![0; players];
         let (mut fs_n, mut fs_send, mut fs_send_max) = (0u32, 0u64, 0u64);
         let (mut fs_wait, mut fs_wait_max, mut fs_miss) = (0u64, 0u64, 0u32);
         let (mut fs_lat_sum, mut fs_lat_max, mut fs_lat_max_seat, mut fs_replies) = (0u64, 0u64, 0usize, 0u32);
@@ -770,6 +775,30 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             let t_engine = Instant::now();
             engine.frame(&inputs);
             let engine_us = t_engine.elapsed().as_micros() as u64;
+            // 携带诊断：T99_SEAT_DUMP=1 时，存活席位超过 600 帧没有落新块就打印内部状态。
+            if let Some(watch) = seat_dump {
+                if watch < players {
+                    if engine.frame_n % 120 == 0 {
+                        eprintln!("[watch] f={} {}", engine.frame_n, engine.debug_seat(watch));
+                    }
+                } else {
+                    for pid in 0..players {
+                        let p = &engine.players[pid];
+                        if !p.alive {
+                            continue;
+                        }
+                        if p.pieces == seat_last_piece[pid] {
+                            seat_stall[pid] += 1;
+                            if seat_stall[pid] == 600 {
+                                eprintln!("[stall] f={} {}", engine.frame_n, engine.debug_seat(pid));
+                            }
+                        } else {
+                            seat_stall[pid] = 0;
+                            seat_last_piece[pid] = p.pieces;
+                        }
+                    }
+                }
+            }
             if frame_stats {
                 fs_engine += engine_us;
                 fs_engine_max = fs_engine_max.max(engine_us);
