@@ -489,34 +489,34 @@ impl Default for RulesetSection {
 #[serde(default)]
 pub struct StageSection {
     pub ratio_min_pm: u32,
-    pub gravity_base: i64,
-    pub gravity_ramp_per_min: i64,
-    pub gravity_cap: i64,
-    pub clear_delay_ticks: u32,
-    pub are_ticks: u32,
-    pub garbage_stage_ticks: u32,
+    /// 自然下落一格所需帧数（60Hz）
+    pub g_frames: u32,
+    /// 垃圾倒计时总帧数（60Hz）
+    pub r_frames: u32,
+    /// 锁定后到下一块出生前的帧数（消行延迟，含 ARE）
+    pub d_frames: u32,
+    /// 向下一阶段一半过渡的窗口，占总局时长千分比
+    pub window_pm: u32,
 }
 
 impl Default for StageSection {
     fn default() -> Self {
         Self {
             ratio_min_pm: 0,
-            gravity_base: 750,
-            gravity_ramp_per_min: 120,
-            gravity_cap: 1125,
-            clear_delay_ticks: 18,
-            are_ticks: 6,
-            garbage_stage_ticks: 72,
+            g_frames: 60,
+            r_frames: 270,
+            d_frames: 36,
+            window_pm: 400,
         }
     }
 }
 
 fn default_stages() -> Vec<StageSection> {
     vec![
-        StageSection { ratio_min_pm: 500, gravity_base: 750, gravity_ramp_per_min: 120, gravity_cap: 1125, clear_delay_ticks: 18, are_ticks: 6, garbage_stage_ticks: 72 },
-        StageSection { ratio_min_pm: 300, gravity_base: 1500, gravity_ramp_per_min: 400, gravity_cap: 2250, clear_delay_ticks: 15, are_ticks: 6, garbage_stage_ticks: 54 },
-        StageSection { ratio_min_pm: 100, gravity_base: 3000, gravity_ramp_per_min: 1000, gravity_cap: 4500, clear_delay_ticks: 12, are_ticks: 5, garbage_stage_ticks: 39 },
-        StageSection { ratio_min_pm: 0, gravity_base: 6000, gravity_ramp_per_min: 2000, gravity_cap: 60_000, clear_delay_ticks: 9, are_ticks: 4, garbage_stage_ticks: 27 },
+        StageSection { ratio_min_pm: 500, g_frames: 60, r_frames: 270, d_frames: 36, window_pm: 400 },
+        StageSection { ratio_min_pm: 100, g_frames: 30, r_frames: 180, d_frames: 20, window_pm: 200 },
+        StageSection { ratio_min_pm: 1, g_frames: 10, r_frames: 60, d_frames: 10, window_pm: 100 },
+        StageSection { ratio_min_pm: 0, g_frames: 1, r_frames: 60, d_frames: 10, window_pm: 0 },
     ]
 }
 
@@ -583,9 +583,9 @@ impl RulesetConfig {
             }
         }
         for (i, s) in r.stage.iter().enumerate() {
-            if s.clear_delay_ticks == 0 || s.are_ticks == 0 || s.garbage_stage_ticks == 0 {
+            if s.g_frames == 0 || s.r_frames == 0 || s.d_frames == 0 {
                 return Err(ConfigError::Rules(format!(
-                    "stage {i}: clear/are/garbage ticks must be > 0"
+                    "stage {i}: g/r/d frames must be > 0"
                 )));
             }
         }
@@ -611,12 +611,10 @@ impl RulesetConfig {
             .iter()
             .map(|s| t99_core::PhaseSpec {
                 ratio_min_pm: s.ratio_min_pm,
-                gravity_base: s.gravity_base,
-                gravity_ramp_per_min: s.gravity_ramp_per_min,
-                gravity_cap: s.gravity_cap,
-                clear_delay: tick(s.clear_delay_ticks),
-                are: tick(s.are_ticks),
-                garbage_stage: tick(s.garbage_stage_ticks),
+                g_frames: s.g_frames,
+                r_frames: s.r_frames,
+                d_frames: s.d_frames,
+                window_pm: s.window_pm,
             })
             .collect();
         if phases.is_empty() {
@@ -723,10 +721,9 @@ seed = 0
     fn ruleset_tick_and_time_units() {
         let r = RulesetConfig::default().to_ruleset().unwrap();
         assert_eq!(r.lock_ticks, 30 * t99_core::FRAME_TICKS);
-        assert_eq!(r.phases[0].are, 6 * t99_core::FRAME_TICKS);
-        assert_eq!(r.phases[0].clear_delay, 18 * t99_core::FRAME_TICKS);
-        // gravity 是 time rate，不是 tick 数
-        assert_eq!(r.phases[0].gravity_base, 750);
+        assert_eq!(r.phases[0].d_frames, 36);
+        assert_eq!(r.phases[0].g_frames, 60);
+        assert_eq!(r.phases[0].r_frames, 270);
         assert_eq!(r.match_ticks, 900 * 1000 * t99_core::TMS);
     }
 
@@ -741,7 +738,7 @@ seed = 0
         assert!(c.to_ruleset().is_err());
 
         let mut c = RulesetConfig::default();
-        c.ruleset.stage[0].are_ticks = 0;
+        c.ruleset.stage[0].d_frames = 0;
         assert!(c.to_ruleset().is_err());
     }
 

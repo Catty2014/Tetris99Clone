@@ -24,7 +24,7 @@ pub const MILLI_CELL: Milli = 1000;
 
 /// 引擎语义版本：任何影响模拟结果的引擎改动都必须递增（镜像失步的语义类防护——
 /// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
-pub const ENGINE_SEMANTICS: u32 = 2;
+pub const ENGINE_SEMANTICS: u32 = 3;
 /// 规则集身份；与 ruleset.toml 的 `id` 和服务器 hello 一致。
 pub const RULESET_ID: &str = "9f3c1a7e";
 
@@ -390,19 +390,20 @@ pub enum InitialTrigger {
     Either,
 }
 
-/// 节奏相位（ADR-018）：按存活比例切换；相位内参数缓升，相位间跳变。
+/// 阶段（ruleset v9，见 docs/rules/ruleset-v9.md）：按存活比例选择，
+/// 阶段内按剩余时间比例向下一阶段的一半过渡。
 #[derive(Clone, Debug)]
 pub struct PhaseSpec {
-    /// 进入该相位所需最低存活比例（千分比，alive*1000/start_players）
+    /// 进入该阶段所需最低存活比例（千分比）；末项为终态，只作过渡终点
     pub ratio_min_pm: u32,
-    pub gravity_base: Milli,
-    /// 相位内每分钟重力增量（毫格/秒）
-    pub gravity_ramp_per_min: Milli,
-    pub gravity_cap: Milli,
-    pub clear_delay: Ticks,
-    pub are: Ticks,
-    /// 垃圾黄/红各自阶段的时长（总排队 ≈ 2×此值）
-    pub garbage_stage: Ticks,
+    /// 自然下落一格所需帧数（60Hz），倒数为每帧格数
+    pub g_frames: u32,
+    /// 垃圾倒计时总帧数（60Hz）
+    pub r_frames: u32,
+    /// 锁定后到下一块出生前的帧数，消行延迟与 ARE 合并
+    pub d_frames: u32,
+    /// 向下一阶段一半过渡的窗口，占总局时长的千分比
+    pub window_pm: u32,
 }
 
 /// 规则集：全部数值集中于此，考试档与公开档在此分叉。
@@ -441,12 +442,13 @@ pub struct Ruleset {
     pub spawn_y_milli: Milli,
 }
 
-/// 按参与方数推导对局预算：4p=300s，99p=900s，线性插值，两端截断
+/// 按参与方数推导对局预算：4p=300s，99p=1200s，线性插值，两端截断。
+/// 正式对局 99 人为 20 分钟；人数越少预算越短。
 pub fn match_ticks_for(players: usize) -> Ticks {
     let secs = if players <= 4 {
         300.0f64
     } else {
-        (300.0 + 600.0 * (players.min(99) - 4) as f64 / 95.0).min(900.0)
+        (300.0 + 900.0 * (players.min(99) - 4) as f64 / 95.0).min(1200.0)
     };
     (secs * 1000.0).round() as Ticks * TMS
 }
@@ -464,44 +466,34 @@ impl Default for Ruleset {
             lock_resets_max: 15,
             soft_milli_per_sec: 60_000,
             phases: vec![
-                // P1：重力跟随 T99/准则 L1（0.8s/行 ≈ 0.0125G；自然流速待实机校准，ADR-014）；
-                // 垃圾总排队 2.4s 给足抵消窗口（T99 满厅约 2.5-3.5s），消行 300ms ≈ T99 动画
+                // v9：阶段 1~3 为可选阶段，第 4 项是终态（只作阶段 3 的过渡终点）。
                 PhaseSpec {
                     ratio_min_pm: 500,
-                    gravity_base: 750,
-                    gravity_ramp_per_min: 120,
-                    gravity_cap: 1125,
-                    clear_delay: 300 * TMS,
-                    are: 100 * TMS,
-                    garbage_stage: 1200 * TMS,
-                },
-                PhaseSpec {
-                    ratio_min_pm: 300,
-                    gravity_base: 1500,
-                    gravity_ramp_per_min: 400,
-                    gravity_cap: 2250,
-                    clear_delay: 250 * TMS,
-                    are: 100 * TMS,
-                    garbage_stage: 900 * TMS,
+                    g_frames: 60,
+                    r_frames: 270,
+                    d_frames: 36,
+                    window_pm: 400,
                 },
                 PhaseSpec {
                     ratio_min_pm: 100,
-                    gravity_base: 3000,
-                    gravity_ramp_per_min: 1000,
-                    gravity_cap: 4500,
-                    clear_delay: 200 * TMS,
-                    are: 80 * TMS,
-                    garbage_stage: 650 * TMS,
+                    g_frames: 30,
+                    r_frames: 180,
+                    d_frames: 20,
+                    window_pm: 200,
                 },
-                // P4 末相位：无下一阶梯，向 1G 爬坡（T99 终盘高速）；垃圾 0.9s 进场
+                PhaseSpec {
+                    ratio_min_pm: 1,
+                    g_frames: 10,
+                    r_frames: 60,
+                    d_frames: 10,
+                    window_pm: 100,
+                },
                 PhaseSpec {
                     ratio_min_pm: 0,
-                    gravity_base: 6000,
-                    gravity_ramp_per_min: 2000,
-                    gravity_cap: 60_000,
-                    clear_delay: 150 * TMS,
-                    are: 60 * TMS,
-                    garbage_stage: 450 * TMS,
+                    g_frames: 1,
+                    r_frames: 60,
+                    d_frames: 10,
+                    window_pm: 0,
                 },
             ],
             pending_cap_rows: 12,
@@ -524,53 +516,114 @@ impl Ruleset {
         TPS / self.tick_hz.max(1) as Ticks
     }
 
-    pub fn phase_of(&self, alive: usize, start: usize) -> usize {
-        let ratio = ((alive.max(1) * 1000) / start.max(1)) as u32;
-        for (i, p) in self.phases.iter().enumerate() {
-            if ratio >= p.ratio_min_pm {
-                return i;
-            }
+    /// 阶段选择（v9）：T ≥ 75% 时无条件回到阶段 1；否则按存活比例。
+    /// 阈值取严格不等：P = 50% 属于阶段 2，P = 10% 属于阶段 3。
+    pub fn phase_of(&self, alive: usize, start: usize, ticks_left: Ticks, total: Ticks) -> usize {
+        if total > 0 && ticks_left * 4 >= total * 3 {
+            return 0;
         }
-        self.phases.len() - 1
+        let alive = alive.max(1) as u128;
+        let start = start.max(1) as u128;
+        if alive * 2 > start {
+            0
+        } else if alive * 10 > start {
+            1
+        } else {
+            2
+        }
     }
 
-    pub fn gravity(&self, phase_idx: usize, phase_ticks: Ticks) -> Milli {
-        let i = phase_idx.min(self.phases.len() - 1);
-        let p = &self.phases[i];
-        // 千分之一分钟粒度，保证缓升平滑且全整数
-        let milli_minutes = (phase_ticks.max(0) as i128 * 1000 / MINUTES_TICKS as i128) as Milli;
-        // 相位内线性爬坡，但封顶在到下一相位阶梯的一半（末相位爬到自身 cap）
-        let hold = if i + 1 < self.phases.len() {
-            p.gravity_base + (self.phases[i + 1].gravity_base - p.gravity_base) / 2
+    /// 阶段参数，单位为帧：g 的「帧/格」、垃圾倒计时 r、锁定延迟 d。
+    /// enter_left 是进入当前阶段时的剩余 tick；阶段 1 的过渡起点固定为 75%。
+    /// 规则见 docs/rules/ruleset-v9.md §3、§4。
+    pub fn pacing(
+        &self,
+        phase: usize,
+        enter_left: Ticks,
+        left: Ticks,
+        total: Ticks,
+    ) -> (u32, u32, u32) {
+        let i = phase.min(self.phases.len() - 1);
+        let base = &self.phases[i];
+        let base_v = (base.g_frames, base.r_frames, base.d_frames);
+        let next_i = (i + 1).min(self.phases.len() - 1);
+        let next = &self.phases[next_i];
+        let full = (next.g_frames, next.r_frames, next.d_frames);
+        // 一半在帧域取算术平均；阶段 3 直接推到终态整值
+        let half = if i + 2 >= self.phases.len() {
+            full
         } else {
-            p.gravity_cap
+            (
+                (base.g_frames + next.g_frames) / 2,
+                (base.r_frames + next.r_frames) / 2,
+                (base.d_frames + next.d_frames) / 2,
+            )
         };
-        (p.gravity_base + p.gravity_ramp_per_min * milli_minutes / 1000).min(hold)
-    }
 
-    /// 相位内重力爬坡的封顶值（显示用，与 gravity() 一致）
-    pub fn gravity_hold(&self, phase_idx: usize) -> Milli {
-        let i = phase_idx.min(self.phases.len() - 1);
-        let p = &self.phases[i];
-        if i + 1 < self.phases.len() {
-            p.gravity_base + (self.phases[i + 1].gravity_base - p.gravity_base) / 2
+        let win = total * base.window_pm as Ticks / 1000;
+        let start = if i == 0 {
+            total * 3 / 4
         } else {
-            p.gravity_cap
+            enter_left.clamp(0, total)
+        };
+        if win <= 0 || left >= start {
+            return base_v;
+        }
+        let end = start - win;
+        let p40 = total * 2 / 5;
+
+        let lerp = |from: (u32, u32, u32),
+                    to: (u32, u32, u32),
+                    a: Ticks,
+                    b: Ticks,
+                    at: Ticks|
+         -> (u32, u32, u32) {
+            if b >= a {
+                return to;
+            }
+            let den = (a - b) as i128;
+            let num = (a - at).clamp(0, a - b) as i128;
+            let f = |x: u32, y: u32| -> u32 {
+                let x = x as i128;
+                let y = y as i128;
+                let v = (x * den + (y - x) * num).div_euclid(den);
+                v.max(0) as u32
+            };
+            (f(from.0, to.0), f(from.1, to.1), f(from.2, to.2))
+        };
+
+        if p40 >= start {
+            // 窗口起点已在 40% 之后：整段以整档为目标
+            return lerp(base_v, full, start, end, left);
+        }
+        if p40 > end {
+            // 40% 落在窗口内部：先把已走过的部分按一半走，再在剩余窗口内补齐整档
+            if left >= p40 {
+                return lerp(base_v, half, start, end, left);
+            }
+            let v40 = lerp(base_v, half, start, end, p40);
+            return lerp(v40, full, p40, end, left);
+        }
+        // 窗口在 40% 之前结束
+        if left > p40 {
+            return lerp(base_v, half, start, end, left);
+        }
+        if end == p40 {
+            full
+        } else {
+            half
         }
     }
 
-    pub fn clear_delay(&self, phase_idx: usize) -> Ticks {
-        self.phases[phase_idx.min(self.phases.len() - 1)].clear_delay
+    /// 帧域的落体速度折算为毫格/秒（整数除法，等价于向下取整）
+    pub fn gravity_milli(g_frames: u32) -> Milli {
+        60_000 / g_frames.max(1) as Milli
     }
+}
 
-    pub fn are(&self, phase_idx: usize) -> Ticks {
-        self.phases[phase_idx.min(self.phases.len() - 1)].are
-    }
-
-    /// 垃圾黄/红各阶段的时长（按相位；总排队 ≈ 2×此值）
-    pub fn garbage_stage(&self, phase_idx: usize) -> Ticks {
-        self.phases[phase_idx.min(self.phases.len() - 1)].garbage_stage
-    }
+/// 规则帧（60Hz）换算为引擎 tick；与引擎实际 tick_hz 无关
+pub const fn frames_to_ticks(frames: u32) -> Ticks {
+    frames as Ticks * FRAME_TICKS
 }
 
 pub const MINUTES_TICKS: Ticks = TPS * 60;

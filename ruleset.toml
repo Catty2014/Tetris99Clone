@@ -50,36 +50,28 @@ badge_tier_units = [2, 6, 14, 30]
 # are_ticks 取整数逻辑帧；当前为 100/100/83/67ms，后续调参可改。
 [[ruleset.stage]]
 ratio_min_pm = 500
-gravity_base = 750
-gravity_ramp_per_min = 120
-gravity_cap = 1125
-clear_delay_ticks = 18
-are_ticks = 6
-garbage_stage_ticks = 72
-
-[[ruleset.stage]]
-ratio_min_pm = 300
-gravity_base = 1500
-gravity_ramp_per_min = 400
-gravity_cap = 2250
-clear_delay_ticks = 15
-are_ticks = 6
-garbage_stage_ticks = 54
+g_frames = 60
+r_frames = 270
+d_frames = 36
+window_pm = 400
 
 [[ruleset.stage]]
 ratio_min_pm = 100
-gravity_base = 3000
-gravity_ramp_per_min = 1000
-gravity_cap = 4500
-clear_delay_ticks = 12
-are_ticks = 5
-garbage_stage_ticks = 39
+g_frames = 30
+r_frames = 180
+d_frames = 20
+window_pm = 200
+
+[[ruleset.stage]]
+ratio_min_pm = 1
+g_frames = 10
+r_frames = 60
+d_frames = 10
+window_pm = 100
 
 [[ruleset.stage]]
 ratio_min_pm = 0
-gravity_base = 6000
-gravity_ramp_per_min = 2000
-gravity_cap = 60000
-clear_delay_ticks = 9
-are_ticks = 4
-garbage_stage_ticks = 27
+g_frames = 1
+r_frames = 60
+d_frames = 10
+window_pm = 0

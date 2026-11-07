@@ -2158,19 +2158,16 @@ fn sync(
             };
         }
     }
-    // 当前模式参数（相位规格 + 垃圾延迟）
+    // 当前阶段参数（v9：落体帧/格、垃圾倒计时、锁定延迟）
     let params = session
         .with_engine(|e, _| {
-            let rules = &e.cfg.ruleset;
-            let ph = &rules.phases[e.phase_idx];
+            let (g, r, d) = e.pacing_frames();
             format!(
-                "P{} G{:.2}→{:.2} ARE{} 消{} 垃{}",
+                "P{} G{:.2} R{} D{}",
                 e.phase_idx + 1,
-                ph.gravity_base as f64 / 60000.0,
-                rules.gravity_hold(e.phase_idx) as f64 / 60000.0,
-                ph.are / TMS,
-                ph.clear_delay / TMS,
-                rules.garbage_stage(e.phase_idx) / TMS
+                60.0 / g.max(1) as f64,
+                r,
+                d
             )
         })
         .unwrap_or_default();
@@ -2335,12 +2332,18 @@ fn sync(
             if !dead {
                 show_grid(&mut vq, &tv.meter, 1, &|r, _| {
                     let idx = (H - 1 - r) as u32;
-                    if idx < snap.garbage_red {
-                        // 同主棋盘：暗相位转暗红而非隐藏
+                    let flash = snap.garbage_flash;
+                    let red_end = flash + snap.garbage_red;
+                    let yellow_end = red_end + snap.garbage_yellow;
+                    let gray_end = yellow_end + snap.garbage_gray;
+                    if idx < flash {
+                        // 倒计时已归零、等待锁定：红闪 5Hz
                         Some(if red_on { 5 } else { 9 })
-                    } else if idx < snap.garbage_red + snap.garbage_yellow {
+                    } else if idx < red_end {
+                        Some(5)
+                    } else if idx < yellow_end {
                         Some(2)
-                    } else if idx < snap.garbage_red + snap.garbage_yellow + snap.garbage_gray {
+                    } else if idx < gray_end {
                         Some(8)
                     } else {
                         None

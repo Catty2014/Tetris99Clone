@@ -137,12 +137,15 @@ pub struct ActiveMsg {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct GarbageMsg {
-    /// 红：即将进场
+    /// 红：倒计时后半段
     pub red: u32,
-    /// 黄：计时中
+    /// 黄：倒计时前半段
     pub yellow: u32,
     /// 灰：排队
     pub gray: u32,
+    /// 红闪：倒计时归零，等待落块锁定进场（v9）
+    #[serde(default)]
+    pub flash: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -195,7 +198,7 @@ impl FrameMsg {
             hold_used: s.hold_used,
             combo: s.combo as i64,
             b2b: s.b2b,
-            garbage: GarbageMsg { red: s.garbage_red, yellow: s.garbage_yellow, gray: s.garbage_gray },
+            garbage: GarbageMsg { red: s.garbage_red, yellow: s.garbage_yellow, gray: s.garbage_gray, flash: s.garbage_flash },
             clearing: s.clearing.clone(),
             badges: s.badges,
             badge_units: s.badge_units,
@@ -278,6 +281,7 @@ pub fn snapshot_from_frame(f: &FrameMsg, pid: usize) -> Snapshot {
         garbage_red: f.garbage.red,
         garbage_yellow: f.garbage.yellow,
         garbage_gray: f.garbage.gray,
+        garbage_flash: f.garbage.flash,
         garbage_batches: vec![],
         clearing: f.clearing.clone(),
         badges: f.badges,
@@ -1048,7 +1052,10 @@ mod tests {
             assert_eq!(back.hold_used, snap.hold_used);
             assert_eq!(back.combo, snap.combo);
             assert_eq!(back.b2b, snap.b2b);
-            assert_eq!((back.garbage_red, back.garbage_yellow, back.garbage_gray), (snap.garbage_red, snap.garbage_yellow, snap.garbage_gray));
+            assert_eq!(
+                (back.garbage_red, back.garbage_yellow, back.garbage_gray, back.garbage_flash),
+                (snap.garbage_red, snap.garbage_yellow, snap.garbage_gray, snap.garbage_flash)
+            );
             assert_eq!(back.clearing, snap.clearing);
             assert_eq!((back.badges, back.badge_units), (snap.badges, snap.badge_units));
             assert_eq!(back.target, snap.target);

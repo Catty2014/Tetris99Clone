@@ -132,6 +132,8 @@ pub struct Snapshot {
     pub garbage_red: u32,
     pub garbage_yellow: u32,
     pub garbage_gray: u32,
+    /// 倒计时已归零、等待锁定的行数（红闪）
+    pub garbage_flash: u32,
     /// 按待进顺序排列的垃圾批次（跳过空批次）
     pub garbage_batches: Vec<GarbView>,
     /// 消行延迟中正在闪烁的行（可见区行号）
@@ -178,7 +180,7 @@ struct Active {
     y: Milli,
 }
 
-/// T99 垃圾队列条目三态（wiki：黄→红→红闪进场，灰色排队，连击阻挡）
+/// T99 垃圾队列条目（v9：灰色排队；激活后单一倒计时，颜色按剩余比例）
 #[derive(Clone, Debug)]
 struct Garb {
     rows: u32,
@@ -188,21 +190,32 @@ struct Garb {
 
 #[derive(Clone, Debug)]
 enum GarbState {
-    /// 灰：排队中，前序批次了结后才开始计时
+    /// 灰：排队中，队首批次进场后才开始倒计时
     Gray,
-    /// 黄：计时中（剩余 ticks）
-    Yellow(Ticks),
-    /// 红：即将进场（剩余 ticks，到 0 后等待连击窗口）
-    Red(Ticks),
+    /// 激活：total 为激活时按 P 与 T 定下的倒计时总长，left 为剩余。
+    /// left 到 0 后红闪，等待落块锁定并结算消除。
+    Active { total: Ticks, left: Ticks },
 }
 
 impl GarbState {
     fn tag(&self) -> u8 {
         match self {
             GarbState::Gray => 0,
-            GarbState::Yellow(_) => 1,
-            GarbState::Red(_) => 2,
+            GarbState::Active { total, left } => {
+                if *left <= 0 {
+                    3
+                } else if *left * 2 >= *total {
+                    1
+                } else {
+                    2
+                }
+            }
         }
+    }
+
+    /// 倒计时走完，等待进场
+    fn ready(&self) -> bool {
+        matches!(self, GarbState::Active { left, .. } if *left <= 0)
     }
 }
 
@@ -428,9 +441,11 @@ pub struct Match {
     pub frame_n: u64,
     pub over: Option<MatchResult>,
     alive_count: usize,
-    /// 节奏相位（ADR-018）
+    /// 节奏阶段（ruleset v9）
     pub phase_idx: usize,
     phase_ticks: Ticks,
+    /// 进入当前阶段时的剩余 tick；阶段 1 的过渡起点固定为 75%，不使用它
+    phase_enter_left: Ticks,
     /// 最近一次击倒的帧号（None = 尚无死亡）；0 杀加速燃烧的锚点
     last_death_frame: Option<u64>,
     /// 对局倒计时剩余（tick），归零按排序键终局
@@ -527,6 +542,7 @@ impl Match {
             alive_count,
             phase_idx: 0,
             phase_ticks: 0,
+            phase_enter_left: match_ticks_left,
             last_death_frame: None,
             match_ticks_left,
             match_total_ticks: match_ticks_left,
@@ -778,6 +794,7 @@ impl Match {
         // 归零即按排序键终局（rule.md 8 排序键 / 9 时间上限）
         if self.over.is_none() {
             self.match_ticks_left = (self.match_ticks_left - self.burn_ticks()).max(0);
+            self.refresh_phase();
             if self.match_ticks_left == 0 {
                 // 流局：幸存者仅按徽章数排名
                 let ranking = self.ranking_badges();
@@ -821,7 +838,7 @@ impl Match {
 
     fn step_player(&mut self, pid: usize, dt: Ticks) {
         self.players[pid].dbg_steps = self.players[pid].dbg_steps.wrapping_add(1);
-        // 垃圾队列独立推进（任何相位；T99：黄→红→进场，连击阻挡）
+        // 垃圾倒计时独立推进；进场在锁定并结算消除之后（v9）
         self.tick_garbage(pid, dt);
         // 相位推进
         match self.players[pid].phase {
@@ -853,7 +870,7 @@ impl Match {
         let rate = if self.players[pid].soft {
             self.cfg.ruleset.soft_milli_per_sec
         } else {
-            self.cfg.ruleset.gravity(self.phase_idx, self.phase_ticks)
+            self.gravity_now()
         };
         {
             let p = &mut self.players[pid];
@@ -1587,45 +1604,73 @@ impl Match {
         out
     }
 
-    /// 垃圾队列推进：仅队首计时；红阶段到点且无连击阻挡时进场。
+    /// 垃圾倒计时推进（v9）：只递减队首；进场由锁定后的 flush_garbage 负责。
     fn tick_garbage(&mut self, pid: usize, dt: Ticks) {
-        loop {
-            if !self.players[pid].alive || self.players[pid].pending.is_empty() {
-                return;
-            }
-            let do_insert = {
-                let stage = self.cfg.ruleset.garbage_stage(self.phase_idx);
-                let p = &mut self.players[pid];
-                match &mut p.pending[0].state {
-                    GarbState::Gray => {
-                        // 晋升为队首后开始计时
-                        p.pending[0].state = GarbState::Yellow(stage);
-                        false
-                    }
-                    GarbState::Yellow(t) => {
-                        let nt = *t - dt;
-                        p.pending[0].state = if nt <= 0 {
-                            GarbState::Red(stage)
-                        } else {
-                            GarbState::Yellow(nt)
-                        };
-                        false
-                    }
-                    GarbState::Red(t) => {
-                        let nt = *t - dt;
-                        p.pending[0].state = GarbState::Red(nt.max(0));
-                        // 连击阻挡：只有 combo > 0（真正的连击段）才挡进场。
-                        // combo == 0 只是单次消行，T99 里不算连击，也不显示连击。
-                        nt <= 0 && p.combo <= 0
-                    }
-                }
-            };
-            if do_insert {
-                self.insert_first(pid);
-            } else {
-                return;
+        let Some(g) = self.players[pid].pending.first_mut() else {
+            return;
+        };
+        if let GarbState::Active { left, .. } = &mut g.state {
+            if *left > 0 {
+                *left = (*left - dt).max(0);
             }
         }
+    }
+
+    /// 当前阶段的 g/r/d（帧）
+    fn pacing_now(&self) -> (u32, u32, u32) {
+        self.cfg.ruleset.pacing(
+            self.phase_idx,
+            self.phase_enter_left,
+            self.match_ticks_left,
+            self.match_total_ticks,
+        )
+    }
+
+    /// 当前阶段自然落体速度（毫格/秒）
+    fn gravity_now(&self) -> Milli {
+        let (g, _, _) = self.pacing_now();
+        Ruleset::gravity_milli(g)
+    }
+
+    /// 重算阶段；阶段变化时记录进入时刻，作为过渡起点
+    fn refresh_phase(&mut self) {
+        let idx = self.cfg.ruleset.phase_of(
+            self.alive_count.max(1),
+            self.cfg.players,
+            self.match_ticks_left,
+            self.match_total_ticks,
+        );
+        if idx != self.phase_idx {
+            self.phase_idx = idx;
+            self.phase_ticks = 0;
+            self.phase_enter_left = self.match_ticks_left;
+        }
+    }
+
+    /// 激活队首灰色批次：按当前 P 与 T 取倒计时总长，此后不再变化
+    fn activate_head(&mut self, pid: usize) {
+        let (_, r_frames, _) = self.pacing_now();
+        let total = crate::frames_to_ticks(r_frames);
+        if let Some(g) = self.players[pid].pending.first_mut() {
+            if matches!(g.state, GarbState::Gray) {
+                g.state = GarbState::Active { total, left: total };
+            }
+        }
+    }
+
+    /// 落块锁定并结算消除之后调用：队首倒计时到 0 且当前不在连击时放一批进场。
+    /// 连击期间保持红闪；每次锁定最多放一批，放完立刻激活下一批。
+    fn flush_garbage(&mut self, pid: usize) {
+        let ready = self.players[pid]
+            .pending
+            .first()
+            .map(|g| g.state.ready())
+            .unwrap_or(false);
+        if !ready || self.players[pid].combo > 0 {
+            return;
+        }
+        self.insert_first(pid);
+        self.activate_head(pid);
     }
 
     /// 队首垃圾进场：上移棋盘、活动块随之上推、完全推出场外判负。
@@ -1709,6 +1754,8 @@ impl Match {
             }
         }
         self.players[pid].canceled += canceled;
+        // 队首被完全抵消后，新的队首若还是灰色，就从这一刻开始倒计时
+        self.activate_head(pid);
         canceled
     }
 
@@ -1735,9 +1782,9 @@ impl Match {
                 }
             }
         }
-        // 垃圾进场独立于锁定/消行（T99 语义），此处只压实与进入 ARE
-        let are = self.cfg.ruleset.are(self.phase_idx);
-        self.players[pid].phase = PlayerPhase::Are(are);
+        // v9：消行结算完成之后才轮到垃圾进场；d 已覆盖消行延迟与 ARE
+        self.flush_garbage(pid);
+        self.players[pid].phase = PlayerPhase::Are(0);
     }
 
     fn lock_piece(&mut self, pid: usize) {
@@ -1927,14 +1974,15 @@ impl Match {
             sent_rows = total - blocked;
         }
         if n > 0 {
-            let d = self.cfg.ruleset.clear_delay(self.phase_idx);
+            let d = crate::frames_to_ticks(self.pacing_now().2);
             let p = &mut self.players[pid];
             p.clearing_rows = full_rows;
             p.phase = PlayerPhase::Clear(d);
         } else {
-            // 垃圾独立进场，无消行直接进 ARE
-            let are = self.cfg.ruleset.are(self.phase_idx);
-            self.players[pid].phase = PlayerPhase::Are(are);
+            // v9：锁定并结算消除之后才放垃圾；无消行即为结算完成
+            let d = crate::frames_to_ticks(self.pacing_now().2);
+            self.flush_garbage(pid);
+            self.players[pid].phase = PlayerPhase::Are(d);
         }
         if n > 0 && sent_rows > 0 {
             let recv = self.resolve_receivers(pid, sent_rows);
@@ -1957,9 +2005,11 @@ impl Match {
                 let accepted = rows.min(room);
                 overflow += rows - accepted;
                 if accepted > 0 {
-                    // 队列为空立即开始计时（黄），否则灰排队
+                    // 队列为空立即激活并开始倒计时，否则灰色排队
                     let state = if self.players[rid].pending.is_empty() {
-                        GarbState::Yellow(self.cfg.ruleset.garbage_stage(self.phase_idx))
+                        let (_, r_frames, _) = self.pacing_now();
+                        let total = crate::frames_to_ticks(r_frames);
+                        GarbState::Active { total, left: total }
                     } else {
                         GarbState::Gray
                     };
@@ -2021,12 +2071,8 @@ impl Match {
         }
         self.alive_count -= 1;
         self.last_death_frame = Some(self.frame_n);
-        // 节奏相位重算（ADR-018）
-        let new_idx = self.cfg.ruleset.phase_of(self.alive_count.max(1), self.cfg.players);
-        if new_idx != self.phase_idx {
-            self.phase_idx = new_idx;
-            self.phase_ticks = 0;
-        }
+        // 节奏阶段重算（v9）
+        self.refresh_phase();
         if self.cfg.players > 1 && self.alive_count <= 1 {
             for p in &mut self.players {
                 if p.alive {
@@ -2195,16 +2241,21 @@ impl Match {
         &self.recent_attacks
     }
 
-    /// 从预定时间 66.66% 起，每 3.33% 所有玩家受到的垃圾行 +1。
+    /// 当前阶段的 g/r/d（帧），供客户端 HUD 显示
+    pub fn pacing_frames(&self) -> (u32, u32, u32) {
+        self.pacing_now()
+    }
+
+    /// 时间伤害（ruleset v9）：T=40% 起为 1，每 2%·T 加 1，T=20% 累计 11 后不变。
     pub fn garbage_bonus(&self) -> u32 {
         let total = self.match_total_ticks.max(1);
         let elapsed = (self.match_total_ticks - self.match_ticks_left).max(0);
-        let start = total * 2 / 3;
+        let start = total * 3 / 5; // 剩余 40%
         if elapsed < start {
             return 0;
         }
-        let step = (total / 30).max(1);
-        1 + ((elapsed - start) / step) as u32
+        let step = (total * 2 / 100).max(1);
+        (1 + (elapsed - start) / step).min(11) as u32
     }
 
     /// 诊断用：单席位内部状态一行（T99_SEAT_DUMP）。
@@ -2267,12 +2318,19 @@ impl Match {
         let mut garbage_red = 0u32;
         let mut garbage_yellow = 0u32;
         let mut garbage_gray = 0u32;
-        for (i, g) in p.pending.iter().enumerate() {
-            // 队首 Gray 会在下一拍晋升，计入黄
-            match (&g.state, i) {
-                (GarbState::Red(_), _) => garbage_red += g.rows,
-                (GarbState::Yellow(_), _) | (GarbState::Gray, 0) => garbage_yellow += g.rows,
-                (GarbState::Gray, _) => garbage_gray += g.rows,
+        let mut garbage_flash = 0u32;
+        for g in p.pending.iter() {
+            match &g.state {
+                GarbState::Gray => garbage_gray += g.rows,
+                GarbState::Active { total, left } => {
+                    if *left <= 0 {
+                        garbage_flash += g.rows;
+                    } else if *left * 2 >= *total {
+                        garbage_yellow += g.rows;
+                    } else {
+                        garbage_red += g.rows;
+                    }
+                }
             }
         }
         let garbage_batches: Vec<GarbView> = p
@@ -2294,6 +2352,7 @@ impl Match {
             garbage_red,
             garbage_yellow,
             garbage_gray,
+            garbage_flash,
             garbage_batches,
             clearing: p.clearing_rows.iter().map(|&r| r as isize - HIDDEN as isize).filter(|&r| r >= 0).map(|r| r as usize).collect(),
             badges: self.badge_tier(pid),
@@ -2301,7 +2360,7 @@ impl Match {
             target: p.last_target.filter(|&t| self.players[t].alive),
             target_mode: p.target_mode,
             alive: self.players.iter().filter(|q| q.alive).map(|q| q.id).collect(),
-            gravity_milli: self.cfg.ruleset.gravity(self.phase_idx, self.phase_ticks),
+            gravity_milli: self.gravity_now(),
             soft: p.soft,
             lock_ms_left: ((self.cfg.ruleset.lock_ticks - p.lock_timer) / TMS).max(0),
             lock_resets: p.lock_resets,
@@ -2357,6 +2416,7 @@ impl Match {
         mix_i(&mut h, self.over.is_some() as i64);
         mix_i(&mut h, self.phase_idx as i64);
         mix_i(&mut h, self.phase_ticks);
+        mix_i(&mut h, self.phase_enter_left);
         for p in &self.players {
             mix_i(&mut h, p.id as i64);
             mix(&mut h, p.phase.tag().as_bytes()[0]);
@@ -2398,8 +2458,11 @@ impl Match {
                 mix_i(&mut h, g.rows as i64);
                 mix_i(&mut h, g.sender as i64);
                 mix(&mut h, g.state.tag());
-                match g.state {
-                    GarbState::Yellow(t) | GarbState::Red(t) => mix_i(&mut h, t),
+                match &g.state {
+                    GarbState::Active { total, left } => {
+                        mix_i(&mut h, *total);
+                        mix_i(&mut h, *left);
+                    }
                     GarbState::Gray => {}
                 }
             }
@@ -2520,40 +2583,50 @@ mod tests {
     }
 
     #[test]
-    fn garbage_enters_when_combo_is_zero() {
-        // combo == 0 只是一次消行，不构成 T99 连击，不能挡垃圾进场。
+    fn garbage_enters_on_lock_when_combo_is_over() {
+        // v9：倒计时归零后不自行进场，必须等到落块锁定且连击结束。
         let mut m = solo();
         m.players[0].combo = 0;
         m.players[0].pending.push(Garb {
             rows: 1,
             sender: 0,
-            state: GarbState::Red(1),
+            state: GarbState::Active { total: 1, left: 0 },
         });
         let before = m.players[0].inserted;
         m.frame(&[vec![]]);
-        assert_eq!(
-            m.players[0].inserted,
-            before + 1,
-            "combo==0 时垃圾应当进场"
-        );
+        assert_eq!(m.players[0].inserted, before, "未锁定不进場");
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
+        m.lock_piece(0);
+        assert_eq!(m.players[0].inserted, before + 1, "锁定后应当进场");
     }
 
     #[test]
-    fn garbage_blocked_during_combo() {
+    fn garbage_blocked_while_clearing_combo() {
         let mut m = solo();
-        m.players[0].combo = 1;
+        // 造一次消行：底行 9 格 + O 块补满
+        for c in 0..9 {
+            m.players[0].board[23 * W + c] = 1;
+        }
         m.players[0].pending.push(Garb {
-            rows: 1,
+            rows: 3,
             sender: 0,
-            state: GarbState::Red(1),
+            state: GarbState::Active { total: 1, left: 0 },
         });
+        // combo 语义：-1 = 尚未消行，0 = 单次消行，>=1 才是连击段
+        m.players[0].combo = 1;
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
         let before = m.players[0].inserted;
-        m.frame(&[vec![]]);
-        assert_eq!(
-            m.players[0].inserted,
-            before,
-            "连击进行中不应进场"
-        );
+        m.lock_piece(0);
+        assert_eq!(m.players[0].combo, 2);
+        assert_eq!(m.players[0].inserted, before, "连击中不应进场");
+        // 消行结算完成后仍被连击挡住
+        run_quiet(&mut m, 40);
+        assert_eq!(m.players[0].inserted, before);
+        // 下一次无消行锁定把 combo 打回 -1，这一批才进来
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
+        m.lock_piece(0);
+        // 消行本身会把 1 行攻击用于阻挡，所以这批 3 行只剩 2 行进场
+        assert_eq!(m.players[0].inserted, before + 2, "连击结束后入场");
     }
 
     #[test]
@@ -2800,22 +2873,50 @@ mod tests {
     }
 
     #[test]
-    fn gravity_ramps_only_half_step_and_records_clear() {
+    fn pacing_ramps_against_remaining_time() {
         let r = Ruleset::default();
-        let minute = MINUTES_TICKS;
-        // P1 内线性爬坡（750 + 120/min），封顶在到 P2 阶梯的一半：750 + 750/2 = 1125
-        assert_eq!(r.gravity(0, minute), 870);
-        assert_eq!(r.gravity(0, 100 * minute), 1125);
-        // P2 内封顶 2250；P4 末相位爬到自身 cap（1G）
-        assert_eq!(r.gravity(1, 100 * minute), 2250);
-        assert_eq!(r.gravity(3, 100 * minute), 60_000);
-        assert_eq!(r.gravity_hold(0), 1125);
+        let total = 1200 * 1000 * TMS;
+        // T >= 75%：阶段 1 恒定
+        assert_eq!(r.pacing(0, total, total, total), (60, 270, 36));
+        assert_eq!(r.pacing(0, total, total * 3 / 4, total), (60, 270, 36));
+        // T = 55%：窗口过半
+        assert_eq!(r.pacing(0, total, total * 55 / 100, total), (52, 247, 32));
+        // T = 40%：7a 触发前的最后一刻
+        assert_eq!(r.pacing(0, total, total * 40 / 100, total), (46, 230, 29));
+        // T = 35%：整档走完
+        assert_eq!(r.pacing(0, total, total * 35 / 100, total), (30, 180, 20));
+        assert_eq!(r.pacing(0, total, total * 20 / 100, total), (30, 180, 20));
+
+        // 阶段 2 自 75% 进入：窗口 20%，55% 结束，未触及 40%
+        let enter = total * 3 / 4;
+        assert_eq!(r.pacing(1, enter, total * 65 / 100, total), (25, 150, 17));
+        assert_eq!(r.pacing(1, enter, total * 55 / 100, total), (20, 120, 15));
+        assert_eq!(r.pacing(1, enter, total * 30 / 100, total), (20, 120, 15));
+
+        // 阶段 3：直接推向终态，r/d 不变
+        let enter = total * 60 / 100;
+        assert_eq!(r.pacing(2, enter, total * 55 / 100, total), (5, 60, 10));
+        assert_eq!(r.pacing(2, enter, total * 50 / 100, total), (1, 60, 10));
+    }
+
+    #[test]
+    fn pacing_handles_forty_percent_at_window_edges() {
+        let r = Ruleset::default();
+        let total = 1200 * 1000 * TMS;
+        // 40% 恰为窗口起点：整段以整档为目标
+        assert_eq!(r.pacing(1, total * 40 / 100, total * 30 / 100, total), (20, 120, 15));
+        // 40% 恰为窗口终点：立刻跳到整档
+        let enter = total * 60 / 100;
+        assert_eq!(r.pacing(1, enter, total * 41 / 100, total), (20, 123, 15));
+        assert_eq!(r.pacing(1, enter, total * 40 / 100, total), (10, 60, 10));
     }
 
     #[test]
     fn gravity_accumulator_exact() {
-        let mut m = solo(); // players=1 → 相位0
-        let base = m.cfg.ruleset.phases[0].gravity_base;
+        let mut m = solo(); // players=1 → 阶段 1
+        // 1/60 格/帧 = 1000 毫格/秒
+        let base = Ruleset::gravity_milli(60);
+        assert_eq!(base, 1000);
         for _ in 0..3 {
             m.frame(&[]);
         }
@@ -2825,34 +2926,35 @@ mod tests {
     }
 
     #[test]
-    fn clear_then_are_gates_spawn() {
+    fn lock_then_spawn_delay_gates_spawn() {
         let mut m = solo();
         m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
         m.lock_piece(0);
-        // 无消行 → 直接 ARE，期间无活动块
+        // 无消行 → 等 d；期间无活动块
         assert!(m.players[0].active.is_none());
         assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
-        let are_frames = m.cfg.ruleset.are(0) / m.cfg.ruleset.frame_ticks() + 2;
-        run_quiet(&mut m, are_frames as u64);
+        // 阶段 1 的 d = 36 帧
+        run_quiet(&mut m, 35);
+        assert!(m.players[0].active.is_none(), "d 未走完不应出生");
+        run_quiet(&mut m, 2);
         assert!(m.players[0].active.is_some());
         assert_eq!(m.players[0].phase, PlayerPhase::Play);
     }
 
     #[test]
-    fn doubled_tick_rate_halves_frame_ticks_without_changing_absolute_timing() {
+    fn doubled_tick_rate_keeps_rule_frames_absolute() {
         let mut r = Ruleset::default();
         r.tick_hz = 120;
         assert_eq!(r.frame_ticks(), TPS / 120);
-        // 规则时长是绝对时间，不随 tick_hz 变化
-        assert_eq!(r.are(0), 100 * TMS);
+        // 规则帧按 60Hz 定义：d = 36 帧 = 0.6s，120Hz 下等于 72 帧
+        assert_eq!(crate::frames_to_ticks(36), 36 * TPS / 60);
         assert_eq!(r.lock_ticks, 500 * TMS);
 
         let mut m = Match::new(MatchConfig { players: 1, seed: 3, ruleset: r });
         m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
         m.lock_piece(0);
         assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
-        // 120Hz 下 ARE 100ms = 12 帧
-        run_quiet(&mut m, 11);
+        run_quiet(&mut m, 71);
         assert!(m.players[0].active.is_none());
         run_quiet(&mut m, 2);
         assert!(m.players[0].active.is_some());
@@ -2860,14 +2962,34 @@ mod tests {
     }
 
     #[test]
-    fn phase_advances_on_deaths() {
-        let mut m = Match::new(MatchConfig { players: 4, seed: 1, ruleset: Ruleset::default() });
+    fn phase_follows_ratio_below_75_percent() {
+        let mut m = Match::new(MatchConfig { players: 20, seed: 1, ruleset: Ruleset::default() });
+        let total = m.match_total_ticks;
+        // T >= 75% 强制阶段 1，即使人数已经很少
+        m.match_ticks_left = total * 80 / 100;
+        for pid in 1..=18 {
+            m.kill(pid, "t");
+        }
+        assert_eq!(m.alive_count, 2);
+        m.refresh_phase();
         assert_eq!(m.phase_idx, 0);
-        m.kill(1, "t");
-        m.kill(2, "t");
-        assert_eq!(m.phase_idx, 0); // 2/4 = 500‰
-        m.kill(3, "t");
-        assert_eq!(m.phase_idx, 2); // 1/4 = 250‰ → 跳过相位1
+
+        // T = 50% 时按比例：10/20 恰为 50%，属于阶段 2
+        let mut m = Match::new(MatchConfig { players: 20, seed: 1, ruleset: Ruleset::default() });
+        let total = m.match_total_ticks;
+        m.match_ticks_left = total * 50 / 100;
+        for pid in 1..=10 {
+            m.kill(pid, "t");
+        }
+        assert_eq!(m.alive_count, 10);
+        assert_eq!(m.phase_idx, 1);
+
+        // 2/20 = 10% 恰为 10%，属于阶段 3
+        for pid in 11..=18 {
+            m.kill(pid, "t");
+        }
+        assert_eq!(m.alive_count, 2);
+        assert_eq!(m.phase_idx, 2);
     }
 
     #[test]
@@ -2912,7 +3034,7 @@ mod tests {
         m.players[1].pending.push(Garb {
             rows: cap,
             sender: 2,
-            state: GarbState::Yellow(1200 * TMS),
+            state: GarbState::Active { total: 1, left: 0 },
         });
         assert_eq!(m.resolve_receivers(0, 3), vec![(2, 3)]);
         assert_eq!(m.players[0].last_target, Some(2), "饱和时应改锁仍有空间的目标");
@@ -2979,7 +3101,7 @@ mod tests {
                     p1.board[r * W + c] = CELL_GARBAGE;
                 }
             }
-            p1.pending.push(Garb { rows: cap, sender: 0, state: GarbState::Yellow(1200 * TMS) });
+            p1.pending.push(Garb { rows: cap, sender: 0, state: GarbState::Active { total: 1, left: 0 } });
             // p2：堆略低、待进无人
             let p2 = &mut m.players[2];
             for r in 12..ROWS {
@@ -3061,15 +3183,32 @@ mod tests {
     }
 
     #[test]
-    fn garbage_inserts_independently_and_cancels() {
+    fn garbage_enters_on_lock_and_cancels() {
         let mut m = Match::new(MatchConfig { players: 2, seed: 9, ruleset: Ruleset::default() });
-        // 2 人局 P1：黄/红各 1200ms，总排队 2.4s
-        let stage = 1200 * TMS;
-        m.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Yellow(stage) });
-        // 无消行（无阻挡）：约 145 帧后 3 行进场（独立于落块）
-        run_quiet(&mut m, 150);
+        // 阶段 1 的 r = 270 帧；队首倒计时走完也不会自行进场
+        let r = crate::frames_to_ticks(270);
+        m.players[0].pending.push(Garb {
+            rows: 3,
+            sender: 1,
+            state: GarbState::Active { total: r, left: r },
+        });
+        m.players[0].pending.push(Garb { rows: 2, sender: 1, state: GarbState::Gray });
+        run_quiet(&mut m, 275);
+        assert_eq!(m.players[0].pending.len(), 2, "没有锁定就不进场");
+        assert_eq!(m.players[0].inserted, 0);
+        // 一次锁定只放一批，随后立即激活下一批
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
+        m.lock_piece(0);
+        assert_eq!(m.players[0].inserted, 3);
+        assert_eq!(m.players[0].pending.len(), 1);
+        match m.players[0].pending[0].state {
+            GarbState::Active { total, left } => {
+                assert_eq!(left, total);
+                assert!(total > 0);
+            }
+            GarbState::Gray => panic!("队首应在进场后立即激活"),
+        }
         let p = &m.players[0];
-        assert!(p.pending.is_empty());
         for r in 22..ROWS {
             let garbage = (0..W).filter(|&c| p.board[r * W + c] == CELL_GARBAGE).count();
             assert_eq!(garbage, 9);
@@ -3086,7 +3225,7 @@ mod tests {
             }
             p.active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
         }
-        m2.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Yellow(stage) });
+        m2.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Active { total: 1, left: 0 } });
         m2.lock_piece(0); // 消 1 行（single，攻击值 0）→ 阻挡 0，剩 3，不发送
         let rows: u32 = m2.players[0].pending.iter().map(|g| g.rows).sum();
         assert_eq!(rows, 3, "单消攻击值为 0，不应阻挡");
@@ -3104,21 +3243,23 @@ mod tests {
             }
             p.active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
         }
-        m3.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Yellow(stage) });
+        m3.players[0].pending.push(Garb { rows: 3, sender: 1, state: GarbState::Active { total: 1, left: 0 } });
         m3.lock_piece(0); // 消 2 行（double，攻击值 1）→ 阻挡 1，剩 2，不发送
         let rows: u32 = m3.players[0].pending.iter().map(|g| g.rows).sum();
         assert_eq!(rows, 2, "攻击值 1 应阻挡 1 行");
         assert_eq!(m3.players[0].sent, 0, "阻挡后仍有暂缓垃圾，剩余攻击不放行");
-        // 连击中断（任一次无消行锁定会把 combo 打回 -1，此处直接置位）后，红段走完即进场
+        // 消行结算完成、连击中断后，下一次锁定才放行
+        run_quiet(&mut m3, 40);
         {
             let p = &mut m3.players[0];
             p.combo = -1;
+            p.active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
             if let Some(g) = p.pending.first_mut() {
-                g.state = GarbState::Red(1);
+                g.state = GarbState::Active { total: 1, left: 0 };
             }
         }
-        run_quiet(&mut m3, 3);
-        assert!(m3.players[0].pending.is_empty(), "连击结束后垃圾应进场");
+        m3.lock_piece(0);
+        assert!(m3.players[0].pending.is_empty(), "连击结束后锁定即进场");
     }
     #[test]
     fn garbage_pushes_airborne_piece_without_death() {
@@ -3133,9 +3274,9 @@ mod tests {
             }
             // 活动块悬在半空（全板第 3~4 行），被 8 行垃圾顶起会完全出板
             p.active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 3000 });
-            p.pending.push(Garb { rows: 8, sender: 1, state: GarbState::Yellow(1200 * TMS) });
+            p.pending.push(Garb { rows: 8, sender: 1, state: GarbState::Active { total: 1, left: 0 } });
         }
-        run_quiet(&mut m, 150);
+        m.insert_first(0);
         let p = &m.players[0];
         assert!(p.alive, "空中块被顶不应判负");
         let a = p.active.unwrap();
@@ -3162,7 +3303,7 @@ mod tests {
         m.players[0].pending.push(Garb {
             rows: 1,
             sender: 0,
-            state: GarbState::Red(1),
+            state: GarbState::Active { total: 1, left: 0 },
         });
         m.insert_first(0);
         assert_eq!(
@@ -3189,9 +3330,9 @@ mod tests {
                 }
             }
             p.active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 0 });
-            p.pending.push(Garb { rows: 4, sender: 1, state: GarbState::Yellow(1200 * TMS) });
+            p.pending.push(Garb { rows: 4, sender: 1, state: GarbState::Active { total: 1, left: 0 } });
         }
-        run_quiet(&mut m, 150);
+        m.insert_first(0);
         assert!(!m.players[0].alive, "堆到顶后垃圾进场应挤压判负");
     }
     #[test]
@@ -3240,8 +3381,9 @@ mod tests {
     }
 
     #[test]
-    fn garbage_bonus_ramps_after_two_thirds() {
-        let total = 900 * 1000 * TMS;
+    fn garbage_bonus_ramps_from_forty_percent_left() {
+        // 20 分钟：40% = 480s 起算，每 2% = 24s 加 1，20% = 960s 封顶 11
+        let total = 1200 * 1000 * TMS;
         let mut m = Match::new(MatchConfig {
             players: 2,
             seed: 9,
@@ -3252,11 +3394,12 @@ mod tests {
             m.match_ticks_left = total - secs * 1000 * TMS;
             m.garbage_bonus()
         };
-        assert_eq!(at(599), 0, "600s 前无加成");
-        assert_eq!(at(600), 1);
-        assert_eq!(at(630), 2);
-        assert_eq!(at(720), 5);
-        assert_eq!(at(900), 11);
+        assert_eq!(at(719), 0, "剩余 40% 之前无加成");
+        assert_eq!(at(720), 1);
+        assert_eq!(at(744), 2);
+        assert_eq!(at(959), 10);
+        assert_eq!(at(960), 11);
+        assert_eq!(at(1200), 11, "20% 之后不再变化");
     }
 
     #[test]
@@ -3265,18 +3408,18 @@ mod tests {
         {
             let p = &mut m.players[0];
             p.pending.push(Garb { rows: 2, sender: 1, state: GarbState::Gray });
-            p.pending.push(Garb { rows: 0, sender: 2, state: GarbState::Yellow(1200 * TMS) });
-            p.pending.push(Garb { rows: 3, sender: 2, state: GarbState::Yellow(1200 * TMS) });
-            p.pending.push(Garb { rows: 4, sender: 1, state: GarbState::Red(0) });
+            p.pending.push(Garb { rows: 0, sender: 2, state: GarbState::Active { total: 60, left: 60 } });
+            p.pending.push(Garb { rows: 3, sender: 2, state: GarbState::Active { total: 60, left: 60 } });
+            p.pending.push(Garb { rows: 4, sender: 1, state: GarbState::Active { total: 60, left: 0 } });
         }
         let s = m.snapshot(0);
         let got: Vec<(usize, u32, u8)> =
             s.garbage_batches.iter().map(|g| (g.sender, g.rows, g.state)).collect();
-        assert_eq!(got, vec![(1, 2, 0), (2, 3, 1), (1, 4, 2)]);
-        // 总数统计保持原语义（队首 Gray 计入黄）
-        assert_eq!(s.garbage_yellow, 5);
-        assert_eq!(s.garbage_red, 4);
-        assert_eq!(s.garbage_gray, 0);
+        assert_eq!(got, vec![(1, 2, 0), (2, 3, 1), (1, 4, 3)]);
+        assert_eq!(s.garbage_yellow, 3);
+        assert_eq!(s.garbage_red, 0);
+        assert_eq!(s.garbage_gray, 2);
+        assert_eq!(s.garbage_flash, 4);
     }
 
     #[test]
