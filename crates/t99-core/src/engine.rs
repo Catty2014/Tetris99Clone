@@ -1639,6 +1639,16 @@ impl Match {
         {
             let p = &mut self.players[pid];
             p.board.copy_within(n * W..ROWS * W, 0);
+            // 消行动画期间也能进场：整块上移后待消行下标必须同步上移，
+            // 否则 finish_clear 会清掉底部新插入的垃圾行，把真正的满行留在场上
+            // （表现为之后出现一次消 5 行）。
+            if !p.clearing_rows.is_empty() {
+                p.clearing_rows = p
+                    .clearing_rows
+                    .iter()
+                    .filter_map(|&r| r.checked_sub(n))
+                    .collect();
+            }
             for i in 0..n {
                 let row = ROWS - n + i;
                 for c in 0..W {
@@ -3129,6 +3139,33 @@ mod tests {
             .unwrap();
         assert!(top >= 0, "夹回后不应高于场顶");
         assert!(p.pending.is_empty());
+    }
+
+    #[test]
+    fn garbage_during_clear_shifts_pending_rows() {
+        // 回归：消行动画期间插垃圾会把棋盘整体上移，
+        // 待消行下标必须同步上移，否则会清错行并留下满行（单块消 5 行）。
+        let mut m = solo();
+        for c in 0..W {
+            m.players[0].board[18 * W + c] = 1;
+        }
+        m.players[0].clearing_rows = vec![18];
+        m.players[0].pending.push(Garb {
+            rows: 1,
+            sender: 0,
+            state: GarbState::Red(1),
+        });
+        m.insert_first(0);
+        assert_eq!(
+            m.players[0].clearing_rows,
+            vec![17],
+            "待消行应随棋盘上移一行"
+        );
+        m.finish_clear(0);
+        let full = (0..ROWS)
+            .filter(|&r| m.players[0].board[r * W..(r + 1) * W].iter().all(|&c| c != 0))
+            .count();
+        assert_eq!(full, 0, "清行后不应残留满行");
     }
 
     #[test]
