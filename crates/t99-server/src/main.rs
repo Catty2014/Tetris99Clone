@@ -947,6 +947,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 "t_spin_full": r.t_spin_full,
                 "input_dropped": r.dup_dropped,
                 "arr_violations": r.arr_violations,
+                "clears_gt4": r.clears_gt4,
                 "dropped": r.dropped,
                 "canceled": r.canceled,
                 "inserted": r.inserted,

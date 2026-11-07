@@ -290,6 +290,8 @@ pub struct Player {
     last_move_frame: [i64; 2],
     /// ARRCheck 丢弃的移动次数
     pub arr_violations: u32,
+    /// 诊断：单次消行超过 4 行的次数（正常应为 0，非 0 说明棋盘残留了满行）
+    pub clears_gt4: u32,
     /// 诊断：累计被推进的 tick 数
     pub dbg_adv: u64,
     /// 诊断：上一帧事件之后剩余的推进 tick 数
@@ -410,6 +412,8 @@ pub struct TableRow {
     pub t_spin_full: u32,
     pub dup_dropped: u32,
     pub arr_violations: u32,
+    /// 诊断：单次消行超过 4 行的次数（正常应为 0）
+    pub clears_gt4: u32,
     pub dropped: u32,
     pub canceled: u32,
     pub inserted: u32,
@@ -486,6 +490,7 @@ impl Match {
                 dup_dropped: 0,
                 last_move_frame: [-1, -1],
                 arr_violations: 0,
+                clears_gt4: 0,
                 dbg_adv: 0,
                 dbg_dt: 0,
                 dbg_steps: 0,
@@ -1835,6 +1840,9 @@ impl Match {
             }
         }
         let n = full_rows.len() as u32;
+        if n > 4 {
+            self.players[pid].clears_gt4 += 1;
+        }
         // 全消判定（不改动棋盘：非满行全空即全消）
         let allclear = if n > 0 {
             let p = &self.players[pid];
@@ -2093,6 +2101,7 @@ impl Match {
                 t_spin_full: p.t_spin_full,
                 dup_dropped: p.dup_dropped,
                 arr_violations: p.arr_violations,
+                clears_gt4: p.clears_gt4,
                 dropped: p.dropped,
                 canceled: p.canceled,
                 inserted: p.inserted,
