@@ -454,8 +454,9 @@ pub struct Match {
     match_ticks_left: Ticks,
     /// 本局总时长（tick），用于受击递增计算
     pub match_total_ticks: Ticks,
-    /// 本局首个 KO 的席位（没有发生 KO 时为 None）
-    first_ko: Option<usize>,
+    /// 本局首个 KO 发生的帧（没有 KO 时为 None）；同帧的多个 KO 都算首杀
+    first_ko_frame: Option<u64>,
+    first_killers: Vec<usize>,
     /// 参考局：强制所有玩家随机锁敌，忽略目标键
     pub force_random_target: bool,
     /// 强制目标策略（优先级高于 force_random_target 与一切目标键）
@@ -550,7 +551,8 @@ impl Match {
             last_death_frame: None,
             match_ticks_left,
             match_total_ticks: match_ticks_left,
-            first_ko: None,
+            first_ko_frame: None,
+            first_killers: Vec::new(),
             force_random_target: false,
             force_policy: None,
             recent_attacks: Vec::new(),
@@ -1733,7 +1735,6 @@ impl Match {
                     a.y += (-top) as Milli * MILLI_CELL;
                 }
             }
-            p.last_garbage_from = Some(last_sender);
         }
         // 挤压判定：夹回后仍与堆叠重叠 = 堆到顶无容身之处
         if let Some(a) = self.players[pid].active {
@@ -2009,6 +2010,9 @@ impl Match {
                 let accepted = rows.min(room);
                 overflow += rows - accepted;
                 if accepted > 0 {
+                    // KO 归属：最后一次把垃圾送入其待定队列的人；
+                    // 完全被上限丢弃的攻击不算送到，不更新归属。
+                    self.players[rid].last_garbage_from = Some(pid);
                     // 队列为空立即激活并开始倒计时，否则灰色排队
                     let state = if self.players[rid].pending.is_empty() {
                         let (_, r_frames, _) = self.pacing_now();
@@ -2059,8 +2063,18 @@ impl Match {
                 if k != pid && self.players[k].alive {
                     // T99：击倒者获得被击倒者全部徽章并额外 +1
                     self.players[k].ko += 1;
-                    if self.first_ko.is_none() {
-                        self.first_ko = Some(k);
+                    match self.first_ko_frame {
+                        None => {
+                            self.first_ko_frame = Some(self.frame_n);
+                            self.first_killers.push(k);
+                        }
+                        // 同一帧内的多个击倒都记首杀
+                        Some(f) if f == self.frame_n => {
+                            if !self.first_killers.contains(&k) {
+                                self.first_killers.push(k);
+                            }
+                        }
+                        _ => {}
                     }
                     let gained = self.players[pid].badges + 1;
                     self.players[k].badges += gained;
@@ -2153,7 +2167,7 @@ impl Match {
                 death_frame: p.death_frame,
                 alive: p.alive,
                 ko: p.ko,
-                first_ko: self.first_ko == Some(p.id),
+                first_ko: self.first_killers.contains(&p.id),
                 badges: p.badges,
                 lines: p.lines,
                 sent: p.sent,
@@ -3466,18 +3480,56 @@ mod tests {
     }
 
     #[test]
-    fn first_ko_is_recorded_once() {
-        let mut m = Match::new(MatchConfig { players: 3, seed: 5, ruleset: Ruleset::default() });
+    fn first_ko_is_shared_within_one_frame() {
+        let mut m = Match::new(MatchConfig { players: 4, seed: 5, ruleset: Ruleset::default() });
         m.players[0].last_garbage_from = Some(1);
         m.kill_player(0, DeathReason::TopOut);
-        assert_eq!(m.players[1].ko, 1);
-        assert_eq!(m.first_ko, Some(1));
-        assert!(m.final_table()[1].first_ko);
-        assert!(!m.final_table()[2].first_ko);
+        m.players[2].last_garbage_from = Some(3);
+        m.kill_player(2, DeathReason::TopOut);
+        assert_eq!(m.first_killers, vec![1, 3], "同帧多个 KO 都算首杀");
         m.players[1].last_garbage_from = Some(2);
         m.kill_player(1, DeathReason::TopOut);
-        assert_eq!(m.players[2].ko, 1);
-        assert_eq!(m.first_ko, Some(1), "首杀只记第一次");
+        assert_eq!(m.first_killers, vec![1, 3], "之后帧的 KO 不算首杀");
+        let rows = m.final_table();
+        assert!(rows[1].first_ko && rows[3].first_ko && !rows[2].first_ko);
+    }
+
+    #[test]
+    fn dropped_attack_keeps_previous_kill_credit() {
+        let mut m = Match::new(MatchConfig { players: 2, seed: 9, ruleset: Ruleset::default() });
+        let cap = m.cfg.ruleset.pending_cap_rows;
+        // 目标队已满，p0 的攻击会全部被丢弃，不应抢走 KO 归属
+        m.players[1].pending.push(Garb {
+            rows: cap,
+            sender: 1,
+            state: GarbState::Active { total: 1, left: 1 },
+        });
+        m.players[1].last_garbage_from = Some(1);
+        m.players[0].target_mode = TargetMode::Manual(1);
+        for c in 0..8 {
+            m.players[0].board[22 * W + c] = 1;
+            m.players[0].board[23 * W + c] = 1;
+        }
+        m.players[0].board[20 * W] = 1; // 避免全消奖励
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
+        m.lock_piece(0);
+        assert_eq!(
+            m.players[1].last_garbage_from,
+            Some(1),
+            "被上限完全丢弃的攻击不算送到"
+        );
+        // 队列腾空后再送一次，归属改为 p0
+        m.players[1].pending.clear();
+        m.players[1].last_garbage_from = Some(1);
+        run_quiet(&mut m, 40);
+        for c in 0..8 {
+            m.players[0].board[22 * W + c] = 1;
+            m.players[0].board[23 * W + c] = 1;
+        }
+        m.players[0].board[20 * W] = 1;
+        m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 8, y: 22000 });
+        m.lock_piece(0);
+        assert_eq!(m.players[1].last_garbage_from, Some(0));
     }
 
     #[test]
