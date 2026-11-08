@@ -5,8 +5,10 @@
 //! 对局是 `(seed, 事件流)` 的纯函数，可跨平台逐位重放。
 
 pub mod engine;
+pub mod score;
 
 pub use engine::{Match, MatchConfig, MatchResult, PlayerPhase, Snapshot, TableRow};
+pub use score::{match_points, placement_points};
 
 pub type Ticks = i64;
 /// ticks per second (1/3 ns)

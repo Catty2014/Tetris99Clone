@@ -418,6 +418,8 @@ pub struct TableRow {
     pub death_frame: Option<u64>,
     pub alive: bool,
     pub ko: u32,
+    /// 本局首个 KO 是否由该席位取得
+    pub first_ko: bool,
     pub badges: u32,
     pub lines: u32,
     pub sent: u32,
@@ -452,6 +454,8 @@ pub struct Match {
     match_ticks_left: Ticks,
     /// 本局总时长（tick），用于受击递增计算
     pub match_total_ticks: Ticks,
+    /// 本局首个 KO 的席位（没有发生 KO 时为 None）
+    first_ko: Option<usize>,
     /// 参考局：强制所有玩家随机锁敌，忽略目标键
     pub force_random_target: bool,
     /// 强制目标策略（优先级高于 force_random_target 与一切目标键）
@@ -546,6 +550,7 @@ impl Match {
             last_death_frame: None,
             match_ticks_left,
             match_total_ticks: match_ticks_left,
+            first_ko: None,
             force_random_target: false,
             force_policy: None,
             recent_attacks: Vec::new(),
@@ -797,7 +802,7 @@ impl Match {
             self.refresh_phase();
             if self.match_ticks_left == 0 {
                 // 流局：幸存者仅按徽章数排名
-                let ranking = self.ranking_badges();
+                let ranking = self.ranking_survivors();
                 for (i, &pid) in ranking.iter().enumerate() {
                     if self.players[pid].place.is_none() {
                         self.players[pid].place = Some(i as u32 + 1);
@@ -2054,6 +2059,9 @@ impl Match {
                 if k != pid && self.players[k].alive {
                     // T99：击倒者获得被击倒者全部徽章并额外 +1
                     self.players[k].ko += 1;
+                    if self.first_ko.is_none() {
+                        self.first_ko = Some(k);
+                    }
                     let gained = self.players[pid].badges + 1;
                     self.players[k].badges += gained;
                 }
@@ -2122,10 +2130,16 @@ impl Match {
         v
     }
 
-    /// 流局（倒计时耗尽）名次：幸存者仅按徽章数降序，平局按编号
-    fn ranking_badges(&self) -> Vec<usize> {
+    /// 流局（倒计时耗尽）名次：幸存者按击杀数降序，其次徽章数，最后按编号
+    fn ranking_survivors(&self) -> Vec<usize> {
         let mut v: Vec<usize> = (0..self.players.len()).filter(|&p| self.players[p].alive).collect();
-        v.sort_by(|&a, &b| self.players[b].badges.cmp(&self.players[a].badges).then(a.cmp(&b)));
+        v.sort_by(|&a, &b| {
+            self.players[b]
+                .ko
+                .cmp(&self.players[a].ko)
+                .then(self.players[b].badges.cmp(&self.players[a].badges))
+                .then(a.cmp(&b))
+        });
         v
     }
 
@@ -2139,6 +2153,7 @@ impl Match {
                 death_frame: p.death_frame,
                 alive: p.alive,
                 ko: p.ko,
+                first_ko: self.first_ko == Some(p.id),
                 badges: p.badges,
                 lines: p.lines,
                 sent: p.sent,
@@ -2176,8 +2191,9 @@ impl Match {
         if time_limit {
             survivors.sort_by(|&a, &b| {
                 self.players[b]
-                    .badges
-                    .cmp(&self.players[a].badges)
+                    .ko
+                    .cmp(&self.players[a].ko)
+                    .then(self.players[b].badges.cmp(&self.players[a].badges))
                     .then(a.cmp(&b))
             });
         } else {
@@ -2188,9 +2204,11 @@ impl Match {
         let mut i = 0;
         while i < survivors.len() {
             let j = if time_limit {
-                let badges = self.players[survivors[i]].badges;
+                let key = (self.players[survivors[i]].ko, self.players[survivors[i]].badges);
                 let mut j = i + 1;
-                while j < survivors.len() && self.players[survivors[j]].badges == badges {
+                while j < survivors.len()
+                    && (self.players[survivors[j]].ko, self.players[survivors[j]].badges) == key
+                {
                     j += 1;
                 }
                 j
@@ -3419,6 +3437,47 @@ mod tests {
         assert_eq!(s.garbage_red, 0);
         assert_eq!(s.garbage_gray, 2);
         assert_eq!(s.garbage_flash, 4);
+    }
+
+    #[test]
+    fn time_limit_ranks_by_kills_then_badges() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 5, ruleset: Ruleset::default() });
+        m.players[0].ko = 1;
+        m.players[0].badges = 9;
+        m.players[1].ko = 3;
+        m.players[2].ko = 1;
+        m.players[2].badges = 2;
+        m.over = Some(MatchResult { reason: "time_limit", frame: 100, places: vec![] });
+        let got: Vec<(usize, u32)> = m.final_ranking().iter().map(|r| (r.pid, r.rank)).collect();
+        assert_eq!(got, vec![(1, 1), (0, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn time_limit_ties_share_rank() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 5, ruleset: Ruleset::default() });
+        m.players[1].ko = 3;
+        m.players[0].ko = 1;
+        m.players[0].badges = 2;
+        m.players[2].ko = 1;
+        m.players[2].badges = 2;
+        m.over = Some(MatchResult { reason: "time_limit", frame: 100, places: vec![] });
+        let got: Vec<(usize, u32)> = m.final_ranking().iter().map(|r| (r.pid, r.rank)).collect();
+        assert_eq!(got, vec![(1, 1), (0, 2), (2, 2)]);
+    }
+
+    #[test]
+    fn first_ko_is_recorded_once() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 5, ruleset: Ruleset::default() });
+        m.players[0].last_garbage_from = Some(1);
+        m.kill_player(0, DeathReason::TopOut);
+        assert_eq!(m.players[1].ko, 1);
+        assert_eq!(m.first_ko, Some(1));
+        assert!(m.final_table()[1].first_ko);
+        assert!(!m.final_table()[2].first_ko);
+        m.players[1].last_garbage_from = Some(2);
+        m.kill_player(1, DeathReason::TopOut);
+        assert_eq!(m.players[2].ko, 1);
+        assert_eq!(m.first_ko, Some(1), "首杀只记第一次");
     }
 
     #[test]

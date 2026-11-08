@@ -941,6 +941,8 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 "badges": r.badges,
                 "alive": r.alive,
                 "ko": r.ko,
+                "first_ko": r.first_ko,
+                "pts": t99_core::match_points(r.rank, r.ko, r.first_ko),
                 "lines": r.lines,
                 "sent": r.sent,
                 "t_spins": r.t_spins,
