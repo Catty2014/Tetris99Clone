@@ -75,12 +75,11 @@ dist: musl-build
 	CARGO_TARGET_DIR=$(DIST)/.buildcheck cargo test --manifest-path $(DIST)/src/Cargo.toml
 	rm -rf $(DIST)/.buildcheck
 	@echo "[dist] 完成：$$(du -sh $(DIST) | cut -f1)，源码自洽构建通过"
-	# 部署到题目目录：分发模块 + 同步公开 bot 源码（与 crate 原文逐字一致）
+	# 部署到题目目录：分发模块（basic/advanced 源码已包含在 dist/src 内，不再单独复制）
 	@if [ -d "$(AX1_DIR)" ]; then \
 	    rm -rf "$(AX1_DIR)/dist"; \
 	    cp -r $(DIST) "$(AX1_DIR)/dist"; \
-	    cp crates/t99-bots/src/basic.rs crates/t99-bots/src/advanced.rs "$(AX1_DIR)/"; \
-	    echo "[dist] 已部署到题目目录 $(AX1_DIR)（dist/ + basic.rs + advanced.rs）"; \
+	    echo "[dist] 已部署到题目目录 $(AX1_DIR)（dist/）"; \
 	else \
 	    echo "[dist] 未找到题目目录 $(AX1_DIR)，跳过部署"; \
 	fi
