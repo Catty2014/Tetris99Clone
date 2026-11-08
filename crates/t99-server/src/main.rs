@@ -502,16 +502,26 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         }
         running.store(true, Ordering::SeqCst);
         // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。
+        // 席位名：网络席位用连接 ID；bot 席位用阵容里的实际标签
+        // （候选目录名 / basic / advanced / expert / master / gm / null），
+        // 而不是笼统的 bot-N——观战端与 match_result 都按这个名字显示。
         let seat_ids: Vec<String> = {
             let h = hall.lock().unwrap();
             (0..players)
                 .map(|pid| {
-                    h.clients
-                        .iter()
-                        .flatten()
-                        .find(|c| c.seat == Some(pid))
-                        .map(|c| c.id.clone())
-                        .unwrap_or_else(|| format!("bot-{pid}"))
+                    if args.lobby && pid < human_seats {
+                        if let Some(c) =
+                            h.clients.iter().flatten().find(|c| c.seat == Some(pid))
+                        {
+                            return c.id.clone();
+                        }
+                    } else if let Some(spec) = args.bots.get(pid.saturating_sub(human_seats)) {
+                        return match parse_seat(spec) {
+                            SeatProgram::BuiltIn(tier) => tier,
+                            SeatProgram::Ext { label, .. } => label,
+                        };
+                    }
+                    format!("bot-{pid}")
                 })
                 .collect()
         };
