@@ -6,6 +6,7 @@
 //! 浏览器是单线程：回调不能跨线程，所以状态放在 `Rc` + `thread_local` 里。
 
 use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,11 @@ pub struct Ctx {
     pub expected: RefCell<Option<u64>>,
     /// 断线/失步后置位；observer 由 pump 负责重连补史
     pub reconnect: Cell<bool>,
+    /// 已接收未处理的服务器消息。onmessage 只入队，pump 每帧一次排空——
+    /// 浏览器把回调与 Bevy 帧放在同一事件循环里，刷新慢时回调会排队，
+    /// 让画面落后于实时；排空（while 一次性处理完积压）保证 UI 等待计算，
+    /// 计算永远在渲染之前追平到最新帧。
+    pub mq: RefCell<VecDeque<String>>,
 }
 
 struct Pump {
@@ -53,6 +59,8 @@ fn close(ctx: &Ctx) {
 }
 
 fn connect(ctx: &Rc<Ctx>) {
+    // 重连换连接：旧连接排队中的消息已无意义，清掉避免与重建的镜像错位。
+    ctx.mq.borrow_mut().clear();
     let ws = match WebSocket::new(&ctx.url) {
         Ok(w) => w,
         Err(_) => {
@@ -96,15 +104,9 @@ fn connect(ctx: &Rc<Ctx>) {
                 }
             }
         }
-        let ok = {
-            // expected 只在回调里读写，不会与 Bevy 系统并发
-            let mut exp = c.expected.borrow_mut();
-            handle_server_msg(&text, &c.mirror, &c.status, &c.stats, &c.base_ruleset, c.spectate, &mut exp)
-        };
-        if !ok {
-            c.reconnect.set(true);
-            close(&c);
-        }
+        // 只入队，不在浏览器回调里推进镜像：回调与 Bevy 帧同事件循环，
+        // 积压的推进推迟到 pump，由单帧 while 排空追平，慢刷新下 UI 才等得动计算。
+        c.mq.borrow_mut().push_back(text);
     });
     ws.set_onmessage(Some(onmsg.as_ref().unchecked_ref()));
     onmsg.forget();
@@ -162,6 +164,34 @@ pub fn pump_frame() {
             p.retry_at = None;
         }
 
+        // —— 单帧追平：一次性排空本帧积压的全部服务器消息 ——
+        // 每条消息立即推进镜像引擎，帧内 CPU 尽量给重演；排空后再渲染，
+        // 画面即当前实时帧。失步（序号断裂）走重连补史，属于失真而非变慢。
+        let mut exp = p.ctx.expected.borrow_mut();
+        let retry = loop {
+            let Some(text) = p.ctx.mq.borrow_mut().pop_front() else { break false };
+            if !handle_server_msg(
+                &text,
+                &p.ctx.mirror,
+                &p.ctx.status,
+                &p.ctx.stats,
+                &p.ctx.base_ruleset,
+                p.ctx.spectate,
+                &mut exp,
+            ) {
+                // 失步/版本不符：与旧回调行为一致，断开并重连；旧连接剩余消息作废。
+                *p.ctx.status.lock().unwrap() = "镜像失步，重连补史…".into();
+                p.ctx.mq.borrow_mut().clear();
+                close(&p.ctx);
+                break true;
+            }
+        };
+        drop(exp);
+        if retry {
+            p.ctx.reconnect.set(true);
+        }
+
+        // —— 发送侧：本帧积压的输入指令一次发完 ——
         while let Ok(cmd) = p.rx.try_recv() {
             let msg = net_cmd_json(&cmd);
             let mut failed = false;

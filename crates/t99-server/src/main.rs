@@ -501,11 +501,26 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             };
         }
         running.store(true, Ordering::SeqCst);
-        // 每客户端下发专属 hello
+        // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。
+        let seat_ids: Vec<String> = {
+            let h = hall.lock().unwrap();
+            (0..players)
+                .map(|pid| {
+                    h.clients
+                        .iter()
+                        .flatten()
+                        .find(|c| c.seat == Some(pid))
+                        .map(|c| c.id.clone())
+                        .unwrap_or_else(|| format!("bot-{pid}"))
+                })
+                .collect()
+        };
+        // 每客户端下发专属 hello；席位→ID 映射只给观战端，玩家连接不下发，
+        // 避免在对局内暴露对手身份（同族识别与结盟的入口）。
         {
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
-                let hello = serde_json::json!({
+                let mut hello = serde_json::json!({
                     "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
                     "player_id": c.id.clone(),
@@ -513,6 +528,9 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     "time_limit_secs": args.time_limit_secs,
                     "stall_accel": args.stall_accel,
                 });
+                if c.seat.is_none() {
+                    hello["seats"] = serde_json::json!(seat_ids);
+                }
                 let _ = c.tx.send(hello.to_string());
             }
         }
@@ -528,20 +546,6 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         } else if args.force_random_target {
             engine.force_random_targets();
         }
-        // 结算/握手用：seat -> PlayerID；bot 席位生成稳定占位 ID。
-        let seat_ids: Vec<String> = {
-            let h = hall.lock().unwrap();
-            (0..players)
-                .map(|pid| {
-                    h.clients
-                        .iter()
-                        .flatten()
-                        .find(|c| c.seat == Some(pid))
-                        .map(|c| c.id.clone())
-                        .unwrap_or_else(|| format!("bot-{pid}"))
-                })
-                .collect()
-        };
         // 席位适配器：前 human_seats 席 = 网络玩家（lobby），其余 = 内建 bot / 外部子进程
         let mut net_iter = net_bots.into_iter();
         let mut bots: Vec<Option<Box<dyn PlayerAdapter>>> = (0..players)
@@ -641,6 +645,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                         let hello = serde_json::json!({
                             "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
                             "seat": -1, "role": "observer",
+                            "seats": seat_ids,
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
                         {

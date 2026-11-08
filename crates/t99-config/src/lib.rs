@@ -453,7 +453,7 @@ pub struct RulesetSection {
 impl Default for RulesetSection {
     fn default() -> Self {
         Self {
-            id: "9f3c1a7e".into(),
+            id: "bd607898ab870354".into(),
             tick_hz: 60,
             arr_ticks: 2,
             board_width: 10,

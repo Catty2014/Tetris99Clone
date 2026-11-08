@@ -51,6 +51,9 @@ const THUMB_HZ: f64 = 10.0;
 /// 攻击光点（recent_attacks 飞行动画）。暂时关闭以观察纯连线效果；
 /// 代码保留，改回 true 即可恢复。攻击连线不受影响。
 const SHOW_ATTACK_DOTS: bool = false;
+/// 攻击连线（被瞄黄/瞄准蓝的直线）：暂时整体关闭以观察净空效果；
+/// 代码保留，改回 true 即可恢复。攻击光点不受本开关控制。
+const SHOW_ATTACK_LINES: bool = false;
 /// 观战编号输入超时：最后一键后超过该时长自动应用。
 const SPECTATE_IDLE: Duration = Duration::from_secs(3);
 const TW: f32 = 44.0; // 小窗宽（含边框）
@@ -105,10 +108,11 @@ fn stack_height(s: &Snapshot) -> usize {
     0
 }
 
-/// 开局最小可容网格（2N² ≥ 存活对手数），2..=7 —— 8 人局开局为 2×2
-fn fit_grid(alive_others: usize) -> usize {
+/// 开局最小可容网格（2N² ≥ 初始对手数），2..=7 —— 99 人局固定 7×7；
+/// 只在开局调用一次，此后不随淘汰缩小（自动缩档暂时禁用）
+fn fit_grid(others: usize) -> usize {
     let mut n = 2usize;
-    while n < 7 && 2 * n * n < alive_others {
+    while n < 7 && 2 * n * n < others {
         n += 1;
     }
     n
@@ -154,6 +158,8 @@ struct MirrorState {
 #[derive(Resource, Default, Clone)]
 struct NetStats {
     player_id: String,
+    /// 观战端 hello 下发的席位名（下标=seat，PlayerID 或 bot-N）；玩家连接为空表
+    seats: Vec<String>,
     match_id: u64,
     rtt_ms: u32,
     loss_pct: u32,
@@ -442,12 +448,8 @@ impl Default for DebugHud {
     }
 }
 
-/// 追帧控制（观战端）：镜像落后服务器超过 60s 帧数时置位，
-/// sync 由此跳过整帧渲染，让出 CPU 给 tick 重演；落后回到 1s 内复位。
-#[derive(Resource, Default)]
-struct Catchup {
-    active: bool,
-}
+/// 追帧控制（观战端）：已被「单帧追平」取代——消息在每帧 pump 里一次性排空，
+/// 画面在 sync 之前永远推进到实时，不再需要冻结渲染让慢的局面逐步追来。
 
 /// 观战编号输入缓冲：0–9 最多两位，Enter 立即应用，静默 3 秒自动应用。
 #[derive(Resource, Default)]
@@ -1196,7 +1198,8 @@ fn observer_spectate_input(
         }
         mirror.lock().unwrap().my_seat = n as usize - 1;
         *status.lock().unwrap() = format!("观战 #{n}");
-        // 座位变了：缩略图网格必须按新视角重建
+        // 座位变了：小窗按新视角重画（新主视角玩家退出小窗集合）。
+        // 网格大小与顺序不参与重排：n 开局定死，顺序按 pid，淘汰者仍在原位。
         thumbs.n = 0;
         thumbs.last_refresh = None;
     };
@@ -1253,57 +1256,14 @@ fn toggle_debug_hud(
     }
 }
 
-// ———— 观战端追帧 ————
+// ———— 观战端追帧（已移除）————
 
-/// 追帧状态机（纯函数便于单测）：积压估计超过 60s（画面已慢于服务器 1 分钟）
-/// 进入追帧；回落到 ≤1s 恢复渲染；中间态维持，滞回防抖。
-fn catchup_step(active: bool, lag_ms: f32) -> bool {
-    if lag_ms > 60_000.0 {
-        return true;
-    }
-    if active && lag_ms <= 1_000.0 {
-        return false;
-    }
-    active
-}
-
-/// 追帧判定（观战/本地镜像端）：
-/// 重演速度本身总能跟上一条消息（消息到手即同步消耗），真正的滞后发生在
-/// 到达节奏层——积压的 tick 以远快于实时周期的速度成串到达时，说明客户端
-/// 正在消化一段落后的历史（TCP/浏览器事件队列积压，obs 接入慢的典型形态）。
-/// 期间把 sync 整帧跳过（画面阻滞在最后一帧），把 CPU 让给重演与消息排空。
-fn update_catchup(session: Res<Session>, mut ctl: ResMut<Catchup>) {
-    // 只有观战端需要追帧；玩家端冻结画面会影响操作
-    let Session::Net { stats, observer, .. } = &*session else { return };
-    if !*observer {
-        ctl.active = false;
-        return;
-    }
-    let st = stats.lock().unwrap().clone();
-    if !st.connected {
-        // 断线后镜像将重建，旧积压分作废
-        ctl.active = false;
-        return;
-    }
-    let Some(at) = st.clock_at else {
-        ctl.active = false;
-        return;
-    };
-    // tick 流停了 >1s（对局结束/服务器停帧）：解除冻结，避免画面常黑
-    if st.last_tick_at.map_or(true, |t| t.elapsed() > Duration::from_millis(1000)) {
-        ctl.active = false;
-        return;
-    }
-    let tps = if st.server_tps > 1.0 { st.server_tps } else { 60.0 };
-    let expected = st.clock_n as f32 + tps * at.elapsed().as_secs_f32();
-    let backlog = (expected - st.last_tick_n as f32).max(0.0);
-    ctl.active = catchup_step(ctl.active, backlog * 1000.0 / tps);
-}
-
-/// sync 的 run_if 条件：追帧期间整帧跳过渲染（画面阻滞在最后一帧）。
-fn render_paused_by_catchup(ctl: Res<Catchup>) -> bool {
-    !ctl.active
-}
+// 旧版 Catchup 状态机（catchup_step / update_catchup / render_paused_by_catchup）
+// 已删：一旦消息在 onmessage 里排队、pump 排空出现在任何一帧里，画面就能
+// 在同一个渲染帧里算到实时。上次加的「冻结整帧渲染给重演」反而把画面
+// 阻滞在失步时刻，被取代后直接删掉。
+// stats 里为它服务的 tick 时钟（clock_n / clock_at）仍由 handle_server_msg
+// 维护，诊断语义不变，只是客户端不再基于积压估算冻结渲染。
 
 /// 返回本帧应补发的离散方向事件；不直接碰 Bevy，便于单测。
 fn repeat_keys(
@@ -1542,21 +1502,6 @@ mod repeat_tests {
         assert!(cells.contains(&(9, 4)), "T bottom middle: {cells:?}");
         assert!(!cells.contains(&(10, 4)), "must not overlap stack: {cells:?}");
     }
-
-    #[test]
-    fn catchup_engages_over_60s_lag() {
-        // 60Hz：落后 3601 帧（≈1 分钟）即追帧；3599 帧且未追帧则保持原态；
-        // 追帧中在 60s 阈值以下仍保持着，直到 ≤1s 才恢复（滞回防抖）
-        assert!(catchup_step(false, 60_100.0));
-        assert!(!catchup_step(false, 60_000.0));
-        assert!(!catchup_step(false, 59_900.0));
-        assert!(catchup_step(true, 59_900.0));
-        // 追帧中回到 ≤1s 才恢复渲染（滞回）
-        assert!(!catchup_step(true, 1_000.0));
-        assert!(catchup_step(true, 1_001.0));
-        // 从未落后不触发
-        assert!(!catchup_step(false, 0.0));
-    }
 }
 
 fn drain_input(queue: &mut InputQueue) -> Vec<TimedKey> {
@@ -1755,10 +1700,17 @@ fn set_debug_hud_text(
     set_text(text_q, views.dbg_bot, String::new());
     match stat {
         Some(st) => {
-            // 观战者在服务端没有 player_id：显示被观战席位的标识。
-            // 服务端 hello 不下发席位名（协议不变），用 1-based 座位号 #n（与「观战 #n」一致）。
+            // 观战者在服务端没有 player_id：优先用 hello 下发的席位名（座位号索引），
+            // 服务端不下发 seats 或越位时，退回 1-based 座位号 #n（与「观战 #n」一致）。
             let pid = if st.player_id.is_empty() {
-                session.with_engine(|_, seat| format!("#{}", seat + 1)).unwrap_or_else(|| "(observer)".to_string())
+                session
+                    .with_engine(|_, seat| {
+                        st.seats
+                            .get(seat)
+                            .cloned()
+                            .unwrap_or_else(|| format!("#{}", seat + 1))
+                    })
+                    .unwrap_or_else(|| "(observer)".to_string())
             } else {
                 st.player_id
             };
@@ -1852,30 +1804,14 @@ fn rebuild_thumbs(
         thumbs.n = 0;
         return;
     }
-    // 网格等级由 sync 决定（开局最小可容 + 淘汰降级），此处只消费
+    // 网格等级由 sync 开局定死（不随淘汰缩小），此处只消费
     let n = thumbs.n.max(2);
     let cap = 2 * n * n;
+    // 顺序固定按 pid/座位，不按名次重排：更换观战座位时只把新主视角玩家
+    // 从小窗集合里移除，其余玩家保持原位（淘汰者不集中移到末尾）。
     let mut shown: Vec<usize> = session
-        .with_engine(|e, _| others.iter().copied().filter(|&p| e.players[p].alive).collect())
+        .with_engine(|_, _| others.clone())
         .unwrap_or_default();
-    // 死者按名次升序补位（最近淘汰在前）：网格缩小时从尾部移除最早淘汰者
-    let dead_order: Vec<usize> = session
-        .with_engine(|e, _| {
-            let mut d: Vec<(u32, usize)> = others
-                .iter()
-                .copied()
-                .filter(|&p| !e.players[p].alive)
-                .map(|p| (e.players[p].place.unwrap_or(u32::MAX), p))
-                .collect();
-            d.sort_by_key(|&(pl, _)| pl);
-            d.into_iter().map(|(_, p)| p).collect()
-        })
-        .unwrap_or_default();
-    for p in dead_order {
-        if !shown.contains(&p) && shown.len() < cap {
-            shown.push(p);
-        }
-    }
     shown.truncate(cap);
     let per_side = (shown.len() + 1) / 2;
     for (i, &pid) in shown.iter().enumerate() {
@@ -2353,21 +2289,21 @@ fn sync(
     }
     // —— 小窗层（节流） ——
     let font: Handle<Font> = font_assets.0.clone();
-    let alive_others = session
-        .with_engine(|e, seat| (0..e.players.len()).filter(|&p| p != seat && e.players[p].alive).count())
-        .unwrap_or(0);
-    // 新局（帧号倒退）→ 网格重置为开局最小可容（8 人局 = 2×2）
+    // 新局（帧号倒退）→ 网格重置为开局基准
     if s.n < thumbs.last_frame {
         thumbs.n = 0;
     }
     thumbs.last_frame = s.n;
-    let mut want_n = if thumbs.n == 0 { fit_grid(alive_others.max(1)) } else { thumbs.n };
-    // 淘汰降级：跌出 K-2 级容量 2(K-2)² → 降一级（恒 ≥ 2×2）
-    while want_n > 2 && alive_others < 2 * (want_n - 2) * (want_n - 2) {
-        want_n -= 1;
-    }
-    if want_n != thumbs.n {
-        thumbs.n = want_n;
+    // 网格等级只在开局按初始对手数定一次（2n² ≥ 初始对手数，98 人局 → 7×7），
+    // 此后不随淘汰缩小（自动缩档暂时禁用）；更换观战座位也不改变网格大小，
+    // 只会按新视角重画一遍（顺序仍按 pid，见 rebuild_thumbs）。
+    if thumbs.n == 0 {
+        let initial_others = session
+            .with_engine(|e, _| e.players.len().saturating_sub(1))
+            .unwrap_or(1)
+            .max(1);
+        let n = fit_grid(initial_others).max(2);
+        thumbs.n = n;
         rebuild_thumbs(&mut cmd, &font, &session, &mut thumbs, half_w);
         thumbs.last_refresh = None;
     }
@@ -2462,7 +2398,15 @@ fn sync(
                     "★".repeat(snap.badge_units as usize)
                 },
             );
+            // 名次（死亡）：#XX；被主界面玩家击杀的用黄色标记（killed_by_self）
             set_text(&mut text_q, tv.rank, if dead { format!("#{}", snap.place.unwrap_or(0)) } else { "".into() });
+            if let Ok(mut tc) = color_q_state.get_mut(tv.rank) {
+                tc.0 = if dead && s.killed_by_self.contains(&tv.pid) {
+                    Color::srgb(0.98, 0.8, 0.25)
+                } else {
+                    Color::srgb(0.85, 0.85, 0.88)
+                };
+            }
             // 副操作光标：ID 标签高亮
             if let Ok(mut tc) = color_q_state.get_mut(tv.id) {
                 tc.0 = if cursor_pid == Some(tv.pid) {
@@ -2475,8 +2419,9 @@ fn sync(
     }
     // —— 攻击连线：被瞄(targeted_by → 菱形 黄) + 本方瞄准(菱形 → target 蓝) ——
     // z=6：99p 缩略图（z≤3）之上、调试 HUD（z=50）之下；池化复用，多余槽隐藏。
-    // 本方已出局时菱形被攻击盘蒙灰接管，不再画线。
-    if s.alive_self {
+    // SHOW_ATTACK_LINES=false 时整块关闭（代码保留，改回 true 恢复）；
+    // 关闭或本方已出局时隐藏全部连线实体，不留残影。
+    if SHOW_ATTACK_LINES && s.alive_self {
         let dia = Vec2::new(0.0, -344.0);
         let mut segs: Vec<(Vec2, Vec2, Color)> = Vec::new();
         let yellow = Color::srgba(1.0, 0.85, 0.25, 0.30);
@@ -2520,6 +2465,9 @@ fn sync(
                 tr.rotation = Quat::from_rotation_z(d.y.atan2(d.x));
             }
         }
+    } else {
+        // 连线关闭或本方已出局：全量隐藏，不残留旧实体
+        hide(&mut vq, &thumbs.atk_lines);
     }
     // —— 攻击光点：每 tick 的 recent_attacks 生成 0.3s 飞行淡出光点；按 tick 号去重，
     // 池化复用（不 spawn/despawn），无事件时槽位保持隐藏。——
@@ -2646,6 +2594,12 @@ fn handle_server_msg(
             {
                 let mut st = stats.lock().unwrap();
                 st.match_id = v["match_id"].as_u64().unwrap_or(0);
+                // 观战端 hello 的可选席位名：缺失（玩家连接/旧服务器）则清空，
+                // 调试 HUD 退回 #n 座位号显示
+                st.seats = v["seats"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
                 st.connected = true;
                 st.server_tps = 0.0;
                 st.last_tick_n = 0;
@@ -3115,6 +3069,7 @@ fn main() {
                 url: format!("{url}/ws?id={my_id}&key={my_key}&role={role}&spectate={spectate}"),
                 expected: std::cell::RefCell::new(None),
                 reconnect: std::cell::Cell::new(false),
+                mq: std::cell::RefCell::new(std::collections::VecDeque::new()),
             });
             wasm_net::start(ctx, rx);
             Session::Net { mirror, tx, observer, status, stats }
@@ -3168,7 +3123,6 @@ fn main() {
         .insert_resource(display)
         .insert_resource(keymap)
         .insert_resource(DebugHud::default())
-        .init_resource::<Catchup>()
         .init_resource::<SpectateInput>()
         .add_systems(Startup, (load_ui_font, setup).chain())
         .add_systems(
@@ -3176,17 +3130,18 @@ fn main() {
             (
                 fit_camera,
                 sync_tick_rate,
+                // wasm：先在本帧内把到达的 WebSocket 消息全部排空（推进镜像），
+                // 再做输入采样与整帧渲染——单帧追平，UI 等待计算而非拖后。
+                #[cfg(target_arch = "wasm32")]
+                wasm_net_pump,
                 poll_input,
                 observer_spectate_input,
                 toggle_debug_hud,
-                update_catchup,
-                sync.run_if(render_paused_by_catchup),
+                sync,
             )
                 .chain(),
         )
         .add_systems(FixedUpdate, tick);
-    #[cfg(target_arch = "wasm32")]
-    app.add_systems(Update, wasm_net_pump);
     app.run();
 }
 

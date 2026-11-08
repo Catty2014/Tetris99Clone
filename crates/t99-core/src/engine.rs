@@ -164,6 +164,8 @@ pub struct Snapshot {
     pub badges_all: Vec<u32>,
     /// 全员待进垃圾行数（index=pid）
     pub pending_all: Vec<u32>,
+    /// 本快照归属玩家击杀过的 pid 列表（客户端把这些玩家的小窗名次标黄）
+    pub killed_by_self: Vec<usize>,
     /// 场上存活他人最高可见堆（KOs 权重用）
     pub max_stack: u16,
     /// 待进队列上限（行）
@@ -334,6 +336,8 @@ pub struct Player {
     /// 死亡发生的逻辑帧；同帧淘汰共享名次
     pub death_frame: Option<u64>,
     last_garbage_from: Option<usize>,
+    /// 击杀者：TopOut 死亡且垃圾归属指向另一名存活玩家时记录；流局/强制判负为 None
+    pub killer: Option<usize>,
     pub last_clear: Option<ClearView>,
 }
 
@@ -530,6 +534,7 @@ impl Match {
                 place: None,
                 death_frame: None,
                 last_garbage_from: None,
+                killer: None,
                 last_clear: None,
             });
         }
@@ -2061,6 +2066,8 @@ impl Match {
         if reason == DeathReason::TopOut {
             if let Some(k) = self.players[pid].last_garbage_from {
                 if k != pid && self.players[k].alive {
+                    // KO 归属同步记录：快照用它生成 killed_by_self（客户端名次标黄）
+                    self.players[pid].killer = Some(k);
                     // T99：击倒者获得被击倒者全部徽章并额外 +1
                     self.players[k].ko += 1;
                     match self.first_ko_frame {
@@ -2423,6 +2430,9 @@ impl Match {
                 .players
                 .iter()
                 .map(|p| p.pending.iter().map(|g| g.rows).sum::<u32>())
+                .collect(),
+            killed_by_self: (0..self.players.len())
+                .filter(|&q| self.players[q].killer == Some(pid_field))
                 .collect(),
             garbage_cap: self.cfg.ruleset.pending_cap_rows,
             targeted_by: (0..self.players.len())
@@ -3492,6 +3502,26 @@ mod tests {
         assert_eq!(m.first_killers, vec![1, 3], "之后帧的 KO 不算首杀");
         let rows = m.final_table();
         assert!(rows[1].first_ko && rows[3].first_ko && !rows[2].first_ko);
+    }
+
+    #[test]
+    fn killer_recorded_and_snapshot_killed_by_self() {
+        let mut m = Match::new(MatchConfig { players: 4, seed: 5, ruleset: Ruleset::default() });
+        // TopOut：垃圾归属指向另一名存活玩家 → 记录凶手，快照携带 killed_by_self
+        m.players[0].last_garbage_from = Some(1);
+        m.kill_player(0, DeathReason::TopOut);
+        assert_eq!(m.players[0].killer, Some(1));
+        assert_eq!(m.snapshot(1).killed_by_self, vec![0], "p1 的快照应报告击杀过 p0");
+        // 同一凶手连杀多人
+        m.players[2].last_garbage_from = Some(1);
+        m.kill_player(2, DeathReason::TopOut);
+        assert_eq!(m.snapshot(1).killed_by_self, vec![0, 2]);
+        // 凶手自己的快照不含他人击杀
+        assert!(m.snapshot(3).killed_by_self.is_empty());
+        // 流局 / 强制判负：无归属，不记凶手
+        m.kill_player(3, DeathReason::HostKill("timeout".into()));
+        assert_eq!(m.players[3].killer, None);
+        assert!(!m.snapshot(1).killed_by_self.contains(&3));
     }
 
     #[test]

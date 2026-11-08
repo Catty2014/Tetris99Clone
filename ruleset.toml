@@ -9,7 +9,7 @@
 #   gravity_* = 毫格/秒
 
 [ruleset]
-id = "a37b3e7d57e51a8d"       # = Ruleset::fingerprint()；规则改动后由测试强制同步
+id = "bd607898ab870354"       # = Ruleset::fingerprint()；规则改动后由测试强制同步
 
 tick_hz = 60                # 60 或 120；必须整除引擎时基
 arr_ticks = 2               # 横向移动同方向最小间隔（帧）

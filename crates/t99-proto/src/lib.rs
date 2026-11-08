@@ -10,6 +10,7 @@
 //! v7：frame 增 `badges`（全员徽章数组；徽章随 KO 转移，围猎徽章领先者的依据）。
 //! v8 起 frame 增可选 `pending_all` / `garbage_cap` / `max_stack`（全员待进行数、
 //! 队列上限、存活他人最高堆）；协议号不变，缺席按默认值处理，旧读取方不受影响。
+//! 之后增可选 `killed_by_self`（本方击杀过的 pid 列表，KO 名次标黄），同样默认空。
 //! 读取方须容忍字段缺席（serde default）。
 //! 另提供 `snapshot_from_frame`：wire frame → 内存快照的反向构造，
 //! 使外部程序可以把 frame 直接喂给消费 `Snapshot` 的决策核。
@@ -124,6 +125,9 @@ pub struct FrameMsg {
     /// v6：倒计时燃烧倍率 ×10（10 = 正常）
     #[serde(default)]
     pub burn_x10: u16,
+    /// 本方击杀过的玩家 pid 列表（客户端把这些玩家的小窗名次标黄）
+    #[serde(default)]
+    pub killed_by_self: Vec<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -226,6 +230,7 @@ impl FrameMsg {
             max_stack: s.max_stack,
             time_secs_left: s.match_secs_left,
             burn_x10: s.burn_x10,
+            killed_by_self: s.killed_by_self.clone(),
         }
     }
 }
@@ -311,6 +316,7 @@ pub fn snapshot_from_frame(f: &FrameMsg, pid: usize) -> Snapshot {
         targeted_by: f.targeted_by.clone(),
         badges_all: f.badges_all.clone(),
         pending_all: f.pending_all.clone(),
+        killed_by_self: f.killed_by_self.clone(),
         max_stack: f.max_stack,
         garbage_cap: f.garbage_cap,
         last_clear: None,
@@ -1073,6 +1079,7 @@ mod tests {
             assert_eq!(back.targeted_by, snap.targeted_by);
             assert_eq!(back.badges_all, snap.badges_all);
             assert_eq!(back.pending_all, snap.pending_all);
+            assert_eq!(back.killed_by_self, snap.killed_by_self);
             assert_eq!(back.garbage_cap, snap.garbage_cap);
             assert_eq!(back.max_stack, snap.max_stack);
             assert_eq!(back.match_secs_left, snap.match_secs_left);

@@ -31,7 +31,7 @@ pub const ARE_FRAMES: u32 = 6;
 /// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
 pub const ENGINE_SEMANTICS: u32 = 4;
 /// 规则集身份；与 ruleset.toml 的 `id` 和服务器 hello 一致。
-pub const RULESET_ID: &str = "a37b3e7d57e51a8d";
+pub const RULESET_ID: &str = "bd607898ab870354";
 
 pub const W: usize = 10;
 pub const HIDDEN: usize = 4;
@@ -508,7 +508,7 @@ impl Default for Ruleset {
             badge_tier_units: [2, 6, 14, 30],
             p_same_hole_pct: 70,
             match_ticks: 0,
-            stall_accel: true,
+            stall_accel: false,
             allow_rot180: false,
             // 可见首行出生：T99 观感——方块从场顶立即出现（而非隐藏缓冲区）
             spawn_y_milli: 4000,
