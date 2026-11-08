@@ -1782,9 +1782,9 @@ impl Match {
                 }
             }
         }
-        // v9：消行结算完成之后才轮到垃圾进场；d 已覆盖消行延迟与 ARE
+        // v9：消行结算完成之后才轮到垃圾进场，随后是固定的 ARE
         self.flush_garbage(pid);
-        self.players[pid].phase = PlayerPhase::Are(0);
+        self.players[pid].phase = PlayerPhase::Are(crate::frames_to_ticks(crate::ARE_FRAMES));
     }
 
     fn lock_piece(&mut self, pid: usize) {
@@ -1979,10 +1979,9 @@ impl Match {
             p.clearing_rows = full_rows;
             p.phase = PlayerPhase::Clear(d);
         } else {
-            // v9：锁定并结算消除之后才放垃圾；无消行即为结算完成
-            let d = crate::frames_to_ticks(self.pacing_now().2);
+            // v9：锁定并结算消除之后才放垃圾；无消行只等固定的 ARE
             self.flush_garbage(pid);
-            self.players[pid].phase = PlayerPhase::Are(d);
+            self.players[pid].phase = PlayerPhase::Are(crate::frames_to_ticks(crate::ARE_FRAMES));
         }
         if n > 0 && sent_rows > 0 {
             let recv = self.resolve_receivers(pid, sent_rows);
@@ -2877,26 +2876,26 @@ mod tests {
         let r = Ruleset::default();
         let total = 1200 * 1000 * TMS;
         // T >= 75%：阶段 1 恒定
-        assert_eq!(r.pacing(0, total, total, total), (60, 270, 36));
-        assert_eq!(r.pacing(0, total, total * 3 / 4, total), (60, 270, 36));
+        assert_eq!(r.pacing(0, total, total, total), (60, 270, 33));
+        assert_eq!(r.pacing(0, total, total * 3 / 4, total), (60, 270, 33));
         // T = 55%：窗口过半
-        assert_eq!(r.pacing(0, total, total * 55 / 100, total), (52, 247, 32));
+        assert_eq!(r.pacing(0, total, total * 55 / 100, total), (52, 247, 29));
         // T = 40%：7a 触发前的最后一刻
-        assert_eq!(r.pacing(0, total, total * 40 / 100, total), (46, 230, 29));
+        assert_eq!(r.pacing(0, total, total * 40 / 100, total), (46, 230, 26));
         // T = 35%：整档走完
-        assert_eq!(r.pacing(0, total, total * 35 / 100, total), (30, 180, 20));
-        assert_eq!(r.pacing(0, total, total * 20 / 100, total), (30, 180, 20));
+        assert_eq!(r.pacing(0, total, total * 35 / 100, total), (30, 180, 17));
+        assert_eq!(r.pacing(0, total, total * 20 / 100, total), (30, 180, 17));
 
         // 阶段 2 自 75% 进入：窗口 20%，55% 结束，未触及 40%
         let enter = total * 3 / 4;
-        assert_eq!(r.pacing(1, enter, total * 65 / 100, total), (25, 150, 17));
-        assert_eq!(r.pacing(1, enter, total * 55 / 100, total), (20, 120, 15));
-        assert_eq!(r.pacing(1, enter, total * 30 / 100, total), (20, 120, 15));
+        assert_eq!(r.pacing(1, enter, total * 65 / 100, total), (25, 150, 14));
+        assert_eq!(r.pacing(1, enter, total * 55 / 100, total), (20, 120, 12));
+        assert_eq!(r.pacing(1, enter, total * 30 / 100, total), (20, 120, 12));
 
         // 阶段 3：直接推向终态，r/d 不变
         let enter = total * 60 / 100;
-        assert_eq!(r.pacing(2, enter, total * 55 / 100, total), (5, 60, 10));
-        assert_eq!(r.pacing(2, enter, total * 50 / 100, total), (1, 60, 10));
+        assert_eq!(r.pacing(2, enter, total * 55 / 100, total), (5, 60, 7));
+        assert_eq!(r.pacing(2, enter, total * 50 / 100, total), (1, 60, 7));
     }
 
     #[test]
@@ -2904,11 +2903,11 @@ mod tests {
         let r = Ruleset::default();
         let total = 1200 * 1000 * TMS;
         // 40% 恰为窗口起点：整段以整档为目标
-        assert_eq!(r.pacing(1, total * 40 / 100, total * 30 / 100, total), (20, 120, 15));
+        assert_eq!(r.pacing(1, total * 40 / 100, total * 30 / 100, total), (20, 120, 12));
         // 40% 恰为窗口终点：立刻跳到整档
         let enter = total * 60 / 100;
-        assert_eq!(r.pacing(1, enter, total * 41 / 100, total), (20, 123, 15));
-        assert_eq!(r.pacing(1, enter, total * 40 / 100, total), (10, 60, 10));
+        assert_eq!(r.pacing(1, enter, total * 41 / 100, total), (20, 123, 12));
+        assert_eq!(r.pacing(1, enter, total * 40 / 100, total), (10, 60, 7));
     }
 
     #[test]
@@ -2933,9 +2932,9 @@ mod tests {
         // 无消行 → 等 d；期间无活动块
         assert!(m.players[0].active.is_none());
         assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
-        // 阶段 1 的 d = 36 帧
-        run_quiet(&mut m, 35);
-        assert!(m.players[0].active.is_none(), "d 未走完不应出生");
+        // 无消行只等固定的 ARE：6 帧
+        run_quiet(&mut m, 5);
+        assert!(m.players[0].active.is_none(), "ARE 未走完不应出生");
         run_quiet(&mut m, 2);
         assert!(m.players[0].active.is_some());
         assert_eq!(m.players[0].phase, PlayerPhase::Play);
@@ -2946,15 +2945,15 @@ mod tests {
         let mut r = Ruleset::default();
         r.tick_hz = 120;
         assert_eq!(r.frame_ticks(), TPS / 120);
-        // 规则帧按 60Hz 定义：d = 36 帧 = 0.6s，120Hz 下等于 72 帧
-        assert_eq!(crate::frames_to_ticks(36), 36 * TPS / 60);
+        // 规则帧按 60Hz 定义：ARE = 6 帧 = 0.1s，120Hz 下等于 12 帧
+        assert_eq!(crate::frames_to_ticks(crate::ARE_FRAMES), 6 * TPS / 60);
         assert_eq!(r.lock_ticks, 500 * TMS);
 
         let mut m = Match::new(MatchConfig { players: 1, seed: 3, ruleset: r });
         m.players[0].active = Some(Active { kind: Kind::O, rot: 0, x: 4, y: 22000 });
         m.lock_piece(0);
         assert!(matches!(m.players[0].phase, PlayerPhase::Are(_)));
-        run_quiet(&mut m, 71);
+        run_quiet(&mut m, 11);
         assert!(m.players[0].active.is_none());
         run_quiet(&mut m, 2);
         assert!(m.players[0].active.is_some());

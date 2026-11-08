@@ -22,6 +22,9 @@ pub const MAX_T_US: u32 = 16_666;
 pub type Milli = i64;
 pub const MILLI_CELL: Milli = 1000;
 
+/// 消行延迟结束后的出生间隔（ruleset v9：恒为 6 帧 @60Hz）
+pub const ARE_FRAMES: u32 = 6;
+
 /// 引擎语义版本：任何影响模拟结果的引擎改动都必须递增（镜像失步的语义类防护——
 /// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
 pub const ENGINE_SEMANTICS: u32 = 3;
@@ -471,28 +474,28 @@ impl Default for Ruleset {
                     ratio_min_pm: 500,
                     g_frames: 60,
                     r_frames: 270,
-                    d_frames: 36,
+                    d_frames: 33,
                     window_pm: 400,
                 },
                 PhaseSpec {
                     ratio_min_pm: 100,
                     g_frames: 30,
                     r_frames: 180,
-                    d_frames: 20,
+                    d_frames: 17,
                     window_pm: 200,
                 },
                 PhaseSpec {
                     ratio_min_pm: 1,
                     g_frames: 10,
                     r_frames: 60,
-                    d_frames: 10,
+                    d_frames: 7,
                     window_pm: 100,
                 },
                 PhaseSpec {
                     ratio_min_pm: 0,
                     g_frames: 1,
                     r_frames: 60,
-                    d_frames: 10,
+                    d_frames: 7,
                     window_pm: 0,
                 },
             ],
