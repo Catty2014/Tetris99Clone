@@ -31,7 +31,7 @@ pub const ARE_FRAMES: u32 = 6;
 /// 客户端二进制落后于服务器时，tick 流本身无缺口、序号校验抓不到，只能靠版本号）
 pub const ENGINE_SEMANTICS: u32 = 4;
 /// 规则集身份；与 ruleset.toml 的 `id` 和服务器 hello 一致。
-pub const RULESET_ID: &str = "9f3c1a7e";
+pub const RULESET_ID: &str = "a37b3e7d57e51a8d";
 
 pub const W: usize = 10;
 pub const HIDDEN: usize = 4;
@@ -624,6 +624,43 @@ impl Ruleset {
     pub fn gravity_milli(g_frames: u32) -> Milli {
         60_000 / g_frames.max(1) as Milli
     }
+
+    /// 语义指纹：覆盖所有影响模拟结果的字段（不含 id 本身）。
+    /// 握手时服务器与客户端各算一次，不一致就拒绝连接——规则改了却忘了改
+    /// RULESET_ID 时，旧客户端不会静默跑偏，而是当场报错。
+    pub fn fingerprint(&self) -> u64 {
+        let mut v: Vec<u64> = vec![
+            self.preview as u64,
+            self.tick_hz as u64,
+            self.arr_ticks as u64,
+            self.irs as u64,
+            self.ihs as u64,
+            self.initial_trigger as u64,
+            self.lock_ticks as u64,
+            self.lock_resets_max as u64,
+            self.soft_milli_per_sec as u64,
+            self.pending_cap_rows as u64,
+            self.send_cap_rows as u64,
+            self.p_same_hole_pct as u64,
+            self.match_ticks as u64,
+            self.stall_accel as u64,
+            self.allow_rot180 as u64,
+            self.spawn_y_milli as u64,
+            ARE_FRAMES as u64,
+        ];
+        for p in &self.phases {
+            v.push(p.ratio_min_pm as u64);
+            v.push(p.g_frames as u64);
+            v.push(p.r_frames as u64);
+            v.push(p.d_frames as u64);
+            v.push(p.window_pm as u64);
+        }
+        v.extend(self.combo_bonus.iter().map(|x| *x as u64));
+        v.extend(self.target_bonus.iter().map(|x| *x as u64));
+        v.extend(self.badge_tier_units.iter().map(|x| *x as u64));
+        v.iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, &x| (h ^ x).wrapping_mul(0x100_0000_01b3))
+    }
 }
 
 /// 规则帧（60Hz）换算为引擎 tick；与引擎实际 tick_hz 无关
@@ -632,3 +669,14 @@ pub const fn frames_to_ticks(frames: u32) -> Ticks {
 }
 
 pub const MINUTES_TICKS: Ticks = TPS * 60;
+
+#[cfg(test)]
+mod ruleset_tests {
+    use super::*;
+
+    /// 规则一改，指纹就变；这条测试强制同步 RULESET_ID 与 ruleset.toml 的 id。
+    #[test]
+    fn ruleset_id_matches_fingerprint() {
+        assert_eq!(RULESET_ID, format!("{:016x}", Ruleset::default().fingerprint()));
+    }
+}

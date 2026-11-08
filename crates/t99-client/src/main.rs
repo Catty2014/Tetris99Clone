@@ -2630,6 +2630,18 @@ fn handle_server_msg(
     let v: serde_json::Value = match serde_json::from_str(&t) { Ok(v) => v, Err(_) => return true };
     match v["type"].as_str().unwrap_or("") {
         "hello" => {
+            // 规则指纹闸门：规则改了但客户端没重建时，镜像会与服务器静默跑偏。
+            // 服务器在 hello 里带 ruleset_fp，任何不一致当场拒绝并提示强制刷新。
+            if let Some(fp) = v["ruleset_fp"].as_str() {
+                let local = format!("{:016x}", base_ruleset.fingerprint());
+                if fp != local {
+                    *status.lock().unwrap() = format!(
+                        "规则集不一致（服务端 {fp} / 本地 {local}）：请按 Ctrl+Shift+R 强制刷新"
+                    );
+                    stats.lock().unwrap().connected = false;
+                    return false;
+                }
+            }
             *expected = None;
             {
                 let mut st = stats.lock().unwrap();

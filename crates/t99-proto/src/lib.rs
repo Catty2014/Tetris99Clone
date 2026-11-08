@@ -1025,7 +1025,7 @@ mod tests {
         assert!(s.contains(r#""seat":3"#));
         assert!(s.contains(r#""player_id":"human-1234""#));
         assert!(s.contains(r#""protocol":8"#));
-        assert!(s.contains(r#""ruleset":"9f3c1a7e""#));
+        assert!(s.contains(&format!(r#""ruleset":"{}""#, t99_core::RULESET_ID)));
     }
 
     /// snapshot → frame → snapshot roundtrip：Bot 可见字段逐位一致。

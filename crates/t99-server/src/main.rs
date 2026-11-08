@@ -464,7 +464,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     match m {
                         ToGame::ObserverJoin { idx } => {
                             let hello = serde_json::json!({
-                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
+                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
                                 "seat": -1, "role": "observer",
                                 "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                             });
@@ -506,7 +506,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
                 let hello = serde_json::json!({
-                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
+                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
                     "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
                     "player_id": c.id.clone(),
                     "role": if c.seat.is_some() { "player" } else { "observer" },
@@ -639,7 +639,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     ToGame::ObserverJoin { idx } => {
                         // 单线程回放：先 hello + 全部历史 tick，再激活直播，时序必然正确
                         let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
+                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
                             "seat": -1, "role": "observer",
                             "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
                         });
