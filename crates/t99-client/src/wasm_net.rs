@@ -97,10 +97,9 @@ fn connect(ctx: &Rc<Ctx>) {
                     close(&c);
                     return;
                 }
-                // 私有 hello（带 frame_hz）是 NetPlayerAdapter 的 setup；不交给镜像。
-                if v.get("frame_hz").is_some() {
+                // 玩家连接必须在 hello 后回 ready；观战端不回。hello 仍交给镜像处理。
+                if v["role"].as_str() == Some("player") {
                     send_text(&c, r#"{"type":"ready"}"#);
-                    return;
                 }
             }
         }

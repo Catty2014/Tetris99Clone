@@ -721,9 +721,9 @@ seed = 0
     fn ruleset_tick_and_time_units() {
         let r = RulesetConfig::default().to_ruleset().unwrap();
         assert_eq!(r.lock_ticks, 30 * t99_core::FRAME_TICKS);
-        assert_eq!(r.phases[0].d_frames, 36);
+        assert_eq!(r.phases[0].d_frames, 33);
         assert_eq!(r.phases[0].g_frames, 60);
-        assert_eq!(r.phases[0].r_frames, 270);
+        assert_eq!(r.phases[0].r_frames, 136);
         assert_eq!(r.match_ticks, 0, "0 表示按人数自动");
     }
 

@@ -24,26 +24,41 @@ use std::time::{Duration, Instant};
 
 use t99_core::{Key, Snapshot, TimedKey};
 
-pub const PROTOCOL: u32 = 8;
+pub const PROTOCOL: u32 = 9;
 pub const FRAME_DEADLINE: Duration = Duration::from_millis(16);
 pub const READY_DEADLINE: Duration = Duration::from_millis(2000);
 pub const MAX_CONSECUTIVE_MISS: u32 = 600;
 
+/// 唯一形态的握手：服务器拼的 JSON hello 与 NetPlayerAdapter 的 setup hello 合并为此结构。
+/// 玩家连接只收一条（席位适配器 setup 发出），观战端由服务器直接发送（`seats` 有值）。
 #[derive(Serialize, Debug)]
 pub struct Hello {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub protocol: u32,
     pub ruleset: &'static str,
-    pub frame_hz: u32,
-    /// 引擎内部席位编号
-    pub seat: usize,
+    /// 规则集指纹；stdio/WS 程序据此判断规则是否一致
+    pub ruleset_fp: String,
+    /// 本局序号（服务器单局恒为 1，语义同 match_no）
+    pub r#match: u64,
+    pub match_id: u64,
+    pub seed: u64,
+    pub players: usize,
+    pub tick_hz: u32,
+    /// 引擎内部席位编号；观战 -1
+    pub seat: i64,
     /// 外部身份；与 seat 分开
     pub player_id: String,
-    pub players: usize,
+    /// "player" / "observer"
+    pub role: &'static str,
     pub board: BoardSpec,
     pub preview: usize,
     pub keys: Vec<&'static str>,
+    pub time_limit_secs: u64,
+    pub stall_accel: bool,
+    /// 观战端专用：席位→PlayerID；玩家长缺省不发
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seats: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Debug)]
@@ -52,24 +67,73 @@ pub struct BoardSpec {
     pub h: usize,
 }
 
-pub fn hello_for(pid: usize, player_id: &str, players: usize, preview: usize) -> Hello {
-    Hello {
-        kind: "hello",
-        protocol: PROTOCOL,
-        ruleset: t99_core::RULESET_ID,
-        frame_hz: 60,
-        seat: pid,
-        player_id: player_id.to_string(),
-        players,
-        board: BoardSpec { w: t99_core::W, h: t99_core::H },
-        preview,
-        keys: vec![
-            "left_down", "left_up", "right_down", "right_up", "soft_down", "soft_up", "cw", "ccw",
-            "flip", "hard", "hold", "cw_down", "cw_up", "ccw_down", "ccw_up", "hold_down",
-            "hold_up", "target_badges", "target_kos", "target_attackers", "target_random",
-            "target_player", "noop",
-        ],
+impl Hello {
+    /// 全字段构造：服务器按本局参数生成，玩家与观战共用同一结构。
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_match(
+        match_no: u64,
+        match_id: u64,
+        seed: u64,
+        players: usize,
+        tick_hz: u32,
+        seat: i64,
+        player_id: impl Into<String>,
+        role: &'static str,
+        preview: usize,
+        time_limit_secs: u64,
+        stall_accel: bool,
+        ruleset_fp: String,
+        seats: Option<Vec<String>>,
+    ) -> Hello {
+        Hello {
+            kind: "hello",
+            protocol: PROTOCOL,
+            ruleset: t99_core::RULESET_ID,
+            ruleset_fp,
+            r#match: match_no,
+            match_id,
+            seed,
+            players,
+            tick_hz,
+            seat,
+            player_id: player_id.into(),
+            role,
+            board: BoardSpec { w: t99_core::W, h: t99_core::H },
+            preview,
+            keys: hello_keys(),
+            time_limit_secs,
+            stall_accel,
+            seats,
+        }
     }
+}
+
+fn hello_keys() -> Vec<&'static str> {
+    vec![
+        "left_down", "left_up", "right_down", "right_up", "soft_down", "soft_up", "cw", "ccw",
+        "flip", "hard", "hold", "cw_down", "cw_up", "ccw_down", "ccw_up", "hold_down",
+        "hold_up", "target_badges", "target_kos", "target_attackers", "target_random",
+        "target_player", "noop",
+    ]
+}
+
+/// 测试/无头局的最小握手：无服务器对局上下文（match/match_id/seed 全 0）。
+pub fn hello_for(pid: usize, player_id: &str, players: usize, preview: usize) -> Hello {
+    Hello::for_match(
+        0,
+        0,
+        0,
+        players,
+        60,
+        pid as i64,
+        player_id,
+        "player",
+        preview,
+        0,
+        false,
+        format!("{:016x}", t99_core::Ruleset::default().fingerprint()),
+        None,
+    )
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -778,23 +842,51 @@ pub struct NetPlayerAdapter {
     misses: u32,
     dead: bool,
     last_n: u64,
+    /// 程序发来的查询（type=query），由服务器每帧取走并回包
+    queries: std::collections::VecDeque<String>,
 }
 
 impl NetPlayerAdapter {
     pub fn new(label: impl Into<String>, tx: mpsc::Sender<String>, rx: mpsc::Receiver<String>) -> Self {
-        NetPlayerAdapter { label: label.into(), tx, rx, misses: 0, dead: false, last_n: 0 }
+        NetPlayerAdapter { label: label.into(), tx, rx, misses: 0, dead: false, last_n: 0, queries: Default::default() }
     }
 
     fn send(&self, s: &str) -> bool {
         self.tx.send(s.to_string()).is_ok()
     }
 
-    /// 读一行；None = 超时，Some("") = 断开
-    fn recv(&self, timeout: Duration) -> Option<String> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(line) => Some(line),
-            Err(RecvTimeoutError::Timeout) => None,
-            Err(RecvTimeoutError::Disconnected) => Some(String::new()),
+    /// `{"type":"query","what":"boards"}` 混在输入流里：入队并返回 true，不当作坏帧/输入。
+    fn queue_query(&mut self, line: &str) -> bool {
+        if !line.contains("query") {
+            return false;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v["type"].as_str() == Some("query") {
+                self.queries.push_back(v["what"].as_str().unwrap_or("").to_string());
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 读一行；None = 超时，Some("") = 断开。查询行被取走入队，不返回给调用方。
+    fn recv(&mut self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remain = deadline.saturating_duration_since(Instant::now());
+            if remain.is_zero() {
+                return None;
+            }
+            match self.rx.recv_timeout(remain) {
+                Ok(line) => {
+                    if self.queue_query(&line) {
+                        continue;
+                    }
+                    return Some(line);
+                }
+                Err(RecvTimeoutError::Timeout) => return None,
+                Err(RecvTimeoutError::Disconnected) => return Some(String::new()),
+            }
         }
     }
 }
@@ -858,6 +950,9 @@ impl PlayerAdapter for NetPlayerAdapter {
                         self.dead = true;
                         self.misses += 1;
                         return vec![];
+                    }
+                    if self.queue_query(&line) {
+                        continue;
                     }
                     if dbg && self.last_n < 5 {
                         eprintln!("[net:{}<-] {}", self.label, &line[..line.len().min(120)]);
@@ -935,6 +1030,9 @@ impl PlayerAdapter for NetPlayerAdapter {
                         self.misses += 1;
                         return Some(vec![]);
                     }
+                    if self.queue_query(&line) {
+                        continue;
+                    }
                     let val: serde_json::Value = match serde_json::from_str(&line) {
                         Ok(v) => v,
                         Err(_) => {
@@ -986,6 +1084,14 @@ impl PlayerAdapter for NetPlayerAdapter {
         self.dead
     }
 
+    fn take_query(&mut self) -> Option<String> {
+        self.queries.pop_front()
+    }
+
+    fn send_json(&mut self, msg: &str) {
+        let _ = self.send(msg);
+    }
+
     fn finish(&mut self, result: &ResultMsg) {
         if let Ok(msg) = serde_json::to_string(result) {
             self.send(&msg);
@@ -1030,8 +1136,57 @@ mod tests {
         assert!(s.contains(r#""type":"hello""#));
         assert!(s.contains(r#""seat":3"#));
         assert!(s.contains(r#""player_id":"human-1234""#));
-        assert!(s.contains(r#""protocol":8"#));
+        assert!(s.contains(r#""protocol":9"#));
         assert!(s.contains(&format!(r#""ruleset":"{}""#, t99_core::RULESET_ID)));
+        assert!(s.contains(r#""tick_hz":60"#));
+        assert!(s.contains(r#""ruleset_fp":""#));
+        assert!(s.contains(r#""match_id":0"#));
+        assert!(s.contains(r#""role":"player""#));
+        assert!(!s.contains("frame_hz"));
+        assert!(!s.contains(r#""seats":"#), "玩家 hello 不应带 seats");
+    }
+
+    #[test]
+    fn observer_hello_has_seats() {
+        let h = Hello::for_match(
+            1,
+            42,
+            7,
+            4,
+            60,
+            -1,
+            "obs-1",
+            "observer",
+            6,
+            120,
+            true,
+            "0123456789abcdef".to_string(),
+            Some(vec!["p0".into(), "bot-1".into()]),
+        );
+        let s = serde_json::to_string(&h).unwrap();
+        assert!(s.contains(r#""seat":-1"#));
+        assert!(s.contains(r#""role":"observer""#));
+        assert!(s.contains(r#""seats":["p0","bot-1"]"#));
+        assert!(s.contains(r#""time_limit_secs":120"#));
+        assert!(s.contains(r#""stall_accel":true"#));
+        assert!(!s.contains("frame_hz"));
+    }
+
+    #[test]
+    fn net_adapter_queues_query_and_returns_input() {
+        use std::sync::mpsc::channel;
+        let (tx_client, rx_client) = channel::<String>();
+        let (tx_in, rx_in) = channel::<String>();
+        let mut a = NetPlayerAdapter::new("net:test", tx_client, rx_in);
+        tx_in.send(r#"{"type":"query","what":"boards"}"#.to_string()).unwrap();
+        tx_in.send(r#"{"type":"input","n":0,"events":[]}"#.to_string()).unwrap();
+        let ev = a.try_input().expect("本帧 input 应正常返回");
+        assert!(ev.is_empty());
+        assert_eq!(a.consecutive_misses(), 0, "查询不应计入 misses");
+        assert_eq!(a.take_query().as_deref(), Some("boards"));
+        assert!(a.take_query().is_none());
+        a.send_json(r#"{"type":"boards","n":1,"rows":[]}"#);
+        assert_eq!(rx_client.try_recv().unwrap(), r#"{"type":"boards","n":1,"rows":[]}"#);
     }
 
     /// snapshot → frame → snapshot roundtrip：Bot 可见字段逐位一致。

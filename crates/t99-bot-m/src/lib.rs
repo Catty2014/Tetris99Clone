@@ -26,7 +26,7 @@ pub const ARR_FRAMES: u64 = 2;
 
 /// 服务器 hello.protocol
 pub const PROTOCOL_MIN: u32 = 5;
-pub const PROTOCOL_MAX: u32 = 8;
+pub const PROTOCOL_MAX: u32 = 9;
 
 // ———— 线协议（参赛方视角）———
 
@@ -2181,15 +2181,14 @@ pub fn run_ws(profile: Profile, url: &str, id: &str, key: &str) {
                     continue;
                 }
                 match v["type"].as_str().unwrap_or("") {
-                    "hello" if v.get("frame_hz").is_some() => {
+                    "hello" => {
+                        // v9：唯一形态 hello，同时承担 ready 握手与对局公告
                         let proto = v["protocol"].as_u64().unwrap_or(0) as u32;
                         if !(PROTOCOL_MIN..=PROTOCOL_MAX).contains(&proto) {
                             eprintln!("[t99-bot-{}] 协议不兼容: {}", profile.name, proto);
                             std::process::exit(2);
                         }
                         let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
-                    }
-                    "hello" => {
                         eprintln!(
                             "[t99-bot-{}] 对局 {}（seat {}）",
                             profile.name,

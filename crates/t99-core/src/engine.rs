@@ -2442,6 +2442,31 @@ impl Match {
         }
     }
 
+    /// 全部存活席位的可见区盘面（本帧输入应用前的状态），供拉取式查询一次构造。
+    /// 行数 20、每行 10 字符，映射与 `t99_proto::board_rows` 一致；按 pid 升序，包含调用者自己。
+    pub fn alive_board_rows(&self) -> Vec<(usize, Vec<String>)> {
+        let mut out = Vec::new();
+        for pid in 0..self.players.len() {
+            let p = &self.players[pid];
+            if !p.alive {
+                continue;
+            }
+            let rows = (0..H)
+                .map(|r| {
+                    (0..W)
+                        .map(|c| match p.board[(HIDDEN + r) * W + c] {
+                            0 => '.',
+                            CELL_GARBAGE => 'G',
+                            other => Kind::from_id(other).map(|k| k.ch()).unwrap_or('?'),
+                        })
+                        .collect::<String>()
+                })
+                .collect();
+            out.push((pid, rows));
+        }
+        out
+    }
+
     pub fn hash_state(&self) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         fn mix(h: &mut u64, b: u8) {
@@ -3573,5 +3598,28 @@ mod tests {
         }
         assert!(m.over.is_some());
         assert!(!m.players[0].alive);
+    }
+
+    #[test]
+    fn alive_board_rows_shape_and_garbage() {
+        let mut m = Match::new(MatchConfig { players: 3, seed: 5, ruleset: Ruleset::default() });
+        // p1 死亡：不应出现在结果里
+        m.players[1].alive = false;
+        // p0 可见区底行放垃圾，另放一个实体方块
+        let p0 = &mut m.players[0];
+        p0.board[(HIDDEN + H - 1) * W] = CELL_GARBAGE;
+        p0.board[(HIDDEN + H - 1) * W + 1] = Kind::T.id();
+        let rows = m.alive_board_rows();
+        assert_eq!(rows.len(), 2, "死者不在结果里");
+        assert_eq!(rows.iter().map(|(pid, _)| *pid).collect::<Vec<_>>(), vec![0, 2]);
+        for (_, board) in &rows {
+            assert_eq!(board.len(), H);
+            assert!(board.iter().all(|r| r.chars().count() == W));
+        }
+        let last = &rows[0].1[H - 1];
+        let chars: Vec<char> = last.chars().collect();
+        assert_eq!(chars[0], 'G');
+        assert_eq!(chars[1], Kind::T.ch());
+        assert_eq!(chars[2], '.');
     }
 }

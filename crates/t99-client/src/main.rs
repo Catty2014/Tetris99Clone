@@ -2834,11 +2834,10 @@ fn net_thread(
                             stats.lock().unwrap().connected = false;
                             return;
                         }
-                        // 私有 hello（带 frame_hz）是 NetPlayerAdapter 的 setup；
-                        // 它不含 match/seed，不能交给 mirror 的 hello 分支。
-                        if v.get("frame_hz").is_some() {
+                        // 玩家连接必须在 hello 后回 ready；观战端不回。
+                        // 同一条 hello 既含对局参数也含接口形状，处理完仍交给 mirror。
+                        if v["role"].as_str() == Some("player") {
                             let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
-                            continue;
                         }
                     }
                 }

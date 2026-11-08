@@ -18,11 +18,14 @@ use tungstenite::Message;
 use t99_bots::BotAdapter;
 use t99_core::engine::TargetPolicy;
 use t99_core::{Key, Match, MatchConfig, Ruleset, TMS, TimedKey, Ticks, RULESET_ID};
-use t99_proto::{board_rows, hello_for, parse_seat, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
+use t99_proto::{parse_seat, Hello, PlayerAdapter, ResultMsg, SeatProgram, SubprocessAdapter, FRAME_DEADLINE, MAX_CONSECUTIVE_MISS, PROTOCOL};
 
 /// 逻辑帧墙钟周期由 ruleset.tick_hz 决定；引擎时基本身是 frame_ticks，这里只负责节流。
 /// 读线程断开时投给写线程的收尾信号（JSON 文本帧不含 NUL，不会与业务消息冲突）
 const MSG_CLOSE: &str = "\u{0}close";
+
+/// 拉取式盘面查询的限频（tick）：同一席位至少间隔这么多帧才回包一次。
+const BOARD_QUERY_MIN_TICKS: u64 = 15;
 
 #[derive(Clone)]
 struct Args {
@@ -401,6 +404,53 @@ fn writer_loop(mut ws: tungstenite::WebSocket<std::net::TcpStream>, rx: mpsc::Re
     let _ = ws.flush();
 }
 
+/// 大厅等待期（seat_ids 尚未算出）的席位表：按当时已就座连接 ID，空位填 bot-<pid>。
+fn hall_seat_ids(hall: &Arc<Mutex<Hall>>, players: usize) -> Vec<String> {
+    let h = hall.lock().unwrap();
+    (0..players)
+        .map(|pid| {
+            h.clients
+                .iter()
+                .flatten()
+                .find(|c| c.seat == Some(pid))
+                .map(|c| c.id.clone())
+                .unwrap_or_else(|| format!("bot-{pid}"))
+        })
+        .collect()
+}
+
+/// 观战端 hello（seat=-1、role=observer、带席位表）；三处发送点共用。
+#[allow(clippy::too_many_arguments)]
+fn observer_hello_json(
+    match_no: u64,
+    match_id: u64,
+    seed: u64,
+    players: usize,
+    tick_hz: u32,
+    player_id: &str,
+    seats: Vec<String>,
+    time_limit_secs: u64,
+    stall_accel: bool,
+    ruleset_fp: &str,
+) -> String {
+    serde_json::to_string(&Hello::for_match(
+        match_no,
+        match_id,
+        seed,
+        players,
+        tick_hz,
+        -1,
+        player_id,
+        "observer",
+        6,
+        time_limit_secs,
+        stall_accel,
+        ruleset_fp.to_string(),
+        Some(seats),
+    ))
+    .unwrap_or_default()
+}
+
 fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, human_seats: usize, running: Arc<AtomicBool>) {
     use t99_proto::NetPlayerAdapter;
     // 单局服务器：一台服务器只服务一局（统计/调试口径唯一）；对局结束后驻留现场，
@@ -419,6 +469,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             .unwrap_or(0)
             << 12)
             | (match_no & 0xFFF);
+        let ruleset_fp = format!("{:016x}", args.ruleset.fingerprint());
 
         // 大厅：等人类席位坐满或超时
         let lobby_start = Instant::now();
@@ -463,13 +514,29 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 while let Ok(m) = rx.try_recv() {
                     match m {
                         ToGame::ObserverJoin { idx } => {
-                            let hello = serde_json::json!({
-                                "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
-                                "seat": -1, "role": "observer",
-                                "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
-                            });
+                            let seats = hall_seat_ids(&hall, players);
+                            let id = hall
+                                .lock()
+                                .unwrap()
+                                .clients
+                                .get(idx)
+                                .and_then(|c| c.as_ref())
+                                .map(|c| c.id.clone())
+                                .unwrap_or_default();
+                            let hello = observer_hello_json(
+                                match_no,
+                                match_id,
+                                seed,
+                                players,
+                                tick_hz as u32,
+                                &id,
+                                seats,
+                                args.time_limit_secs,
+                                args.stall_accel,
+                                &ruleset_fp,
+                            );
                             if let Some(Some(c)) = hall.lock().unwrap().clients.get(idx) {
-                                let _ = c.tx.send(hello.to_string());
+                                let _ = c.tx.send(hello);
                             }
                             if let Some(Some(c)) = hall.lock().unwrap().clients.get_mut(idx) {
                                 c.active = true;
@@ -525,23 +592,47 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                 })
                 .collect()
         };
-        // 每客户端下发专属 hello；席位→ID 映射只给观战端，玩家连接不下发，
-        // 避免在对局内暴露对手身份（同族识别与结盟的入口）。
+        // 每席位一条唯一形态 hello：玩家由适配器 setup 发送，观战端由服务器直接发送。
+        // 席位→ID 映射只给观战端，玩家连接不下发，避免在对局内暴露对手身份
+        // （同族识别与结盟的入口）。
+        let hellos: Vec<Hello> = (0..players)
+            .map(|pid| {
+                Hello::for_match(
+                    match_no,
+                    match_id,
+                    seed,
+                    players,
+                    tick_hz as u32,
+                    pid as i64,
+                    seat_ids[pid].clone(),
+                    "player",
+                    6,
+                    args.time_limit_secs,
+                    args.stall_accel,
+                    ruleset_fp.clone(),
+                    None,
+                )
+            })
+            .collect();
         {
             let h = hall.lock().unwrap();
             for c in h.clients.iter().flatten() {
-                let mut hello = serde_json::json!({
-                    "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
-                    "seat": c.seat.map(|s| s as i64).unwrap_or(-1),
-                    "player_id": c.id.clone(),
-                    "role": if c.seat.is_some() { "player" } else { "observer" },
-                    "time_limit_secs": args.time_limit_secs,
-                    "stall_accel": args.stall_accel,
-                });
-                if c.seat.is_none() {
-                    hello["seats"] = serde_json::json!(seat_ids);
+                if c.seat.is_some() {
+                    continue;
                 }
-                let _ = c.tx.send(hello.to_string());
+                let msg = observer_hello_json(
+                    match_no,
+                    match_id,
+                    seed,
+                    players,
+                    tick_hz as u32,
+                    &c.id,
+                    seat_ids.clone(),
+                    args.time_limit_secs,
+                    args.stall_accel,
+                    &ruleset_fp,
+                );
+                let _ = c.tx.send(msg);
             }
         }
 
@@ -577,7 +668,7 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
         // 外部程序握手：ready 超时/拒绝 → 直接判负（与正式 Arena 语义一致）
         for (pid, b) in bots.iter_mut().enumerate() {
             if let Some(b) = b {
-                match b.setup(&hello_for(pid, &seat_ids[pid], players, 6)) {
+                match b.setup(&hellos[pid]) {
                     Err(e) => {
                         eprintln!("[seat {pid}] {} setup 失败: {e:?}", b.name());
                         engine.kill(pid, "setup_failed");
@@ -652,16 +743,30 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     }
                     ToGame::ObserverJoin { idx } => {
                         // 单线程回放：先 hello + 全部历史 tick，再激活直播，时序必然正确
-                        let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "ruleset_fp": format!("{:016x}", args.ruleset.fingerprint()), "seed": seed, "players": players, "tick_hz": tick_hz,
-                            "seat": -1, "role": "observer",
-                            "seats": seat_ids,
-                            "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
-                        });
+                        let id = hall
+                            .lock()
+                            .unwrap()
+                            .clients
+                            .get(idx)
+                            .and_then(|c| c.as_ref())
+                            .map(|c| c.id.clone())
+                            .unwrap_or_default();
+                        let hello = observer_hello_json(
+                            match_no,
+                            match_id,
+                            seed,
+                            players,
+                            tick_hz as u32,
+                            &id,
+                            seat_ids.clone(),
+                            args.time_limit_secs,
+                            args.stall_accel,
+                            &ruleset_fp,
+                        );
                         {
                             let h = hall.lock().unwrap();
                             if let Some(Some(c)) = h.clients.get(idx) {
-                                let _ = c.tx.send(hello.to_string());
+                                let _ = c.tx.send(hello);
                                 for t in &history {
                                     if c.tx.send(t.clone()).is_err() {
                                         break;
@@ -757,31 +862,32 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
                     }
                 }
             }
-            // 拉取式查询：程序可请求全部存活对手的盘面；每席限频 15 tick
+            // 拉取式查询：程序可请求全部存活席位（含自己）的盘面；每席限频 BOARD_QUERY_MIN_TICKS。
+            // 收集 → 一次构造 → 扇出：同一 tick 内所有请求者拿到同一个 String。
+            let mut req: Vec<usize> = Vec::new();
             for pid in 0..players {
-                let mut queries: Vec<String> = Vec::new();
-                if let Some(b) = bots[pid].as_mut() {
-                    while let Some(q) = b.take_query() {
-                        queries.push(q);
+                loop {
+                    let Some(what) = bots[pid].as_mut().and_then(|b| b.take_query()) else {
+                        break;
+                    };
+                    if what == "boards" && engine.frame_n >= last_boards[pid] + BOARD_QUERY_MIN_TICKS {
+                        // 入列即更新：同 tick 多次请求自然去重
+                        last_boards[pid] = engine.frame_n;
+                        req.push(pid);
                     }
                 }
-                for what in queries {
-                    if what != "boards" || engine.frame_n < last_boards[pid] + 15 {
-                        continue;
-                    }
-                    last_boards[pid] = engine.frame_n;
-                    let mut rows = Vec::new();
-                    for op in 0..players {
-                        if !engine.players[op].alive {
-                            continue;
-                        }
-                        let snap = engine.snapshot(op);
-                        rows.push(serde_json::json!([op, board_rows(&snap)]));
-                    }
-                    let msg = serde_json::json!({
-                        "type": "boards", "n": engine.frame_n, "rows": rows,
-                    })
-                    .to_string();
+            }
+            if !req.is_empty() {
+                let rows = engine.alive_board_rows();
+                let msg = serde_json::json!({
+                    "type": "boards", "n": engine.frame_n,
+                    "rows": rows
+                        .iter()
+                        .map(|(pid, rows)| serde_json::json!([pid, rows]))
+                        .collect::<Vec<_>>(),
+                })
+                .to_string();
+                for pid in req {
                     if let Some(b) = bots[pid].as_mut() {
                         b.send_json(&msg);
                     }
@@ -1039,15 +1145,30 @@ fn game_loop(args: Args, hall: Arc<Mutex<Hall>>, rx: mpsc::Receiver<ToGame>, hum
             while let Ok(m) = rx.try_recv() {
                 match m {
                     ToGame::ObserverJoin { idx } => {
-                        let hello = serde_json::json!({
-                            "type": "hello", "match": match_no, "match_id": match_id, "protocol": PROTOCOL, "ruleset": RULESET_ID, "seed": seed, "players": players, "tick_hz": tick_hz,
-                            "seat": -1, "role": "observer",
-                            "time_limit_secs": args.time_limit_secs, "stall_accel": args.stall_accel,
-                        });
+                        let id = hall
+                            .lock()
+                            .unwrap()
+                            .clients
+                            .get(idx)
+                            .and_then(|c| c.as_ref())
+                            .map(|c| c.id.clone())
+                            .unwrap_or_default();
+                        let hello = observer_hello_json(
+                            match_no,
+                            match_id,
+                            seed,
+                            players,
+                            tick_hz as u32,
+                            &id,
+                            seat_ids.clone(),
+                            args.time_limit_secs,
+                            args.stall_accel,
+                            &ruleset_fp,
+                        );
                         {
                             let h = hall.lock().unwrap();
                             if let Some(Some(c)) = h.clients.get(idx) {
-                                let _ = c.tx.send(hello.to_string());
+                                let _ = c.tx.send(hello);
                                 for t in &history {
                                     if c.tx.send(t.clone()).is_err() {
                                         break;

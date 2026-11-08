@@ -15,7 +15,7 @@ use t99_core::TimedKey;
 
 /// 容忍区间与全部 t99 外部程序一致：读取方对可选字段用 serde default。
 pub const PROTOCOL_MIN: u32 = 5;
-pub const PROTOCOL_MAX: u32 = 8;
+pub const PROTOCOL_MAX: u32 = 9;
 
 const HELP: &str = r#"t99-bot-basic / t99-bot-advanced — 公开档外部程序（参考实现/可修改陪练）
 
@@ -36,7 +36,7 @@ const HELP: &str = r#"t99-bot-basic / t99-bot-advanced — 公开档外部程序
 说明:
   - 本程序的决策核与进程内 Bot（t99-bots）为同一份代码，可自由修改。
   - 帧响应预算 16.666ms（实际判定 16ms），连续 600 帧无有效响应判负。
-  - 协议 v8；可选字段缺席按默认处理（容忍 5..=8）。
+  - 协议 v9；可选字段缺席按默认处理（容忍 5..=9）。
 "#;
 
 const HELP_EN: &str = r#"t99-bot-basic / t99-bot-advanced — public-tier external programs (reference implementation / modifiable sparring partner)
@@ -58,7 +58,7 @@ Two ways to connect (no arguments = subprocess stdio mode):
 Notes:
   - The decision core is the same code as the in-process bots (t99-bots); modify freely.
   - Frame response budget 16.666ms (enforced at 16ms); 600 consecutive unanswered frames → loss.
-  - Protocol v8; absent optional fields fall back to defaults (tolerates 5..=8).
+  - Protocol v9; absent optional fields fall back to defaults (tolerates 5..=9).
 "#;
 
 fn lang_is_zh() -> bool {
@@ -193,11 +193,10 @@ fn run_ws(make: fn() -> Box<dyn Bot>, url: &str, id: &str, key: &str) {
                 let line = t.to_string();
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
                 match v["type"].as_str().unwrap_or("") {
-                    "hello" if v.get("frame_hz").is_some() => {
+                    "hello" => {
+                        // v9：唯一形态 hello，同时承担 ready 握手与对局公告
                         check_protocol(v["protocol"].as_u64().unwrap_or(0) as u32, "ext");
                         let _ = ws.send(Message::Text(r#"{"type":"ready"}"#.into()));
-                    }
-                    "hello" => {
                         eprintln!(
                             "[t99-bot-ext] 对局 {}（seat {}）",
                             v["match_id"].as_u64().unwrap_or(0),
