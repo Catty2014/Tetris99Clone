@@ -460,7 +460,7 @@ impl Default for RulesetSection {
             board_height: 20,
             hidden_rows: 4,
             preview: 6,
-            match_seconds: 900,
+            match_seconds: 0,
             bag_randomizer: true,
             srs: true,
             hold: true,
@@ -724,7 +724,7 @@ seed = 0
         assert_eq!(r.phases[0].d_frames, 36);
         assert_eq!(r.phases[0].g_frames, 60);
         assert_eq!(r.phases[0].r_frames, 270);
-        assert_eq!(r.match_ticks, 900 * 1000 * t99_core::TMS);
+        assert_eq!(r.match_ticks, 0, "0 表示按人数自动");
     }
 
     #[test]
@@ -750,9 +750,9 @@ seed = 0
         assert_eq!(r.tick_hz, 120);
         assert_eq!(r.frame_ticks(), t99_core::TPS / 120);
         assert_eq!(r.lock_ticks, 30 * (t99_core::TPS / 120));
-        assert_eq!(r.phases[0].are, 6 * (t99_core::TPS / 120));
-        // match_seconds 是绝对时间
-        assert_eq!(r.match_ticks, 900 * 1000 * t99_core::TMS);
+        assert_eq!(r.phases[0].g_frames, 60);
+        // match_seconds = 0 表示按人数自动
+        assert_eq!(r.match_ticks, 0);
 
         c.ruleset.tick_hz = 0;
         assert!(c.to_ruleset().is_err());

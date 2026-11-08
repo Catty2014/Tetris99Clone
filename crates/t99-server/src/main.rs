@@ -90,7 +90,7 @@ const HELP_ZH: &str = r#"t99-server — 单局权威服务器（stdio 子进程 
   --ids LIST          逗号分隔的 PlayerID 允许列表（glob）；缺省接受任意非空 ID，
                       lobby 且未提供时读取 server.toml auth.id_files
   --seed S            对局种子（0 = 随机并在启动时打印；缺省 0）
-  --time-limit-secs S 对局倒计时（0 = 按人数自动：4p=5min → 99p=15min；缺省 0）
+  --time-limit-secs S 对局倒计时（0 = 按人数自动：4p=5min → 99p=20min；缺省 0）
   --max-frames F      帧数硬上限（缺省随时间预算）
   --stall-accel 1|0   0 杀 60s 后倒计时按对局时钟倍速燃烧（展览/自测机制，正式评测关闭）
   --loglevel L        ERROR/WARN/INFO/DEBUG/TRACE（默认 INFO）
@@ -136,7 +136,7 @@ Options:
   --ids LIST          comma-separated PlayerID allowlist (glob); default accepts any
                       non-empty ID; in lobby without --ids, server.toml auth.id_files is read
   --seed S            match seed (0 = random, printed at startup; default 0)
-  --time-limit-secs S match countdown (0 = auto by player count: 4p=5min → 99p=15min; default 0)
+  --time-limit-secs S match countdown (0 = auto by player count: 4p=5min → 99p=20min; default 0)
   --max-frames F      hard frame cap (default follows the time budget)
   --stall-accel 1|0   after 60s of zero kills, burn the countdown faster (exhibition/self-test
                       mechanism; disabled in official evaluation)

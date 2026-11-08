@@ -18,7 +18,7 @@ board_height = 20
 hidden_rows = 4             # 允许 2..20
 
 preview = 6
-match_seconds = 900         # 99p 15min；0 = 按玩家人数自动
+match_seconds = 0           # 0 = 按玩家人数自动：4p 5min → 99p 20min
 
 # 跨阶段不变量
 bag_randomizer = true
