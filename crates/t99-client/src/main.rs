@@ -165,6 +165,9 @@ struct NetStats {
     /// 内部：上一 tick 的序号与到达时刻
     last_tick_n: u64,
     last_tick_at: Option<Instant>,
+    /// 内部：服务器 tick 时钟锚点（最近一次「跟得上」时的序号与本地时刻）
+    clock_n: u64,
+    clock_at: Option<Instant>,
     /// 内部：已发 ping 数 / 收到 pong 数
     pings: u32,
     pongs: u32,
@@ -425,16 +428,25 @@ struct PrevPiece {
     y_milli: i64,
 }
 
-/// 调试 HUD 显隐开关（反斜杠）：左右两条调试信息一起切换。
+/// 调试 HUD 三态开关（反斜杠 `\` 循环）：
+///   1 = 只显示左边（PlayerID/MatchID + 连接性）  2 = 左边 + 右下调试栏  3 = 全关
+/// 启动默认 1；按 `\` 依次 1→2→3→1。
 #[derive(Resource)]
 struct DebugHud {
-    visible: bool,
+    mode: u8,
 }
 
 impl Default for DebugHud {
     fn default() -> Self {
-        Self { visible: true }
+        Self { mode: 1 }
     }
+}
+
+/// 追帧控制（观战端）：镜像落后服务器超过 60s 帧数时置位，
+/// sync 由此跳过整帧渲染，让出 CPU 给 tick 重演；落后回到 1s 内复位。
+#[derive(Resource, Default)]
+struct Catchup {
+    active: bool,
 }
 
 /// 观战编号输入缓冲：0–9 最多两位，Enter 立即应用，静默 3 秒自动应用。
@@ -610,6 +622,9 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     ];
 
     let mut hud = Vec::new();
+    // 右上常显面板本次只保留 名次(hud[5])/倒计时(hud[6])；存活/徽章/消行/目标/相位均改由
+    // 下文 sync 逐帧填充文本（消行-送出-APM 移入右下调试栏，存活/徽章面板整个移除）。
+    // 初始文本为空，避免引擎未就绪时闪出旧标签。
     let stats: [(&str, f32); 5] = [
         ("存活", 300.0),
         ("徽章", 270.0),
@@ -617,8 +632,8 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         ("目标", 210.0),
         ("相位", 180.0),
     ];
-    for (s, y) in stats {
-        let e = text(&mut cmd, &font, s, 16.0, Color::srgb(0.8, 0.83, 0.9), Vec2::new(345.0, y));
+    for (_label, y) in stats {
+        let e = text(&mut cmd, &font, "", 16.0, Color::srgb(0.8, 0.83, 0.9), Vec2::new(345.0, y));
         cmd.entity(e).insert(bevy::sprite::Anchor::CenterRight);
         hud.push(e);
     }
@@ -637,6 +652,16 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
         cmd.entity(e).insert(bevy::sprite::Anchor::BottomRight);
         e
     });
+    // 可见性初始化：
+    //   hud[0]/hud[1]（存活/相位、徽章/KO/块）本次移除，永久隐藏；
+    //   hud[3]/hud[4]/hud[7] 与 dbg_right_bg 属右下调试栏，随调试态 1（启动默认）隐藏，
+    //   状态 2 才显示。右侧可见性由 toggle_debug_hud 维护。
+    for e in [hud[0], hud[1]] {
+        cmd.entity(e).insert(Visibility::Hidden);
+    }
+    for e in [hud[2], hud[3], hud[4], hud[7]] {
+        cmd.entity(e).insert(Visibility::Hidden);
+    }
     hud.push(text(
         &mut cmd,
         &font,
@@ -702,11 +727,13 @@ fn setup(mut cmd: Commands, ui_font: Res<UiFont>, display: Res<DisplaySettings>)
     };
     let dbg_top_bg = strip_bg(&mut cmd);
     let dbg_bot_bg = strip_bg(&mut cmd);
-    // 右下调试 HUD 背衬：位置/尺寸由 place_debug_hud 按窗口右下角逐帧设定
+    // 右下调试 HUD 背衬：位置/尺寸由 place_debug_hud 按窗口右下角逐帧设定；
+    // 随调试态 1（启动默认）隐藏，状态 2 显示
     let dbg_right_bg = cmd
         .spawn((
-            Sprite::from_color(Color::srgba(0.03, 0.04, 0.06, 0.70), Vec2::new(460.0, 86.0)),
+            Sprite::from_color(Color::srgba(0.03, 0.04, 0.06, 0.70), Vec2::new(460.0, 100.0)),
             Transform::from_xyz(0.0, 0.0, 50.0),
+            Visibility::Hidden,
         ))
         .id();
     let dbg_top = cmd
@@ -1197,7 +1224,8 @@ fn observer_spectate_input(
     }
 }
 
-/// 调试 HUD 开关：反斜杠翻转左右两条调试信息的显示。
+/// 调试 HUD 三态开关：反斜杠 `\` 在「只显左侧 → 左侧+右下调试栏 → 全关」间循环。
+/// 启动时的初始显隐（左显/右下隐）由 setup 内固定，本函数只负责翻状态。
 fn toggle_debug_hud(
     keys: Res<ButtonInput<KeyCode>>,
     keymap: Res<Keymap>,
@@ -1208,26 +1236,73 @@ fn toggle_debug_hud(
     if !keymap.debug_hud.iter().any(|k| keys.just_pressed(*k)) {
         return;
     }
-    dbg.visible = !dbg.visible;
-    let vis = if dbg.visible {
-        Visibility::Visible
-    } else {
-        Visibility::Hidden
-    };
-    for e in [
-        views.dbg_top,
-        views.dbg_top_bg,
-        views.dbg_bot,
-        views.dbg_bot_bg,
-        views.hud[3],
-        views.hud[4],
-        views.hud[7],
-        views.dbg_right_bg,
-    ] {
+    dbg.mode = dbg.mode % 3 + 1;
+    // 左侧两行（PlayerID/MatchID + 连接性/ID）：状态 1、2 显示，状态 3 关
+    let left_vis = if dbg.mode != 3 { Visibility::Visible } else { Visibility::Hidden };
+    for e in [views.dbg_top, views.dbg_top_bg, views.dbg_bot, views.dbg_bot_bg] {
         if let Ok(mut v) = vq.get_mut(e) {
-            *v = vis;
+            *v = left_vis;
         }
     }
+    // 右下调试栏（目标/combo/参数/消行-APM）：仅状态 2 显示
+    let right_vis = if dbg.mode == 2 { Visibility::Visible } else { Visibility::Hidden };
+    for e in [views.hud[2], views.hud[3], views.hud[4], views.hud[7], views.dbg_right_bg] {
+        if let Ok(mut v) = vq.get_mut(e) {
+            *v = right_vis;
+        }
+    }
+}
+
+// ———— 观战端追帧 ————
+
+/// 追帧状态机（纯函数便于单测）：积压估计超过 60s（画面已慢于服务器 1 分钟）
+/// 进入追帧；回落到 ≤1s 恢复渲染；中间态维持，滞回防抖。
+fn catchup_step(active: bool, lag_ms: f32) -> bool {
+    if lag_ms > 60_000.0 {
+        return true;
+    }
+    if active && lag_ms <= 1_000.0 {
+        return false;
+    }
+    active
+}
+
+/// 追帧判定（观战/本地镜像端）：
+/// 重演速度本身总能跟上一条消息（消息到手即同步消耗），真正的滞后发生在
+/// 到达节奏层——积压的 tick 以远快于实时周期的速度成串到达时，说明客户端
+/// 正在消化一段落后的历史（TCP/浏览器事件队列积压，obs 接入慢的典型形态）。
+/// 期间把 sync 整帧跳过（画面阻滞在最后一帧），把 CPU 让给重演与消息排空。
+fn update_catchup(session: Res<Session>, mut ctl: ResMut<Catchup>) {
+    // 只有观战端需要追帧；玩家端冻结画面会影响操作
+    let Session::Net { stats, observer, .. } = &*session else { return };
+    if !*observer {
+        ctl.active = false;
+        return;
+    }
+    let st = stats.lock().unwrap().clone();
+    if !st.connected {
+        // 断线后镜像将重建，旧积压分作废
+        ctl.active = false;
+        return;
+    }
+    let Some(at) = st.clock_at else {
+        ctl.active = false;
+        return;
+    };
+    // tick 流停了 >1s（对局结束/服务器停帧）：解除冻结，避免画面常黑
+    if st.last_tick_at.map_or(true, |t| t.elapsed() > Duration::from_millis(1000)) {
+        ctl.active = false;
+        return;
+    }
+    let tps = if st.server_tps > 1.0 { st.server_tps } else { 60.0 };
+    let expected = st.clock_n as f32 + tps * at.elapsed().as_secs_f32();
+    let backlog = (expected - st.last_tick_n as f32).max(0.0);
+    ctl.active = catchup_step(ctl.active, backlog * 1000.0 / tps);
+}
+
+/// sync 的 run_if 条件：追帧期间整帧跳过渲染（画面阻滞在最后一帧）。
+fn render_paused_by_catchup(ctl: Res<Catchup>) -> bool {
+    !ctl.active
 }
 
 /// 返回本帧应补发的离散方向事件；不直接碰 Bevy，便于单测。
@@ -1467,6 +1542,21 @@ mod repeat_tests {
         assert!(cells.contains(&(9, 4)), "T bottom middle: {cells:?}");
         assert!(!cells.contains(&(10, 4)), "must not overlap stack: {cells:?}");
     }
+
+    #[test]
+    fn catchup_engages_over_60s_lag() {
+        // 60Hz：落后 3601 帧（≈1 分钟）即追帧；3599 帧且未追帧则保持原态；
+        // 追帧中在 60s 阈值以下仍保持着，直到 ≤1s 才恢复（滞回防抖）
+        assert!(catchup_step(false, 60_100.0));
+        assert!(!catchup_step(false, 60_000.0));
+        assert!(!catchup_step(false, 59_900.0));
+        assert!(catchup_step(true, 59_900.0));
+        // 追帧中回到 ≤1s 才恢复渲染（滞回）
+        assert!(!catchup_step(true, 1_000.0));
+        assert!(catchup_step(true, 1_001.0));
+        // 从未落后不触发
+        assert!(!catchup_step(false, 0.0));
+    }
 }
 
 fn drain_input(queue: &mut InputQueue) -> Vec<TimedKey> {
@@ -1665,7 +1755,13 @@ fn set_debug_hud_text(
     set_text(text_q, views.dbg_bot, String::new());
     match stat {
         Some(st) => {
-            let pid = if st.player_id.is_empty() { "(observer)".to_string() } else { st.player_id };
+            // 观战者在服务端没有 player_id：显示被观战席位的标识。
+            // 服务端 hello 不下发席位名（协议不变），用 1-based 座位号 #n（与「观战 #n」一致）。
+            let pid = if st.player_id.is_empty() {
+                session.with_engine(|_, seat| format!("#{}", seat + 1)).unwrap_or_else(|| "(observer)".to_string())
+            } else {
+                st.player_id
+            };
             let mid = if st.match_id == 0 { "-".to_string() } else { format!("{:x}", st.match_id) };
             set_text(text_q, views.dbg_top, format!("PlayerID {pid} | MatchID {mid}"));
             let status = if st.connected { "Connected" } else { "Disconnected" };
@@ -1727,10 +1823,11 @@ fn place_debug_hud(
             tr.translation = Vec3::new(-half_w + mx - 9.0 + w / 2.0, cy, 50.0);
         }
     }
-    // 右下调试 HUD 背衬：覆盖「目标 / combo-b2b-G / 相位参数」三行文本（z=50，文本 z=51）
+    // 右下调试 HUD 背衬：覆盖「目标 / combo-b2b-G / 相位参数 / 消行-送出-APM」四行文本
+    // （z=50，文本 z=51）；四行按原节奏排布（间距 24/22/24），背衬随新行加高 14
     if let Ok((_, mut sp, mut tr)) = vq.get_mut(views.dbg_right_bg) {
-        sp.custom_size = Some(Vec2::new(460.0, 86.0));
-        tr.translation = Vec3::new(half_w - 236.0, -half_h + 68.0, 50.0);
+        sp.custom_size = Some(Vec2::new(460.0, 100.0));
+        tr.translation = Vec3::new(half_w - 236.0, -half_h + 76.0, 50.0);
     }
 }
 
@@ -2047,8 +2144,8 @@ fn sync(
         hide(&mut vq, &views.meter[used..]);
     }
     // —— HUD ——
-    set_text(&mut text_q, views.hud[0], format!("存活 {}/{} 相位{}", s.alive.len(), session.with_engine(|e, _| e.players.len()).unwrap_or(0), session.with_engine(|e, _| e.phase_idx + 1).unwrap_or(1)));
-    set_text(&mut text_q, views.hud[1], format!("徽章{} KO{} 块{}", s.badge_units, s.ko, s.pieces));
+    // 右上常显只剩 hud[5] 名次、hud[6] 倒计时；存活/相位、徽章/KO/块已移除，
+    // 消行/送出/APM（hud[2]）并入右下调试栏。
     set_text(
         &mut text_q,
         views.hud[2],
@@ -2211,21 +2308,19 @@ fn sync(
     set_span(&mut span_q, views.judge_num, judge_num_txt);
     set_text(&mut text_q, views.judge_sub, combo_txt);
     set_span(&mut span_q, views.judge_sub_num, combo_num_txt);
-    // HUD 列：贴窗口右缘（窗口自适应）；调试堆移右下角
+    // HUD 列：贴窗口右缘（窗口自适应）；调试堆移右下角，消行-送出-APM 为最新一行
     {
         let hud_x = half_w - 14.0;
         let spots = [
-            (views.hud[0], hud_x, 300.0, 0.0), // 存活/相位
-            (views.hud[1], hud_x, 270.0, 0.0), // 徽章/KO/块
-            (views.hud[2], hud_x, 240.0, 0.0), // 消行/送出/APM
             (views.hud[5], hud_x, 368.0, 0.0), // 名次
             // 倒计时：主棋盘正上方水平居中（不与 judge/judge_sub/标题重叠）
             (views.hud[6], 0.0, 342.0, 0.0),
-            // 调试堆：目标 / combo-b2b-G / 相位参数 → 右下角（BottomRight 锚定）
+            // 右下调试栏：目标 / combo-b2b-G / 相位参数 / 消行-送出-APM（BottomRight 锚定）
             // z=51：压在 dbg_right_bg（z=50）之上
             (views.hud[3], hud_x, -half_h + 40.0, 51.0),
             (views.hud[4], hud_x, -half_h + 64.0, 51.0),
             (views.hud[7], hud_x, -half_h + 86.0, 51.0),
+            (views.hud[2], hud_x, -half_h + 110.0, 51.0),
         ];
         for (e, x, y, z) in spots {
             if let Ok(mut tr) = dbg_tr.0.get_mut(e) {
@@ -2607,6 +2702,20 @@ fn handle_server_msg(
                 }
                 st.last_tick_n = tn;
                 st.last_tick_at = Some(now);
+                // 服务器 tick 时钟：正常跟得上时就地重锚；落后时不重锚，
+                // 「按速率应到的帧号 − 实际收到」即积压量。
+                let tps = if st.server_tps > 1.0 { st.server_tps } else { 60.0 };
+                let rebase = match st.clock_at {
+                    Some(at) => {
+                        let expected = st.clock_n as f32 + tps * at.elapsed().as_secs_f32();
+                        tn as f32 + 2.0 >= expected
+                    }
+                    None => true,
+                };
+                if rebase {
+                    st.clock_n = tn;
+                    st.clock_at = Some(now);
+                }
             }
             // 序号连续性校验：重复/缺帧即失步（镜像多跑帧会导致垃圾提前灌满等假象）
             if let (Some(tn), Some(exp)) = (tn, *expected) {
@@ -2617,7 +2726,8 @@ fn handle_server_msg(
                 }
             }
             let mut g = mirror.lock().unwrap();
-            if let Some(e) = g.engine.as_mut() {
+            // 先按引擎现有人数解析本 tick 的输入（只读借用），随后重演一帧
+            let inputs: Vec<Vec<TimedKey>> = g.engine.as_ref().map(|e| {
                 let n = e.players.len();
                 let mut inputs: Vec<Vec<TimedKey>> = vec![vec![]; n];
                 if let Some(arr) = v["in"].as_array() {
@@ -2638,6 +2748,10 @@ fn handle_server_msg(
                         }
                     }
                 }
+                inputs
+            }).unwrap_or_default();
+            // 重演一帧；落后量由 NetStats 的 tick 时钟给出
+            if let Some(e) = g.engine.as_mut() {
                 e.frame(&inputs);
             }
             *expected = Some(tn.unwrap_or(0) + 1);
@@ -3041,12 +3155,22 @@ fn main() {
         .insert_resource(timing)
         .insert_resource(display)
         .insert_resource(keymap)
-        .init_resource::<DebugHud>()
+        .insert_resource(DebugHud::default())
+        .init_resource::<Catchup>()
         .init_resource::<SpectateInput>()
         .add_systems(Startup, (load_ui_font, setup).chain())
         .add_systems(
             Update,
-            (fit_camera, sync_tick_rate, poll_input, observer_spectate_input, toggle_debug_hud, sync).chain(),
+            (
+                fit_camera,
+                sync_tick_rate,
+                poll_input,
+                observer_spectate_input,
+                toggle_debug_hud,
+                update_catchup,
+                sync.run_if(render_paused_by_catchup),
+            )
+                .chain(),
         )
         .add_systems(FixedUpdate, tick);
     #[cfg(target_arch = "wasm32")]
