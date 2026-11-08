@@ -2876,26 +2876,26 @@ mod tests {
         let r = Ruleset::default();
         let total = 1200 * 1000 * TMS;
         // T >= 75%：阶段 1 恒定
-        assert_eq!(r.pacing(0, total, total, total), (60, 270, 33));
-        assert_eq!(r.pacing(0, total, total * 3 / 4, total), (60, 270, 33));
-        // T = 55%：窗口过半
-        assert_eq!(r.pacing(0, total, total * 55 / 100, total), (52, 247, 29));
+        assert_eq!(r.pacing(0, total, total, total), (60, 136, 33));
+        assert_eq!(r.pacing(0, total, total * 3 / 4, total), (60, 136, 33));
+        // T = 55%：窗口过半，r 的中点是 (136+90)/2 = 113
+        assert_eq!(r.pacing(0, total, total * 55 / 100, total), (52, 124, 29));
         // T = 40%：7a 触发前的最后一刻
-        assert_eq!(r.pacing(0, total, total * 40 / 100, total), (46, 230, 26));
+        assert_eq!(r.pacing(0, total, total * 40 / 100, total), (46, 115, 26));
         // T = 35%：整档走完
-        assert_eq!(r.pacing(0, total, total * 35 / 100, total), (30, 180, 17));
-        assert_eq!(r.pacing(0, total, total * 20 / 100, total), (30, 180, 17));
+        assert_eq!(r.pacing(0, total, total * 35 / 100, total), (30, 90, 17));
+        assert_eq!(r.pacing(0, total, total * 20 / 100, total), (30, 90, 17));
 
         // 阶段 2 自 75% 进入：窗口 20%，55% 结束，未触及 40%
         let enter = total * 3 / 4;
-        assert_eq!(r.pacing(1, enter, total * 65 / 100, total), (25, 150, 14));
-        assert_eq!(r.pacing(1, enter, total * 55 / 100, total), (20, 120, 12));
-        assert_eq!(r.pacing(1, enter, total * 30 / 100, total), (20, 120, 12));
+        assert_eq!(r.pacing(1, enter, total * 65 / 100, total), (25, 75, 14));
+        assert_eq!(r.pacing(1, enter, total * 55 / 100, total), (20, 60, 12));
+        assert_eq!(r.pacing(1, enter, total * 30 / 100, total), (20, 60, 12));
 
         // 阶段 3：直接推向终态，r/d 不变
         let enter = total * 60 / 100;
-        assert_eq!(r.pacing(2, enter, total * 55 / 100, total), (5, 60, 7));
-        assert_eq!(r.pacing(2, enter, total * 50 / 100, total), (1, 60, 7));
+        assert_eq!(r.pacing(2, enter, total * 55 / 100, total), (5, 30, 7));
+        assert_eq!(r.pacing(2, enter, total * 50 / 100, total), (1, 30, 7));
     }
 
     #[test]
@@ -2903,11 +2903,11 @@ mod tests {
         let r = Ruleset::default();
         let total = 1200 * 1000 * TMS;
         // 40% 恰为窗口起点：整段以整档为目标
-        assert_eq!(r.pacing(1, total * 40 / 100, total * 30 / 100, total), (20, 120, 12));
+        assert_eq!(r.pacing(1, total * 40 / 100, total * 30 / 100, total), (20, 60, 12));
         // 40% 恰为窗口终点：立刻跳到整档
         let enter = total * 60 / 100;
-        assert_eq!(r.pacing(1, enter, total * 41 / 100, total), (20, 123, 12));
-        assert_eq!(r.pacing(1, enter, total * 40 / 100, total), (10, 60, 7));
+        assert_eq!(r.pacing(1, enter, total * 41 / 100, total), (20, 61, 12));
+        assert_eq!(r.pacing(1, enter, total * 40 / 100, total), (10, 30, 7));
     }
 
     #[test]

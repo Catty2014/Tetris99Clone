@@ -504,7 +504,7 @@ impl Default for StageSection {
         Self {
             ratio_min_pm: 0,
             g_frames: 60,
-            r_frames: 270,
+            r_frames: 136,
             d_frames: 33,
             window_pm: 400,
         }
@@ -513,10 +513,10 @@ impl Default for StageSection {
 
 fn default_stages() -> Vec<StageSection> {
     vec![
-        StageSection { ratio_min_pm: 500, g_frames: 60, r_frames: 270, d_frames: 33, window_pm: 400 },
-        StageSection { ratio_min_pm: 100, g_frames: 30, r_frames: 180, d_frames: 17, window_pm: 200 },
-        StageSection { ratio_min_pm: 1, g_frames: 10, r_frames: 60, d_frames: 7, window_pm: 100 },
-        StageSection { ratio_min_pm: 0, g_frames: 1, r_frames: 60, d_frames: 7, window_pm: 0 },
+        StageSection { ratio_min_pm: 500, g_frames: 60, r_frames: 136, d_frames: 33, window_pm: 400 },
+        StageSection { ratio_min_pm: 100, g_frames: 30, r_frames: 90, d_frames: 17, window_pm: 200 },
+        StageSection { ratio_min_pm: 1, g_frames: 10, r_frames: 30, d_frames: 7, window_pm: 100 },
+        StageSection { ratio_min_pm: 0, g_frames: 1, r_frames: 30, d_frames: 7, window_pm: 0 },
     ]
 }
 
